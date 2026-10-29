@@ -94,18 +94,6 @@ int main(void) {
            "%u acquire/%u release, heads=%u\n", REFRESH, f->normal_calls, refresh_chunks,
            refresh_resident, resident_flush_crossings, encoder_acquires, encoder_releases, heads);
     harness_session_close(&fs);
-
-    /* Without batch capture the refresh keeps its 128-token headed calls. */
-    harness_session_open(&fe, &fs, CTX, 2048u);
-    fs.scr_capture_batch_chunks = false;
-    controls(fresh);
-    refresh_resident = refresh_chunks = 0;
-    rc = ds4_session_scr_logical_policy(&fs, &first, 36864u, 32u, 201, &r, err, sizeof(err));
-    if (rc) fprintf(stderr, "legacy refresh policy: %s\n", err);
-    CHECK(!rc && r.published && r.execution.route == DS4_SCR_DENSE_REFRESH);
-    CHECK(f->source_chunks == REFRESH / 128u + 1u && f->completed_heads == f->source_chunks);
-    CHECK(!encoder_acquires && !refresh_resident);
-    harness_session_close(&fs);
     refreshing = false;
     ds4_gpu_tensor_free(rows); ds4_gpu_tensor_free(indices);
     puts("SCR encoder residency spans capture flushes, refresh included (host storage, simulated rows)");

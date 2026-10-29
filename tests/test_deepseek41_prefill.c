@@ -92,12 +92,14 @@ static int check_dispatch(void) {
         CHECK(ds41_prefill_count(&g, 65536) == 1);
         CHECK(unsetenv(ablations[i]) == 0);
     }
+    /* Resident single-device appends are layer-major from two rows. */
     g.tp_world = 1;
-    CHECK(ds41_prefill_count(&g, 7) == 1);
-    CHECK(ds41_prefill_count(&g, 8) == 8);
+    CHECK(ds41_prefill_count(&g, 1) == 1);
+    CHECK(ds41_prefill_count(&g, 2) == 2);
+    CHECK(ds41_prefill_count(&g, 7) == 7);
     for (size_t i = 0; i < sizeof(remaining) / sizeof(*remaining); i++)
         CHECK(ds41_prefill_count(&g, remaining[i]) ==
-            (remaining[i] >= 8 && remaining[i] < 256 ? remaining[i] : cold[i]));
+            (remaining[i] >= 2 && remaining[i] < 256 ? remaining[i] : cold[i]));
     ds4_imatrix_collector imatrix = {0};
     g.imatrix = &imatrix;
     CHECK(ds41_prefill_count(&g, 65536) == 1);

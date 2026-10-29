@@ -348,7 +348,7 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--port N", "Bind port. Default: 8000");
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
-    opt(fp, c, "--scr", "Experimental suffix cache reuse (DeepSeek V4.1, Metal, loopback, single text slot, no KV-cache tuning; dedicated client only). Logical coordinates, batch capture and planner fresh-gap padding with the cache-reuse-utils planner. Batch capture has known unequal logits versus scalar capture; no general numerical or quality qualification is claimed.");
+    opt(fp, c, "--scr", "Experimental suffix cache reuse (DeepSeek V4.1, Metal, loopback, single text slot, no KV-cache tuning; dedicated client only). Logical coordinates, batched capture through the normal prefill path and planner fresh-gap padding with the cache-reuse-utils planner.");
     opt(fp, c, "--scr-tail-tokens C", "SCR archive capacity; eight-aligned 128..1M and <= ctx. Default with --scr: ctx. A nonzero value alone also enables --scr.");
     opt(fp, c, "--scr-max-ranges K", "SCR planner range bound 1..32. Default: 32.");
     opt(fp, c, "--scr-planner-budget-ms MS", "SCR planner deadline 0..60000. Default: 5000.");

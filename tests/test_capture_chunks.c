@@ -33,7 +33,7 @@ static const int *expected_tokens;
 static bool fixture_body_dispatch(void*g,const void*m,const void*w,const int*v,uint32_t n,
     ds4_session_progress_fn p,void*ud,int total,ds4_session_cancel_fn c,void*cu,bool only,bool resume){
     if(wrapper_only){CHECK(g==expected_g&&m==expected_m&&w==expected_w&&v==expected_tokens&&n==17&&total==91&&ud==expected_ud&&cu==expected_ud&&p==progress&&c==cancel&&only==expected_only&&resume==expected_resume);++wrapper_calls;return wrapper_result;}
-    CHECK(session&&session->scr_capture_batch_chunks&&!only&&!resume);
+    CHECK(session&&!only&&!resume);
     return model_prefill(g,m,w,v,n,p,ud,total,c,cu);
 }
 static void per_call_cases(void){
@@ -52,7 +52,7 @@ static ds41_scr_archive *pinned_source;
 static uint64_t pinned_generation;
 static bool changed_rows(ds41_gpu_graph*g,uint32_t n){
     const ds41_policy_owner*o=session?session->scr_dense_owner:NULL;
-    return o&&o->capture_batch_chunks&&session->scr_capture_batch_chunks&&g->archive_capture_pending&&installs&&n>1;
+    return o&&g->archive_capture_pending&&installs&&n>1;
 }
 static bool chunk_before_rows(void*p,uint32_t n){
     ds41_gpu_graph*g=p;const ds41_policy_owner*o=session?session->scr_dense_owner:NULL;
@@ -93,16 +93,16 @@ static int logical_call(control_fixture*f,int*logical,uint32_t n,uint32_t k,ds4_
 }
 static void startup_cases(void){
     char err[128];control_fixture f;setup_control(&f);
+    /* Batched capture is unconditional; the startup call only validates. */
     CHECK(!ds4_session_scr_enable_capture_batch_chunks(&f.s,err,sizeof(err)));
-    CHECK(ds4_session_scr_enable_capture_batch_chunks(&f.s,err,sizeof(err))==1);
+    CHECK(!ds4_session_scr_enable_capture_batch_chunks(&f.s,err,sizeof(err)));
     cleanup_control(&f);
 }
-static void run_case(bool selected,uint32_t k,unsigned failure,bool streaming){
-    control_fixture f;setup_control(&f);char err[128];if(selected)CHECK(!ds4_session_scr_enable_capture_batch_chunks(&f.s,err,sizeof(err)));
+static void run_case(uint32_t k,unsigned failure,bool streaming){
+    control_fixture f;setup_control(&f);char err[128];
     f.source[200]=277;ds4_scr_logical_receipt r;
     reset_chunk_observation(0);CHECK(!logical_call(&f,f.source,1033,6,&r));CHECK(r.execution.route==DS4_SCR_DENSE_REFRESH);
     CHECK(ds4_session_scr_enable_capture_batch_chunks(&f.s,err,sizeof(err))==1);
-    CHECK(f.s.scr_capture_batch_chunks == selected);
     int logical[801],unchanged[801];for(uint32_t i=0;i<800;i++)logical[i]=80000+(int)i;
     memcpy(logical+17,f.source+128,128*sizeof(int));memcpy(logical+337,f.source+512,128*sizeof(int));memcpy(unchanged,logical,800*sizeof(int));
     f.s.ds41_graph.streaming=streaming;
@@ -121,8 +121,7 @@ static void run_case(bool selected,uint32_t k,unsigned failure,bool streaming){
         CHECK(f.s.scr_coordinates.count==1&&f.s.checkpoint.v[f.s.scr_coordinates.pads[0]]==277&&recovered[89]==277);
         ds41_scr_archive*a=f.s.ds41_graph.archive;CHECK(a&&a->sealed&&!a->lost&&a->rebased&&a->raw&&a->raw->committed_tokens==800&&a->rebase_head_end==800);
         /* The 2048-row arena holds each gap and the suffix in one chunk. */
-        if(selected&&!streaming){CHECK(chunk_attempts==2&&chunk_success==chunk_attempts&&!full_chunks&&partial_chunks==2&&chunk_rows>128&&scalar_calls==1);}
-        else if(!selected)CHECK(!chunk_attempts&&scalar_calls>128);
+        if(!streaming){CHECK(chunk_attempts==2&&chunk_success==chunk_attempts&&!full_chunks&&partial_chunks==2&&chunk_rows>128&&scalar_calls==1);}
         /* Streaming batches only from 256 rows: the 192-row gap stays scalar,
          * the 334-row suffix is one arena-bounded chunk. */
         else CHECK(chunk_attempts==1&&chunk_success==1&&chunk_rows==334&&scalar_calls==193);
@@ -130,7 +129,7 @@ static void run_case(bool selected,uint32_t k,unsigned failure,bool streaming){
         unsigned previous_attempts=chunk_attempts;CHECK(!logical_call(&f,logical,800,k,&r));CHECK(r.execution.route==DS4_SCR_DENSE_CONTINUE&&chunk_attempts==previous_attempts);
     }
     uint32_t gap=0;for(uint32_t i=0;i<DS4_SCR_MULTI_MAX_RANGES;i++)gap+=receipt.gap_completed[i];
-    printf("{\"selected\":%s,\"K\":%u,\"streaming\":%s,\"fault\":%u,\"chunk_attempts\":%u,\"dispatched_chunk_rows\":%u,\"primitive_returned_rows\":%u,\"full\":%u,\"partial\":%u,\"scalar_calls\":%u,\"known_gap_rows\":%u,\"known_suffix_rows\":%u,\"unknown\":%s,\"published\":%s,\"rebase_committed\":%s,\"pending_owner_after\":%s}\n",selected?"true":"false",k,streaming?"true":"false",failure,chunk_attempts,dispatched_rows,chunk_rows,full_chunks,partial_chunks,scalar_calls,gap,receipt.suffix_completed,receipt.partial_work_unknown?"true":"false",receipt.published?"true":"false",receipt.rebase_committed?"true":"false",f.s.ds41_graph.archive_pending?"true":"false");
+    printf("{\"K\":%u,\"streaming\":%s,\"fault\":%u,\"chunk_attempts\":%u,\"dispatched_chunk_rows\":%u,\"primitive_returned_rows\":%u,\"full\":%u,\"partial\":%u,\"scalar_calls\":%u,\"known_gap_rows\":%u,\"known_suffix_rows\":%u,\"unknown\":%s,\"published\":%s,\"rebase_committed\":%s,\"pending_owner_after\":%s}\n",k,streaming?"true":"false",failure,chunk_attempts,dispatched_rows,chunk_rows,full_chunks,partial_chunks,scalar_calls,gap,receipt.suffix_completed,receipt.partial_work_unknown?"true":"false",receipt.published?"true":"false",receipt.rebase_committed?"true":"false",f.s.ds41_graph.archive_pending?"true":"false");
     cleanup_control(&f);
 }
-int main(void){CHECK(ds4_gpu_init());g_ds4_shape=DS4_SHAPE_FLASH41;per_call_cases();startup_cases();run_case(false,6,0,false);run_case(true,2,0,false);run_case(true,6,0,false);run_case(true,10,0,false);run_case(true,6,0,true);run_case(true,10,0,true);for(unsigned f=1;f<=9;f++)run_case(true,6,f,false);puts("batch per-call capture mechanisms passed; synthetic rows only, not numerical or quality evidence");return 0;}
+int main(void){CHECK(ds4_gpu_init());g_ds4_shape=DS4_SHAPE_FLASH41;per_call_cases();startup_cases();run_case(2,0,false);run_case(6,0,false);run_case(10,0,false);run_case(6,0,true);run_case(10,0,true);for(unsigned f=1;f<=9;f++)run_case(6,f,false);puts("batch per-call capture mechanisms passed; synthetic rows only, not numerical or quality evidence");return 0;}

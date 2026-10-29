@@ -72,6 +72,36 @@ static void exact_splice(ds41_scr_archive *a) {
         }
     }
 }
+/* A prefetched window is gathered layer-major by kv_archive_gather_layers;
+ * its staged rings must equal the per-layer gather of a synchronous read.
+ * The window end (252) is not record-aligned, so 17 records are gathered. */
+static void prefetched_gather_matches(ds4_session *s, ds41_scr_archive *a) {
+    const uint32_t source = 122u, destination = 16u, count = 130u;
+    const int *tokens = a->tokens + source - a->start;
+    const size_t ring = 128u * DS41_RAW_ROW_BYTES;
+    unsigned char *scalar = malloc(40u * ring), *gathered = malloc(40u * ring);
+    unsigned char *data = malloc(DS41_ARCHIVE_READ_BYTES);
+    CHECK(scalar && gathered && data);
+    CHECK(ds41_archive_materialize_aligned(a, s, &s->engine->model, source, destination,
+                                           tokens, count, s->ds41_graph.ctx, 2u));
+    for (uint32_t l = 0; l < 40u; ++l)
+        CHECK(ds4_gpu_tensor_read(a->stage, ds41_archive_ring(a->cap, l), scalar + l * ring, ring));
+    memset(gathered, 0, 40u * ring);
+    for (uint32_t l = 0; l < 40u; ++l)
+        CHECK(ds4_gpu_tensor_write(a->stage, ds41_archive_ring(a->cap, l), gathered + l * ring, ring));
+    uint32_t first, records;
+    CHECK(ds41_raw_window_records(ds41_archive_count(a), source - a->start + count, &first, &records) &&
+          records == 17u && (source - a->start + count) % 8u);
+    ds41_raw_prefetch window = {0};
+    CHECK(ds41_raw_prefetch_start(&window, a->raw, first, records, data) &&
+          ds41_raw_prefetch_finish(&window));
+    CHECK(ds41_archive_materialize_window(a, s, &s->engine->model, source, destination,
+                                          tokens, count, s->ds41_graph.ctx, 2u, &window, false));
+    for (uint32_t l = 0; l < 40u; ++l)
+        CHECK(ds4_gpu_tensor_read(a->stage, ds41_archive_ring(a->cap, l), gathered + l * ring, ring));
+    CHECK(!memcmp(scalar, gathered, 40u * ring));
+    free(scalar); free(gathered); free(data);
+}
 static void owned_splice(ds4_session *s, const int *old_tokens) {
     ds41_gpu_graph *g = &s->ds41_graph;
     ds41_scr_archive *old = g->archive;
@@ -118,6 +148,9 @@ static void owned_splice(ds4_session *s, const int *old_tokens) {
     ds4_scr_multi_receipt receipt; char err[256];
     int rc = ds41_scr_multi_owned(s, &full, plan, 2u, &receipt, err, sizeof(err), &owner);
     if (rc) fprintf(stderr, "owning rebase rc=%d: %s\n", rc, err);
+    /* The 2-row capture suffix [310,312) is one batched call; only the
+     * post-cover tail [312,315) steps token by token. */
+    CHECK(scalar == 3);
     CHECK(!rc && receipt.published && receipt.rebase_prepared && receipt.head_completed &&
           receipt.covered_head_completed && receipt.covered_head_end == 312u &&
           receipt.planned_tokens == 296u && receipt.imported_tokens == 292u &&
@@ -164,6 +197,7 @@ static void owned_splice(ds4_session *s, const int *old_tokens) {
     uint32_t probe_pad = 62u;
     CHECK(ds41_coordinates_build(&probe_map, probe, 149u, DS4_N_VOCAB, &probe_pad, 1u, 999u));
     CHECK(ds41_multi_pad_correspondence(&next->coordinates, &probe_map, 124u, 16u, 132u));
+    prefetched_gather_matches(s, next);
     CHECK(ds41_archive_range_check_aligned(next, s, &s->engine->model,
         124u, 16u, probe + 16u, 132u, g->ctx, 2u));
     CHECK(ds41_archive_materialize_aligned(next, s, &s->engine->model,

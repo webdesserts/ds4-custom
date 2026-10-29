@@ -376,8 +376,9 @@ typedef enum {
  * logical policy grants no artificial-token placement. */
 int ds4_session_scr_set_padding_policy(ds4_session *s, ds4_scr_padding_policy policy,
                                       char *err, size_t errlen);
-/* Selected fast capture body: known unequal logits, no formal quality claim.
- * Empty startup only. */
+/* Compatibility startup check. SCR always captures through the normal batched
+ * prefill, so this selects nothing; it succeeds on an SCR-compatible empty
+ * session and refuses otherwise. */
 int ds4_session_scr_enable_capture_batch_chunks(ds4_session *s, char *err, size_t errlen);
 /* Experimental RAM-only logical request entry. Counts/identity are immutable
  * prefill receipts; generation may subsequently advance the session map.
@@ -435,9 +436,9 @@ int ds4_scr_pool_open(ds4_scr_pool **out, const char *directory, uint32_t contex
 void ds4_scr_pool_close(ds4_scr_pool *pool);
 uint32_t ds4_scr_pool_entries(const ds4_scr_pool *pool);
 /* Before the logical policy: unless the live transcript continues into the
- * request, score the hot archive and every catalog entry with the planner and,
- * when an entry covers more of the request, save the hot archive and restore
- * that entry in its place. Same exclusive-use rules as the logical policy.
+ * request, score the hot archive and every catalog entry by planner coverage
+ * and aligned common prefix and, when an entry scores higher, save the hot
+ * archive and restore that entry in its place. Same exclusive-use rules as the logical policy.
  * Returns 0 when the session is ready for the policy (restored or not), 1 when
  * a failed swap left no archive (the policy then refreshes). */
 int ds4_session_scr_pool_select(ds4_session *s, ds4_scr_pool *pool,

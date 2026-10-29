@@ -12,16 +12,17 @@ static void startup_modes(void) {
     e.dspark = true;
     assert(!ds41_scr_empty_startup(&s));
     assert(ds4_session_scr_enable_capture_batch_chunks(&s, error, sizeof(error)));
-    assert(!s.scr_capture_batch_chunks && !s.scr_padding_selected);
+    assert(!s.scr_padding_selected);
     e.dspark = false; e.mtp_ready = true;
     assert(!ds41_scr_empty_startup(&s));
     assert(ds4_session_scr_enable_capture_batch_chunks(&s, error, sizeof(error)));
-    assert(!s.scr_capture_batch_chunks && !s.scr_padding_selected);
+    assert(!s.scr_padding_selected);
     e.mtp_ready = false; e.glm_mtp = true;
     assert(!ds41_scr_empty_startup(&s));
     e.glm_mtp = false;
+    /* Compatibility check only: repeatable, selects nothing. */
     assert(!ds4_session_scr_enable_capture_batch_chunks(&s, error, sizeof(error)));
-    assert(s.scr_capture_batch_chunks);
+    assert(!ds4_session_scr_enable_capture_batch_chunks(&s, error, sizeof(error)));
 }
 
 static void capture_and_verifier_owners(void) {

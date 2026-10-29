@@ -443,6 +443,7 @@ static inline bool ds41_raw_gather_layer(const void *data, size_t bytes, uint32_
 /* Record-major GPU copies only. The owner drains before readback/publication;
  * tags certify scheduled rows, not completion of an outstanding command batch. */
 #include "ds4_gpu.h"
+#include "adapter/include/kv_archive_store.h"
 
 /* Capture arena of an archive with capacity `cap`: the widest arena, clipped
  * to the capacity so small archives do not reserve an unusable arena. */
@@ -509,6 +510,8 @@ static inline bool ds41_raw_capture_shift(ds4_gpu_tensor *arena, uint32_t arena_
 
 #define DS41_ARCHIVE_READ_BYTES (DS41_RAW_READ_RECORDS * DS41_RAW_RECORD_BYTES)
 #define DS41_ARCHIVE_IO_BYTES (DS41_ARCHIVE_READ_BYTES + 128u * DS41_RAW_ROW_BYTES)
+/* Threads for the layer-major gather of a prefetched window (11 MB). */
+#define DS41_ARCHIVE_GATHER_THREADS 4u
 /* One host buffer serves capture readback and range window reads + gathers. */
 static inline uint64_t ds41_archive_io_bytes(uint32_t cap) {
     const uint64_t readback = ds41_raw_bytes(ds41_archive_arena_tokens(cap));
@@ -1093,12 +1096,26 @@ static bool ds41_archive_materialize_window(ds41_scr_archive *a, const void *ses
     /* Stage's existing terminal-window region is the canonical read buffer until
      * each layer is transformed through scratch. No second GPU read arena. */
     began = ds41_archive_observation_time(a);
-    unsigned char *layer = a->raw_io + DS41_ARCHIVE_READ_BYTES;
-    for (uint32_t l = 0; ok && l < 40u; ++l)
-        ok = ds41_raw_gather_layer(data, DS41_ARCHIVE_READ_BYTES, first, records,
-                offset + count - 128u, l, layer, 128u * DS41_RAW_ROW_BYTES) &&
-             ds4_gpu_tensor_write(a->stage, ds41_archive_ring(a->cap, l), layer,
-                                  128u * DS41_RAW_ROW_BYTES);
+    if (prefetched) {
+        /* The read buffer is free: gather every layer of the window at once,
+         * layer-major, so each layer's 128 rows are contiguous. */
+        const size_t window_bytes = (size_t)records * DS41_RAW_RECORD_BYTES;
+        const size_t layer_bytes = (size_t)records * 8u * DS41_RAW_ROW_BYTES;
+        const size_t skip = (size_t)(offset + count - 128u - first * 8u) * DS41_RAW_ROW_BYTES;
+        ok = kv_archive_gather_layers(data, window_bytes, records, 40u,
+                8u * DS41_RAW_ROW_BYTES, a->raw_io, window_bytes, DS41_ARCHIVE_GATHER_THREADS,
+                NULL, 0) == KV_ARCHIVE_OK;
+        for (uint32_t l = 0; ok && l < 40u; ++l)
+            ok = ds4_gpu_tensor_write(a->stage, ds41_archive_ring(a->cap, l),
+                                      a->raw_io + l * layer_bytes + skip, 128u * DS41_RAW_ROW_BYTES);
+    } else {
+        unsigned char *layer = a->raw_io + DS41_ARCHIVE_READ_BYTES;
+        for (uint32_t l = 0; ok && l < 40u; ++l)
+            ok = ds41_raw_gather_layer(data, DS41_ARCHIVE_READ_BYTES, first, records,
+                    offset + count - 128u, l, layer, 128u * DS41_RAW_ROW_BYTES) &&
+                 ds4_gpu_tensor_write(a->stage, ds41_archive_ring(a->cap, l), layer,
+                                      128u * DS41_RAW_ROW_BYTES);
+    }
     a->raw_gather_seconds += ds41_archive_observation_time(a) - began;
     if (!ok || (a->cancelled && a->cancelled((void *)a->session))) return false;
     bool owned = ds4_gpu_begin_commands();
@@ -1440,18 +1457,24 @@ static bool ds41_coordinates_slice(const ds41_scr_coordinates *source,
         out->count || out->capacity || out->physical_tokens || !count ||
         start > n || count > n - start ||
         !ds41_coordinates_match(source, physical, n, vocab)) return false;
-    uint32_t first = 0, end = 0;
-    while (first < source->count && source->pads[first] < start) ++first;
-    end = first;
-    while (end < source->count && source->pads[end] < start + count) ++end;
-    const uint32_t kept = end - first;
+    /* Size the copy first: pads before the end, less pads before the start. */
+    uint32_t origin, end, kept = 0;
+    if (cache_reuse_logical_boundary(start, n, source->pads, source->count, &origin,
+            NULL, 0) != CACHE_REUSE_COMPLETE ||
+        cache_reuse_truncate_pad_positions(source->pads, source->count, n, start + count,
+            &end, NULL, 0) != CACHE_REUSE_COMPLETE || end < start - origin) return false;
+    const uint32_t capacity = end - (start - origin);
     size_t bytes;
-    if (!ds41_coordinates_heap_bytes(kept, &bytes)) return false;
-    uint32_t *copy = kept ? malloc(bytes) : NULL;
-    if (kept && !copy) return false;
-    for (uint32_t i = 0; i < kept; ++i) copy[i] = source->pads[first + i] - start;
+    if (!ds41_coordinates_heap_bytes(capacity, &bytes)) return false;
+    uint32_t *copy = capacity ? malloc(bytes) : NULL;
+    if (capacity && !copy) return false;
+    if (cache_reuse_slice_pad_positions(source->pads, source->count, n, start, count,
+            copy, capacity, &kept, NULL, 0) != CACHE_REUSE_COMPLETE || kept != capacity) {
+        free(copy);
+        return false;
+    }
     *out = (ds41_scr_coordinates){copy, kept, kept, count, source->identity};
-    *logical_start = start - first;
+    *logical_start = origin;
     return true;
 }
 
@@ -1492,10 +1515,10 @@ static bool ds41_coordinates_replace_charged(ds41_scr_coordinates *live,
  * rebuild. The session owner must separately invalidate the model frontier. */
 static bool ds41_coordinates_truncate(ds41_scr_coordinates *m, uint32_t n,
                                       uint64_t identity) {
-    if (!ds41_coordinates_shape(m) || n > m->physical_tokens ||
-        identity <= m->identity) return false;
-    uint32_t count = m->count;
-    while (count && m->pads[count - 1] >= n) --count;
+    uint32_t count;
+    if (!ds41_coordinates_shape(m) || identity <= m->identity ||
+        cache_reuse_truncate_pad_positions(m->pads, m->count, m->physical_tokens, n,
+            &count, NULL, 0) != CACHE_REUSE_COMPLETE) return false;
     m->count = count;
     m->physical_tokens = n;
     m->identity = identity;
@@ -1506,10 +1529,11 @@ static bool ds41_coordinates_truncate(ds41_scr_coordinates *m, uint32_t n,
  * The owner checks actual checkpoint bytes and head before publishing this. */
 static inline bool ds41_coordinates_append(ds41_scr_coordinates *m, uint32_t count,
                                            uint32_t physical_limit, uint64_t identity) {
+    uint32_t physical;
     if (!ds41_coordinates_shape(m) || identity <= m->identity ||
-        m->physical_tokens > physical_limit ||
-        count > physical_limit - m->physical_tokens) return false;
-    m->physical_tokens += count;
+        cache_reuse_append_unpadded(m->physical_tokens, m->pads, m->count, count,
+            &physical, NULL, 0) != CACHE_REUSE_COMPLETE || physical > physical_limit) return false;
+    m->physical_tokens = physical;
     m->identity = identity;
     return true;
 }
@@ -1700,7 +1724,6 @@ typedef struct ds41_policy_owner {
     uint64_t live_host_bytes;
     uint32_t archive_capacity;
     bool active;
-    bool capture_batch_chunks; /* Selected fast batch body for K6/K10; not exact-equivalence promotion. */
     bool source_pads_are_content; /* Actual-token planner: source pads are ordinary content. */
     const ds41_scr_coordinates *coordinates;
     const uint32_t *coordinate_pads;
@@ -2212,6 +2235,27 @@ static int ds41_session_eval_scalar(ds4_session *s, int token, char *err, size_t
 #define DS41_SYNC_CAPTURE_BATCH_PREFILL ds41_graph_prefill
 #endif
 typedef struct { uint32_t completed, heads; bool unknown, mutated; } ds41_sync_frontier;
+/* Encoder residency is held across raw arena flushes and dropped before the
+ * prompt's last rows, which then warm the expert cache for decode. */
+#define DS41_ENCODER_RELEASE_TAIL 768u
+static void ds41_encoder_release_tail(ds41_gpu_graph *g, const ds4_model *m,
+                                      ds41_encoder_residency *encoder, uint32_t remaining) {
+    if (g->encoder_resident && remaining < DS41_ENCODER_RELEASE_TAIL)
+        DS41_SYNC_RELEASE(g, m, encoder);
+}
+/* A capturing call stops at the writer's raw arena frontier (and its limit),
+ * where the arena flushes; refuses a cursor outside the current arena. */
+static bool ds41_capture_arena_bound(const ds41_scr_archive *writer, uint32_t pos,
+                                     uint32_t end, uint32_t *bound) {
+    const uint32_t arena = writer->raw_arena_tokens;
+    if (writer->raw_origin > UINT32_MAX - arena || pos < writer->raw_origin ||
+        pos >= writer->raw_origin + arena || pos >= writer->limit) return false;
+    uint32_t b = end;
+    if (b > writer->raw_origin + arena) b = writer->raw_origin + arena;
+    if (b > writer->limit) b = writer->limit;
+    *bound = b;
+    return true;
+}
 static int ds41_session_prefix_impl(ds4_session *s, const ds4_tokens *prompt,
                                bool private_fresh, ds41_sync_frontier *frontier,
                                char *err, size_t errlen) {
@@ -2259,10 +2303,8 @@ static int ds41_session_prefix_impl(ds4_session *s, const ds4_tokens *prompt,
         ds41_scr_archive *writer = rebase_capture ? g->archive_pending :
             refresh_capture ? g->archive : ds41_session_append_writer(s);
         if (writer) {
-            uint32_t bound = (uint32_t)prompt->len;
-            const uint32_t arena = writer->raw_arena_tokens;
-            if (writer->raw_origin > UINT32_MAX - arena || (uint32_t)i < writer->raw_origin ||
-                (uint32_t)i >= writer->raw_origin + arena || (uint32_t)i >= writer->limit) {
+            uint32_t bound;
+            if (!ds41_capture_arena_bound(writer, (uint32_t)i, (uint32_t)prompt->len, &bound)) {
                 DS41_SYNC_RELEASE(g, &e->model, &encoder);
                 if (refresh_capture) {
                     snprintf(err, errlen, "SCR refresh: capture arena frontier refused"); return 1;
@@ -2271,8 +2313,6 @@ static int ds41_session_prefix_impl(ds4_session *s, const ds4_tokens *prompt,
                     ds41_session_rebase_failure(s, err, errlen, "capture arena frontier refused") :
                     ds41_session_append_failure(s, err, errlen, "capture arena frontier refused");
             }
-            if (bound > writer->raw_origin + arena) bound = writer->raw_origin + arena;
-            if (bound > writer->limit) bound = writer->limit;
             if (!rebase_capture && !refresh_capture && bound % 8u && bound - writer->end >= 8u)
                 bound &= ~7u;
             if (bound <= (uint32_t)i) {
@@ -2289,8 +2329,7 @@ static int ds41_session_prefix_impl(ds4_session *s, const ds4_tokens *prompt,
         /* Residency follows the prompt remainder, not the capture arena bound;
          * a resident call still stops at the arena frontier. */
         const uint32_t prompt_remaining = (uint32_t)(prompt->len - i);
-        if (g->encoder_resident && prompt_remaining < 768u)
-            DS41_SYNC_RELEASE(g, &e->model, &encoder);
+        ds41_encoder_release_tail(g, &e->model, &encoder, prompt_remaining);
         const uint32_t short_count = decoder_pending || g->encoder_resident ? 0u :
             ds41_short_prefill_count(g, &e->weights, remaining);
         uint32_t resident_count = prompt_remaining - 512u < g->prefill_cap ?
@@ -2606,29 +2645,21 @@ static bool ds41_multi_coordinate_shape(const ds41_scr_coordinates *m,
     if (!m->identity) return !m->pads && !m->count && !m->capacity && !m->physical_tokens;
     return m->physical_tokens == n && ds41_coordinates_shape(m);
 }
-static uint32_t ds41_multi_pad_lower(const ds41_scr_coordinates *m, uint32_t pos) {
-    uint32_t lo = 0, hi = m->count;
-    while (lo < hi) {
-        uint32_t mid = lo + (hi - lo) / 2u;
-        if (m->pads[mid] < pos) lo = mid + 1u; else hi = mid;
-    }
-    return lo;
-}
+/* Source pads in the range reappear at the same destination offsets, never
+ * on the range's first or last token. A mapped side must contain the range;
+ * an unmapped side (identity 0) is all content. */
 static bool ds41_multi_pad_correspondence(const ds41_scr_coordinates *source,
                                           const ds41_scr_coordinates *target,
                                           uint32_t source_start, uint32_t destination,
                                           uint32_t count) {
-    uint32_t a = ds41_multi_pad_lower(source, source_start);
-    uint32_t b = ds41_multi_pad_lower(target, destination);
-    for (;;) {
-        bool sa = a < source->count && source->pads[a] - source_start < count;
-        bool tb = b < target->count && target->pads[b] - destination < count;
-        if (!sa || !tb) return sa == tb;
-        uint32_t offset = source->pads[a] - source_start;
-        if (!offset || offset + 1u == count ||
-            offset != target->pads[b] - destination) return false;
-        ++a; ++b;
-    }
+    if (count > UINT32_MAX - source_start || count > UINT32_MAX - destination) return false;
+    const cache_reuse_range range = {source_start, destination, count, destination};
+    bool corresponds = false;
+    return cache_reuse_verify_span_correspondence(source->pads, source->count,
+            source->identity ? source->physical_tokens : source_start + count,
+            target->pads, target->count,
+            target->identity ? target->physical_tokens : destination + count,
+            &range, &corresponds, NULL, 0) == CACHE_REUSE_COMPLETE && corresponds;
 }
 static bool ds41_multi_install_aligned(ds4_session *s, const int *tokens,
                                ds41_scr_archive *a, const ds4_scr_range *r,
@@ -2776,19 +2807,22 @@ static bool ds41_session_rebase_pin(ds4_session *s) {
 }
 /* Clip only the selected suffix obstructing a genuine covered-frontier head.
  * The caller rechecks exact tokens and pad endpoints; unsafe clipping refuses. */
-static bool ds41_rebase_clip(ds4_scr_range *plan, uint32_t *count,
-                             uint32_t n, uint32_t alignment) {
+static bool ds41_rebase_clip(ds4_scr_range *plan, uint32_t *count, uint32_t n,
+                             uint32_t alignment, uint32_t archive_start, uint32_t archive_end) {
     if (!plan || !count || *count > DS4_SCR_MULTI_MAX_RANGES || n < 128u ||
         (alignment != 2u && alignment != 8u)) return false;
-    const uint32_t ceiling = ((n & ~7u) - 2u) / alignment * alignment;
-    uint32_t kept = 0;
-    for (uint32_t i = 0; i < *count; ++i) {
-        ds4_scr_range range = plan[i];
-        if (range.destination_start >= ceiling) continue;
-        if (range.count > ceiling - range.destination_start)
-            range.count = ceiling - range.destination_start;
-        if (range.count < 128u) continue;
-        plan[kept++] = range;
+    cache_reuse_range ranges[DS4_SCR_MULTI_MAX_RANGES], clipped[DS4_SCR_MULTI_MAX_RANGES];
+    for (uint32_t i = 0; i < *count; ++i)
+        ranges[i] = (cache_reuse_range){plan[i].source_start, plan[i].destination_start,
+                                        plan[i].count, plan[i].destination_start};
+    uint32_t written = 0, kept = 0;
+    if (*count && cache_reuse_clip_ranges_to_archive(ranges, *count, archive_start, archive_end,
+            (n & ~7u) - 2u, alignment, clipped, DS4_SCR_MULTI_MAX_RANGES, &written,
+            NULL, 0) != CACHE_REUSE_COMPLETE) return false;
+    for (uint32_t i = 0; i < written; ++i) {
+        if (clipped[i].count < 128u) continue;
+        plan[kept++] = (ds4_scr_range){clipped[i].source_start, clipped[i].prepared_start,
+                                       clipped[i].count};
     }
     for (uint32_t i = kept; i < DS4_SCR_MULTI_MAX_RANGES; ++i)
         memset(&plan[i], 0, sizeof(plan[i]));
@@ -2949,7 +2983,7 @@ static bool ds41_capture_chunk_history(const ds41_gpu_graph *g,
     return true;
 }
 /* Arena-bounded capture chunks. Encoder residency, when held, spans arena
- * flushes and is dropped before the last 768 rows or any scalar step. */
+ * flushes and is dropped before the release tail or any scalar step. */
 static int ds41_multi_capture_chunks(ds4_session *s, const int *tokens, uint32_t end,
                             uint32_t *completed, bool *unknown,
                             ds41_scr_archive *source, uint64_t generation,
@@ -2962,23 +2996,19 @@ static int ds41_multi_capture_chunks(ds4_session *s, const int *tokens, uint32_t
     while (g->pos < end) {
         if (ds4_session_cancelled(s)) return DS4_SESSION_SYNC_INTERRUPTED;
         const uint32_t pos = g->pos;
-        if (g->encoder_resident && end - pos < 768u)
-            DS41_SYNC_RELEASE(g, &s->engine->model, encoder);
+        ds41_encoder_release_tail(g, &s->engine->model, encoder, end - pos);
         ds41_scr_archive *pending = g->archive_capture_pending ? g->archive_pending : NULL;
+        uint32_t bound = end;
         if (!tokens || !pending || pending == source || pending->sealed || pending->lost ||
             pending->retiring || pending->session != s || pending->model != &s->engine->model ||
             !pending->raw || !pending->raw->readable || !pending->raw->writable ||
             !pending->tokens || s->checkpoint.cap < (int)end ||
             end > g->ctx || end > pending->writer_known_end || end > pending->limit ||
-            pending->raw_origin > UINT32_MAX - pending->raw_arena_tokens ||
-            pos < pending->raw_origin || pos >= pending->raw_origin + pending->raw_arena_tokens ||
+            !ds41_capture_arena_bound(pending, pos, end, &bound) ||
             !ds41_multi_frontier(s, tokens, pos) || !ds41_session_rebase_pin(s) ||
             !ds41_multi_pin(s, source, generation, start, source_end) ||
             source->generation != pin_generation || source->tokens != pin_tokens ||
             source->source != pin_source || source->stage != pin_stage) return 1;
-        uint32_t bound = end;
-        if (bound > pending->raw_origin + pending->raw_arena_tokens)
-            bound = pending->raw_origin + pending->raw_arena_tokens;
         uint32_t count = ds41_prefill_count(g, bound - pos);
         /* Use the existing chooser/primitive contract, never a forced minimum.
          * Scalar work stops at the same actual flush boundary, not each token. */
@@ -2991,7 +3021,7 @@ static int ds41_multi_capture_chunks(ds4_session *s, const int *tokens, uint32_t
         }
         const uint32_t origin = pending->raw_origin, captured = pending->captured_end;
         const uint32_t known_end = pending->writer_known_end, capacity = pending->cap;
-        const uint32_t limit = pending->limit, arena_tokens = pending->raw_arena_tokens;
+        const uint32_t limit = pending->limit;
         const uint64_t map_identity = pending->coordinates.identity;
         const uint32_t *tags = pending->tags;
         const int *pending_tokens = pending->tokens;
@@ -3028,18 +3058,20 @@ static int ds41_multi_capture_chunks(ds4_session *s, const int *tokens, uint32_t
         }
         for (uint32_t i = pos; i < pos + count; ++i) token_vec_push(&s->checkpoint, tokens[i]);
         *completed += count;
-        if ((g->pos == end || g->pos == origin + arena_tokens) &&
+        if (g->pos == bound &&
             !ds41_session_rebase_forward_ready(s, pending->captured_end, g->pos)) {
             *unknown = true; return 1;
         }
     }
     return ds4_session_cancelled(s) ? DS4_SESSION_SYNC_INTERRUPTED : 0;
 }
+/* A rebase captures every gap into its pending archive in arena-bounded
+ * batches; a non-rebasing graft has no capture owner and steps its gaps. */
 static int ds41_multi_capture_steps(ds4_session *s, const int *tokens, uint32_t end,
                             uint32_t *completed, bool *unknown,
                             ds41_scr_archive *source, uint64_t generation,
-                            uint32_t start, uint32_t source_end, bool enabled) {
-    if (!enabled) return ds41_multi_steps(s, tokens, end, completed, unknown);
+                            uint32_t start, uint32_t source_end, bool rebasing) {
+    if (!rebasing) return ds41_multi_steps(s, tokens, end, completed, unknown);
     ds41_gpu_graph *g = &s->ds41_graph;
     if (!source || !tokens) return 1;
     ds41_encoder_residency encoder = {0};
@@ -3173,7 +3205,8 @@ static int ds41_scr_multi_selected(ds4_session *s, const ds4_tokens *request,
     rebasing = candidate && owner && suffix == DS41_SUFFIX_SCALAR &&
         owner->archive_capacity >= (uint32_t)request->len;
     if (rebasing) {
-        if (!ds41_rebase_clip(plan, &selected, (uint32_t)request->len, alignment)) goto done;
+        if (!ds41_rebase_clip(plan, &selected, (uint32_t)request->len, alignment,
+                              start, end)) goto done;
         for (uint32_t i = 0; i < selected; ++i) {
             const ds4_scr_range *p = &plan[i];
             if (p->count < 128u || p->count % alignment ||
@@ -3188,7 +3221,6 @@ static int ds41_scr_multi_selected(ds4_session *s, const ds4_tokens *request,
         }
         candidate = selected != 0u;
     }
-    const bool capture_chunks = rebasing && owner && owner->capture_batch_chunks && s->scr_capture_batch_chunks;
     r->normalized_spans = selected;
     memcpy(r->ranges, plan, sizeof(plan));
     if (suffix != DS41_SUFFIX_SCALAR &&
@@ -3324,7 +3356,7 @@ static int ds41_scr_multi_selected(ds4_session *s, const ds4_tokens *request,
             t = now_sec();
             rc = ds41_multi_capture_steps(s, tokens, plan[i+1].destination_start,
                                   &r->gap_completed[i], &r->partial_work_unknown,
-                                  a, generation, start, end, capture_chunks);
+                                  a, generation, start, end, rebasing);
             r->gap_seconds += now_sec() - t;
             if (rc) goto failed;
         }
@@ -3332,11 +3364,11 @@ static int ds41_scr_multi_selected(ds4_session *s, const ds4_tokens *request,
     if (candidate) {
         r->phase = DS4_SCR_MULTI_SUFFIX;
         t = now_sec();
-        rc = capture_chunks ?
+        rc = rebasing ?
             ds41_multi_capture_steps(s, full.v, (uint32_t)full.len & ~7u,
                 &r->suffix_completed, &r->partial_work_unknown,
                 a, generation, start, end, true) :
-            ds41_multi_suffix(s, full.v, rebasing ? (uint32_t)full.len & ~7u : (uint32_t)full.len,
+            ds41_multi_suffix(s, full.v, (uint32_t)full.len,
                 &r->suffix_completed, &r->partial_work_unknown,
                 a, generation, start, end, suffix, counts);
         r->suffix_seconds = now_sec() - t;
@@ -3659,20 +3691,15 @@ static int ds41_scr_refresh_owned(ds4_session *s, const ds4_tokens *request,
         if (rc) goto failed;
     }
     r->phase = DS4_SCR_REFRESH_SOURCE;
-    /* With batch capture the whole source span is one call: capture flushes
-     * at each raw arena frontier without a head, encoder residency can span
-     * them, and one head certifies the span. Otherwise 128-token headed calls. */
-    const bool batched = s->scr_capture_batch_chunks;
-    for (uint32_t pos = start; pos < r->source_end;) {
-        const uint32_t next = batched || r->source_end - pos <= 128u ? r->source_end : pos + 128u;
-        ++r->source_chunks;
-        s->scr_refresh_capture = batched;
-        rc = ds41_refresh_call(s, &full, pos, next, r, &r->source_completed,
-                              &r->source_seconds, err, errlen);
-        s->scr_refresh_capture = false;
-        if (rc) goto failed;
-        pos = next;
-    }
+    /* The whole source span is one call: capture flushes at each raw arena
+     * frontier without a head, encoder residency can span them, and one head
+     * certifies the span. */
+    r->source_chunks = 1;
+    s->scr_refresh_capture = true;
+    rc = ds41_refresh_call(s, &full, start, r->source_end, r, &r->source_completed,
+                          &r->source_seconds, err, errlen);
+    s->scr_refresh_capture = false;
+    if (rc) goto failed;
     r->phase = DS4_SCR_REFRESH_SEAL;
     t = now_sec();
     rc = ds4_session_scr_archive_seal(s, full.v + start, count);
@@ -3832,14 +3859,12 @@ refused:
     return 1;
 }
 
-/* Exclusive startup selection for the selected fast capture batch body. */
+/* Compatibility startup check: batched capture is SCR's only capture body,
+ * so this selects nothing and only validates an SCR-compatible empty session. */
 int ds4_session_scr_enable_capture_batch_chunks(ds4_session *s, char *err, size_t errlen) {
-    if (!ds41_scr_empty_startup(s) || s->scr_capture_batch_chunks) {
-        if (err && errlen) snprintf(err, errlen, "capture batch requires exclusive empty startup selection");
-        return 1;
-    }
-    s->scr_capture_batch_chunks = true;
-    return 0;
+    if (ds41_scr_empty_startup(s)) return 0;
+    if (err && errlen) snprintf(err, errlen, "capture batch requires an SCR-compatible empty session");
+    return 1;
 }
 
 /* Logical SCR policy: the server's only SCR prefill entry. Archive planning is
@@ -3859,6 +3884,10 @@ typedef struct {
     ds41_even_plan plan;
     uint32_t logical_tokens, physical_tokens, new_pads, carried_pads;
     uint32_t imported_pads, useful_committed, boundary_policy;
+    /* Rebase execution accounting in physical coordinates (see
+     * ds41_even_executed_subset): reused, fresh gaps between executed
+     * ranges, and the fresh suffix after the last one. */
+    uint32_t executed_reused, executed_gap, executed_suffix;
     uint64_t map_identity, planning_work, planning_comparisons, peak_host_bytes;
     uint32_t planner_status, planner_best_useful, planner_admissible_min;
     uint32_t planner_covered, planner_padding;
@@ -3876,6 +3905,8 @@ static bool ds41_even_admit(ds4_session *s, uint64_t bytes, ds41_even_receipt *r
     if (bytes > r->peak_host_bytes) r->peak_host_bytes = bytes;
     return true;
 }
+/* The engine may stop a selected range early but not move it; the library
+ * checks that subset and alignment, the floor and pad count stay here. */
 static bool ds41_even_executed_subset(ds41_even_receipt *r,
         const ds41_scr_coordinates *map, ds41_pad_budget *budget, uint32_t *pads) {
     const ds41_even_plan *proposal = &r->plan;
@@ -3884,29 +3915,38 @@ static bool ds41_even_executed_subset(ds41_even_receipt *r,
     if (!proposal->verified || !actual->published || !actual->covered_head_completed ||
         actual->planned_spans != proposal->range_count ||
         actual->planned_tokens != proposal->physical_reused ||
+        proposal->range_count > DS4_SCR_MULTI_MAX_RANGES ||
         actual->normalized_spans > proposal->range_count ||
         actual->committed_spans != actual->normalized_spans ||
         actual->committed_tokens != actual->imported_tokens) return false;
-    uint32_t tokens = 0, previous = 0;
+    cache_reuse_range planned[DS4_SCR_MULTI_MAX_RANGES], executed[DS4_SCR_MULTI_MAX_RANGES];
+    for (uint32_t i = 0; i < proposal->range_count; ++i) {
+        const ds4_scr_range *p = &proposal->ranges[i];
+        planned[i] = (cache_reuse_range){p->source_start, p->destination_start, p->count,
+                                         p->destination_start};
+    }
+    for (uint32_t i = 0; i < actual->normalized_spans; ++i) {
+        const ds4_scr_range *p = &actual->ranges[i];
+        if (p->count < 128u) return false;
+        executed[i] = (cache_reuse_range){p->source_start, p->destination_start, p->count,
+                                          p->destination_start};
+    }
+    cache_reuse_execution_summary summary;
+    if (cache_reuse_reconcile_executed_ranges(planned, proposal->range_count, executed,
+            actual->normalized_spans, map->physical_tokens, 2u, &summary, NULL, 0) !=
+        CACHE_REUSE_COMPLETE) return false;
     for (uint32_t i = 0; i < actual->normalized_spans; ++i) {
         const ds4_scr_range *range = &actual->ranges[i];
-        uint32_t j = previous;
-        for (; j < proposal->range_count; ++j) {
-            if (!ds41_pad_tick(budget)) return false;
-            const ds4_scr_range *selected = &proposal->ranges[j];
-            if (selected->source_start == range->source_start &&
-                selected->destination_start == range->destination_start &&
-                range->count <= selected->count) break;
-        }
-        if (j == proposal->range_count || range->count < 128u || range->count % 2u) return false;
-        previous = j + 1u; tokens += range->count;
         for (uint32_t p = 0; p < map->count; ++p) {
             if (!ds41_pad_tick(budget)) return false;
             if (map->pads[p] >= range->destination_start &&
                 map->pads[p] - range->destination_start < range->count) ++*pads;
         }
     }
-    return tokens == actual->committed_tokens && *pads <= tokens;
+    r->executed_reused = summary.reused_tokens;
+    r->executed_gap = summary.gap_tokens;
+    r->executed_suffix = summary.suffix_tokens;
+    return summary.reused_tokens == actual->committed_tokens && *pads <= summary.reused_tokens;
 }
 /* No archive plan (no source, logical continuation, or <=128 unmatched
  * tokens): keep the live physical prefix that covers the common logical prefix,
@@ -3959,11 +3999,20 @@ static int ds41_even_prepare_boundaries(ds4_session *s, const ds4_tokens *logica
     return 0;
 }
 
-/* Without fresh-gap authority a map may carry no pads at all. */
+/* Without fresh-gap authority a map may carry no pads at all. With `logical`,
+ * removing the pads must also leave exactly that request. Pads are checked
+ * here rather than by cache_reuse_verify_separator_map: the planner may insert
+ * at any boundary (allow_all_insertions), not only beside a separator. */
 static bool ds41_boundary_map_authorized(const ds41_scr_coordinates *map, const int *physical,
-        const ds41_boundary_permissions *permissions, ds41_pad_budget *budget) {
+        const int *logical, const ds41_boundary_permissions *permissions,
+        ds41_pad_budget *budget) {
     if (!ds41_coordinates_shape(map) || map->physical_tokens - map->count != permissions->logical_tokens ||
         (map->count && !physical))
+        return false;
+    bool matches = false;
+    if (logical && (cache_reuse_verify_matches_logical((const int32_t *)physical,
+            map->physical_tokens, map->pads, map->count, (const int32_t *)logical,
+            permissions->logical_tokens, &matches, NULL, 0) != CACHE_REUSE_COMPLETE || !matches))
         return false;
     if (permissions->policy != DS4_SCR_BOUNDARIES_FRESH_GAP_SPACE_V1) return map->count == 0;
     for (uint32_t i = 0; i < map->count; ++i) {
@@ -4115,7 +4164,7 @@ static int ds41_even_policy_impl(ds4_session *s, const ds4_tokens *request,
         if (rc) { snprintf(err, errlen, "logical SCR: physical prefix construction refused"); goto done; }
         r->plan = (ds41_even_plan){.planned = true, .verified = true,
             .physical_count = pending.physical_tokens, .pad_count = pending.count};
-        if (!ds41_boundary_map_authorized(&pending, physical.v, &permissions, &budget)) {
+        if (!ds41_boundary_map_authorized(&pending, physical.v, logical.v, &permissions, &budget)) {
             rc = budget.cancelled ? DS4_SESSION_SYNC_INTERRUPTED : 1;
             snprintf(err, errlen, "logical SCR: artificial token outside certified separator");
             goto done;
@@ -4148,7 +4197,6 @@ static int ds41_even_policy_impl(ds4_session *s, const ds4_tokens *request,
     owner = (ds41_policy_owner){.session = s, .identity = &owner, .full = &physical,
         .bytes = physical.v, .length = physical.len, .capacity = physical.cap,
         .live_host_bytes = host, .archive_capacity = cap, .active = true,
-        .capture_batch_chunks = s->scr_capture_batch_chunks,
         .source_pads_are_content = actual_plan};
     s->scr_dense_owner = &owner;
     r->execution.outer_host_bytes = host;
@@ -4216,7 +4264,8 @@ static int ds41_even_policy_impl(ds4_session *s, const ds4_tokens *request,
     }
     if (!rc) {
         publication_attempted = true;
-        if (!ds41_boundary_map_authorized(&pending, physical.v, &permissions, &budget) ||
+        /* The input copy is gone; the pre-execution check proved the projection. */
+        if (!ds41_boundary_map_authorized(&pending, physical.v, NULL, &permissions, &budget) ||
             !ds41_policy_publish_coordinates(&owner, &pending)) {
             rc = 1; snprintf(err, errlen, "logical SCR: authorized headed map publication failed");
         } else if ((rc = ds41_session_rebase_commit(s, &owner, &r->execution.multi))) {
@@ -4520,7 +4569,7 @@ static int ds41_scr_planner_prepare_actual(
         return 1;
     }
     free(pads);
-    if (!ds41_boundary_map_authorized(pending, physical->v, permissions, budget)) {
+    if (!ds41_boundary_map_authorized(pending, physical->v, request->v, permissions, budget)) {
         snprintf(err, errlen, "actual SCR: insertion outside permitted boundary");
         return 1;
     }
@@ -5116,17 +5165,36 @@ int ds4_session_scr_pool_select(ds4_session *s, ds4_scr_pool *p, const ds4_token
     ds41_scr_archive *a = g->archive;
     const bool hot = a && ds41_archive_owned_sealed(a, s) && !a->retiring &&
         ds41_archive_count(a) >= 128u;
-    if (hot) r->hot_covered = r->best_covered = ds41_pool_score(s, request, a->tokens,
-        ds41_archive_count(a), a->source_generation, &config);
-    char winner[17] = "";
-    for (uint32_t i = 0; i < p->count; ++i) {
+    /* Each candidate is planned here under the scoring budget; the library
+     * weighs that plan against its aligned common prefix and picks one. */
+    cache_reuse_candidate hot_candidate = {0}, pool[DS4_SCR_POOL_MAX_ENTRIES];
+    uint32_t pool_entry[DS4_SCR_POOL_MAX_ENTRIES];
+    if (hot) {
+        r->hot_covered = ds41_pool_score(s, request, a->tokens, ds41_archive_count(a),
+                                         a->source_generation, &config);
+        hot_candidate = (cache_reuse_candidate){(const int32_t *)a->tokens,
+            ds41_archive_count(a), NULL, 0, r->hot_covered};
+    }
+    for (uint32_t i = 0; i < p->count && i < DS4_SCR_POOL_MAX_ENTRIES; ++i) {
         const ds41_pool_entry *e = &p->entry[i];
         if (hot && ds41_pool_hot(p, a) && !strcmp(e->name, p->hot_name)) continue;
         if (ds4_session_cancelled(s)) break;
-        ++r->candidates;
-        uint32_t covered = ds41_pool_score(s, request, e->tokens, e->h.end - e->h.start,
-                                           e->h.generation, &config);
-        if (covered > r->best_covered) { r->best_covered = covered; memcpy(winner, e->name, 17); }
+        const uint32_t count = e->h.end - e->h.start;
+        pool_entry[r->candidates] = i;
+        pool[r->candidates++] = (cache_reuse_candidate){(const int32_t *)e->tokens, count,
+            NULL, 0, ds41_pool_score(s, request, e->tokens, count, e->h.generation, &config)};
+    }
+    const cache_reuse_candidate_policy policy = {.minimum_match_tokens = 128u,
+        .alignment = 2u, .restore_penalty_tokens = 0u};
+    cache_reuse_candidate_selection selection = {0};
+    char winner[17] = "";
+    if (!ds4_session_cancelled(s) &&
+        cache_reuse_select_candidate((const int32_t *)request->v, n, hot ? &hot_candidate : NULL,
+            pool, r->candidates, &policy, &selection, NULL, 0) == CACHE_REUSE_COMPLETE) {
+        r->best_covered = selection.reusable_tokens;
+        if (selection.action == CACHE_REUSE_ACTION_RESTORE_POOL &&
+            selection.pool_index < r->candidates)
+            memcpy(winner, p->entry[pool_entry[selection.pool_index]].name, 17);
     }
     int rc = 0;
     if (winner[0] && !ds4_session_cancelled(s)) {

@@ -4,13 +4,13 @@ version = 4
 
 [[package]]
 name = "cache-reuse-utils"
-version = "0.2.0"
-source = "git+https://github.com/webdesserts/cache-reuse-utils.git?rev=0a290dce62fbcbb7c434fa60057d246934865645#0a290dce62fbcbb7c434fa60057d246934865645"
+version = "0.3.0"
+source = "git+https://github.com/webdesserts/cache-reuse-utils.git?rev=b5b6e6d07887a0fc7ad32a1de1f048dddc7b9360#b5b6e6d07887a0fc7ad32a1de1f048dddc7b9360"
 
 [[package]]
 name = "cache-reuse-utils-ffi"
-version = "0.2.0"
-source = "git+https://github.com/webdesserts/cache-reuse-utils.git?rev=0a290dce62fbcbb7c434fa60057d246934865645#0a290dce62fbcbb7c434fa60057d246934865645"
+version = "0.3.0"
+source = "git+https://github.com/webdesserts/cache-reuse-utils.git?rev=b5b6e6d07887a0fc7ad32a1de1f048dddc7b9360#b5b6e6d07887a0fc7ad32a1de1f048dddc7b9360"
 dependencies = [
  "cache-reuse-utils",
 ]
@@ -20,4 +20,16 @@ name = "ds4-cache-reuse"
 version = "0.1.0"
 dependencies = [
  "cache-reuse-utils-ffi",
+ "kv-archive-store-ffi",
+]
+
+[[package]]
+name = "kv-archive-store"
+version = "0.1.0"
+
+[[package]]
+name = "kv-archive-store-ffi"
+version = "0.1.0"
+dependencies = [
+ "kv-archive-store",
 ]

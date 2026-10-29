@@ -42348,8 +42348,11 @@ static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) 
         !getenv("DS4_METAL_DISABLE_V41_TP_SMALL_PREFILL") ? 32u : 256u;
 #endif
     /* Resident appends do not pay for an SSD layer sweep. In particular,
-     * the server's 128-token mixed quantum must not become scalar prefill. */
-    if (!g->streaming && g->tp_world == 1) minimum = 8u;
+     * the server's 128-token mixed quantum must not become scalar prefill.
+     * From two rows one layer-major pass replaces repeated scalar passes;
+     * ds41_matmul_batch keeps 2..DS4_TP_BATCH_MAX_ROWS rows on its
+     * per-row decode reductions. */
+    if (!g->streaming && g->tp_world == 1) minimum = 2u;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     /* With at least half the experts cached, warm short appends beat a full
      * disk sweep. Leave a token-major tail to warm the following decode too. */
@@ -61275,7 +61278,6 @@ struct ds4_session {
     ds4_scr_padding_policy scr_padding_policy;
     int scr_padding_token;
     bool scr_padding_selected;
-    bool scr_capture_batch_chunks; /* Explicit selected fast body; known unequal logits. */
     ds4_dist_session *distributed;
     uint64_t tp_session_id;
     uint64_t glm_reserved_graph_bytes;

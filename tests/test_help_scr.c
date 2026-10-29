@@ -30,11 +30,11 @@ int main(void) {
     for (size_t i = 0; i < sizeof(retired) / sizeof(retired[0]); ++i) assert(!option_entry(buf, retired[i]));
     char range[32]; snprintf(range, sizeof(range), "1..%u", DS4_SCR_MULTI_MAX_RANGES);
     assert(strstr(buf, range) != NULL);
-    assert(strstr(buf, "known unequal logits") != NULL);
+    assert(strstr(buf, "unequal logits") == NULL && strstr(buf, "batched capture") != NULL);
     f = tmpfile(); assert(f);
     ds4_help_print(f, DS4_HELP_SERVER, "kv-cache"); rewind(f);
     n = fread(buf, 1, sizeof(buf) - 1, f); buf[n] = 0; fclose(f);
     assert(strstr(buf, "persistent SCR checkpoint pool") != NULL);
-    puts("help: surviving SCR options, retired selectors hidden, K bound, unequal-logit warning, checkpoint pool");
+    puts("help: surviving SCR options, retired selectors hidden, K bound, batched capture without the retired unequal-logit warning, checkpoint pool");
     return 0;
 }

@@ -201,7 +201,7 @@ static void harness_session_open(ds4_engine *e, ds4_session *s, uint32_t ctx, ui
     *e = (ds4_engine){.backend = DS4_BACKEND_METAL};
     *s = (ds4_session){.engine = e, .ctx_size = (int)ctx, .ds41_graph_ready = true,
         .progress = progress, .display_progress = progress, .cancel = cancel,
-        .scr_planner_budget_ms = 5000u, .scr_capture_batch_chunks = true};
+        .scr_planner_budget_ms = 5000u};
     session = s;
     ds41_gpu_graph *g = &s->ds41_graph;
     g->ctx = ctx; g->tp_world = 1; g->prefill_cap = prefill_cap; g->valid = true;

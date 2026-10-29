@@ -22,6 +22,7 @@ static ds4_gpu_tensor *alloc_boundary(uint64_t);
 #define DS41_SYNC_STEP model_step
 #define DS41_SYNC_SHORT model_short
 #define DS41_SYNC_PREFILL model_prefill
+#define DS41_SYNC_CAPTURE_BATCH_PREFILL model_prefill
 #define DS41_SYNC_SWEEP model_sweep
 #define DS41_SYNC_HEAD model_head
 #define DS41_SYNC_ACQUIRE encoder_acquire
@@ -116,6 +117,10 @@ static bool model_rows(ds41_gpu_graph *g, const int *v, uint32_t n, bool defer) 
     if (fail_pos >= 0 && g->pos == (uint32_t)fail_pos) return false;
     capture(g, g->pos, n);
     g->pos += n; next_position += n; g->valid = true;
+    /* Advance the rolling history as model prefill does; batched rebase
+     * capture proves it at each chunk frontier. */
+    for (uint32_t i = 0; g->token_map && i < 3u && g->pos > i; ++i)
+        g->history.tail[i] = (int32_t)g->token_map[target[g->pos - 1u - i]];
     if (cancel_pos >= 0 && g->pos >= (uint32_t)cancel_pos) cancel_now = true;
     if (defer) ++deferred;
     return true;

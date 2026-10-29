@@ -1,6 +1,7 @@
-# Thin static-library shell around the pinned cache-reuse-utils C ABI.
-# Cargo does not emit a stable staticlib path for a dependency, so this crate
-# re-exports the FFI entry point and produces libds4_cache_reuse.a.
+# Thin static-library shell around the pinned cache-reuse-utils and
+# kv-archive-store C ABIs. Cargo does not emit a stable staticlib path for a
+# dependency, so this crate re-exports both FFI families and produces
+# libds4_cache_reuse.a.
 [package]
 name = "ds4-cache-reuse"
 version = "0.1.0"
@@ -14,7 +15,9 @@ crate-type = ["staticlib"]
 path = "src/lib.rs"
 
 [dependencies]
-cache-reuse-utils-ffi = { git = "https://github.com/webdesserts/cache-reuse-utils.git", rev = "0a290dce62fbcbb7c434fa60057d246934865645" }
+cache-reuse-utils-ffi = { git = "https://github.com/webdesserts/cache-reuse-utils.git", rev = "b5b6e6d07887a0fc7ad32a1de1f048dddc7b9360" }
+# Local checkout at 9e62ff39e455422ad21ebb3eb0324413ca1e3579; it has no remote.
+kv-archive-store-ffi = { path = "../../../kv-archive-store/ffi" }
 
 [profile.release]
 panic = "unwind"

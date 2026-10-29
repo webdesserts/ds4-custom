@@ -15,7 +15,6 @@ static void actual_no_padding_test(ds4_session *s, int *source, int *v, uint32_t
     ds4_session_invalidate(s);
     s->checkpoint.len = 0; s->checkpoint_valid = false;
     s->scr_planner_budget_ms = 5000u;
-    s->scr_capture_batch_chunks = true;
     for (uint32_t i = 0; i < 4096u; ++i) source[i] = 1000 + (int)i;
     controls(source);
     CHECK(!ds4_session_scr_archive_prepare(s, 8u, archive_count));
@@ -81,7 +80,6 @@ static void actual_padding_boundary_test(ds4_session *s, int *source, int *v) {
     ds4_session_invalidate(s);
     s->checkpoint.len = 0; s->checkpoint_valid = false;
     s->scr_planner_budget_ms = 5000u;
-    s->scr_capture_batch_chunks = true;
     s->scr_padding_policy = DS4_SCR_PADDING_PLANNER_FRESH_GAP_SPACE;
     s->scr_padding_selected = true; s->scr_padding_token = 201;
     for (uint32_t i = 0; i < 4096u; ++i) source[i] = 1000 + (int)i;
@@ -171,7 +169,6 @@ static void actual_failure_setup(ds4_session *s, int *source, int *v,
     ds4_session_invalidate(s);
     s->checkpoint.len = 0; s->checkpoint_valid = false;
     s->scr_planner_budget_ms = 5000u;
-    s->scr_capture_batch_chunks = true;
     for (uint32_t i = 0; i < 4096u; ++i) source[i] = 1000 + (int)i;
     controls(source);
     CHECK(!ds4_session_scr_archive_prepare(s, 8u, archive_count));

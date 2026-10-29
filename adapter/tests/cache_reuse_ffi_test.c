@@ -1,8 +1,60 @@
-/* ds4-side smoke test of the pinned cache-reuse-utils C ABI as the native
- * adapter uses it. Host-only: links just the static planner archive. */
+/* ds4-side smoke test of the pinned cache-reuse-utils and kv-archive-store C
+ * ABIs as the native adapter uses them. Host-only: links just the static
+ * planner archive. */
 #include "cache_reuse_utils.h"
+#include "kv_archive_store.h"
 #include <stdio.h>
 #include <string.h>
+
+#define EXPECT(cond, msg) do { if (!(cond)) { fprintf(stderr, "%s\n", msg); return 1; } } while (0)
+
+/* The coordinate, range and selection helpers the SCR engine delegates to. */
+static int smoke_engine_helpers(void) {
+    const int32_t physical[5] = {5, 0, 6, 0, 7}, logical[3] = {5, 6, 7};
+    const uint32_t pads[2] = {1, 3};
+    bool ok = false;
+    EXPECT(cache_reuse_verify_matches_logical(physical, 5, pads, 2, logical, 3, &ok, NULL, 0) == 0 && ok,
+           "verify_matches_logical refused a valid map");
+    EXPECT(cache_reuse_verify_matches_logical(physical, 5, pads, 1, logical, 3, &ok, NULL, 0) == 0 && !ok,
+           "verify_matches_logical accepted a missing pad");
+    uint32_t out[4] = {0}, len = 0;
+    EXPECT(cache_reuse_slice_pad_positions(pads, 2, 5, 2, 3, out, 4, &len, NULL, 0) == 0 &&
+           len == 1 && out[0] == 1, "slice_pad_positions");
+    EXPECT(cache_reuse_truncate_pad_positions(pads, 2, 5, 3, &len, NULL, 0) == 0 && len == 1,
+           "truncate_pad_positions");
+    EXPECT(cache_reuse_append_unpadded(5, pads, 2, 2, &len, NULL, 0) == 0 && len == 7,
+           "append_unpadded");
+    EXPECT(cache_reuse_append_unpadded(UINT32_MAX, NULL, 0, 1, &len, NULL, 0) == CACHE_REUSE_ERR_INVALID,
+           "append_unpadded overflow was not rejected");
+    const uint32_t dst_pads[1] = {12};
+    cache_reuse_range span = {2, 0, 4, 10};
+    EXPECT(cache_reuse_verify_span_correspondence((const uint32_t[]){4}, 1, 8, dst_pads, 1, 16,
+               &span, &ok, NULL, 0) == 0 && ok, "verify_span_correspondence");
+    cache_reuse_range planned[2] = {{4, 4, 8, 4}, {16, 16, 8, 16}}, clipped[2];
+    EXPECT(cache_reuse_clip_ranges_to_archive(planned, 2, 0, 100, 19, 2, clipped, 2, &len, NULL, 0) == 0 &&
+           len == 2 && clipped[1].count == 2, "clip_ranges_to_archive");
+    cache_reuse_range executed[2] = {{4, 4, 4, 4}, {16, 16, 8, 16}};
+    cache_reuse_execution_summary summary;
+    EXPECT(cache_reuse_reconcile_executed_ranges(planned, 2, executed, 2, 32, 2, &summary, NULL, 0) == 0 &&
+           summary.reused_tokens == 12 && summary.gap_tokens == 8 && summary.suffix_tokens == 8,
+           "reconcile_executed_ranges");
+    const int32_t target[3] = {1, 2, 3}, hot_tokens[2] = {1, 9};
+    cache_reuse_candidate hot = {hot_tokens, 2, NULL, 0, 0}, pool = {target, 3, NULL, 0, 0};
+    cache_reuse_candidate_policy policy = {1, 1, 1};
+    cache_reuse_candidate_selection pick;
+    EXPECT(cache_reuse_select_candidate(target, 3, &hot, &pool, 1, &policy, &pick, NULL, 0) == 0 &&
+           pick.action == CACHE_REUSE_ACTION_RESTORE_POOL && pick.pool_index == 0 &&
+           pick.reusable_tokens == 3, "select_candidate");
+    /* Two records of two layers, two bytes per row, gathered layer-major. */
+    const uint8_t window[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+    uint8_t gathered[8] = {0};
+    const uint8_t layer_major[8] = {0, 1, 4, 5, 2, 3, 6, 7};
+    EXPECT(kv_archive_gather_layers(window, 8, 2, 2, 2, gathered, 8, 2, NULL, 0) == KV_ARCHIVE_OK &&
+           !memcmp(gathered, layer_major, 8), "kv_archive_gather_layers");
+    EXPECT(kv_archive_gather_layers(window, 8, 2, 2, 2, gathered, 4, 1, NULL, 0) == KV_ARCHIVE_ERR_INVALID,
+           "short kv gather output was not rejected");
+    return 0;
+}
 
 static cache_reuse_config config_for(uint32_t k) {
     cache_reuse_config c;
@@ -245,6 +297,7 @@ int main(void) {
         fprintf(stderr, "cancel was not propagated\n");
         return 1;
     }
+    if (smoke_engine_helpers()) return 1;
     puts("cache_reuse_ffi_test: ok");
     return 0;
 }
