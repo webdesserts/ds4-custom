@@ -2,6 +2,8 @@
   <img src="logo.svg" alt="DwarfStar logo" width="220">
 </p>
 
+> **Fork notice (`webdesserts/ds4-custom`):** This repository is a personal fork of [`antirez/ds4`](https://github.com/antirez/ds4) customized for local agent workloads on Apple Silicon. It integrates **Suffix Cache Reuse (SCR)** powered by [`webdesserts/cache-reuse-utils`](https://github.com/webdesserts/cache-reuse-utils) (`v0.2.0`), a persistent on-disk SCR checkpoint pool (`--scr --kv-disk-dir`) for cross-restart and multi-branch KV reuse, per-request `"reuse": "scr" | "exact"` control, and `ds4.reuse.v1` telemetry. See [`INTEGRATION.md`](INTEGRATION.md) for architecture, CLI flags, and M5 Ultra benchmarks.
+
 **DwarfStar** aims to be the best way to run a few excellent large
 language models on consumer hardware (that is, hardware that people
 can actually own). To reach this goal, we are building

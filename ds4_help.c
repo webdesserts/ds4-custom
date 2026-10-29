@@ -348,6 +348,10 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--port N", "Bind port. Default: 8000");
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
+    opt(fp, c, "--scr", "Experimental suffix cache reuse (DeepSeek V4.1, Metal, loopback, single text slot, no KV-cache tuning; dedicated client only). Logical coordinates, batch capture and planner fresh-gap padding with the cache-reuse-utils planner. Batch capture has known unequal logits versus scalar capture; no general numerical or quality qualification is claimed.");
+    opt(fp, c, "--scr-tail-tokens C", "SCR archive capacity; eight-aligned 128..1M and <= ctx. Default with --scr: ctx. A nonzero value alone also enables --scr.");
+    opt(fp, c, "--scr-max-ranges K", "SCR planner range bound 1..32. Default: 32.");
+    opt(fp, c, "--scr-planner-budget-ms MS", "SCR planner deadline 0..60000. Default: 5000.");
     opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
     opt(fp, c, "--mixed-prefill-quantum N", "Prefill chunk while generations are active. Default: 128; GLM-5.3 minimum: 1024");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
@@ -367,8 +371,8 @@ static void print_server_thinking(FILE *fp, const help_colors *c) {
 
 static void print_kv_cache(FILE *fp, const help_colors *c) {
     title(fp, c, "Disk KV Cache");
-    opt(fp, c, "--kv-disk-dir DIR", "Enable disk KV checkpoints in DIR.");
-    opt(fp, c, "--kv-disk-space-mb N", "Disk budget. Default when enabled: 4096");
+    opt(fp, c, "--kv-disk-dir DIR", "Enable disk KV checkpoints in DIR. With --scr: persistent SCR checkpoint pool (up to 16 sealed archives) instead.");
+    opt(fp, c, "--kv-disk-space-mb N", "Disk budget. Default when enabled: 4096; with --scr: 32768");
     opt(fp, c, "--kv-cache-min-tokens N", "Do not save/load checkpoints shorter than N. Default: 512");
     opt(fp, c, "--kv-cache-cold-max-tokens N", "Save cold first prompts up to N tokens. 0 disables. Default: 30000");
     opt(fp, c, "--kv-cache-continued-interval-tokens N", "Save aligned continued frontiers. 0 disables. Default: 10000");

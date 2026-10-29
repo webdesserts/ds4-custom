@@ -1,3 +1,8 @@
+/target/
+/build/
+/adapter/cache-reuse/target/
+/adapter/tests/cache_reuse_ffi_test
+
 /ds4
 /ds4-server
 /ds4-bench

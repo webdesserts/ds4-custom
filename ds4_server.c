@@ -4,6 +4,9 @@
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
+#define DS4_SERVER_SCR_TYPES
+#include "ds4_server_scr.h"
+#undef DS4_SERVER_SCR_TYPES
 #include "ds4_tp.h"
 #include "rax.h"
 
@@ -823,6 +826,8 @@ typedef struct {
     uint64_t seed;
     bool stream;
     bool stream_include_usage;
+    bool stream_include_ds4_scr;
+    bool reuse_exact; /* Per-request "reuse":"exact": ordinary exact-prefix prefill under --scr. */
     bool ignore_eos;
     int cache_read_tokens;
     int cache_write_tokens;
@@ -1376,7 +1381,19 @@ static size_t utf8_stream_safe_len(const char *s, size_t start,
     return (limit - lead) < (size_t)need ? lead : limit;
 }
 
-static bool parse_stream_options(const char **p, bool *include_usage) {
+/* Optional per-request reuse mode: "scr" (the default when --scr is enabled) or
+ * "exact" (ordinary exact-prefix prefill, no planner). Other values are refused. */
+static bool parse_reuse_mode(const char **p, bool *exact) {
+    char *mode = NULL;
+    if (!json_string(p, &mode)) return false;
+    const bool ok = !strcmp(mode, "scr") || !strcmp(mode, "exact");
+    if (ok) *exact = !strcmp(mode, "exact");
+    free(mode);
+    return ok;
+}
+#define REUSE_MODE_ERROR "reuse must be \"scr\" or \"exact\""
+
+static bool parse_stream_options(const char **p, bool *include_usage, bool *include_scr) {
     json_ws(p);
     if (**p != '{') return json_skip_value(p);
     (*p)++;
@@ -1395,6 +1412,8 @@ static bool parse_stream_options(const char **p, bool *include_usage) {
                 free(key);
                 return false;
             }
+        } else if (!strcmp(key, "include_ds4_scr")) {
+            if (!json_bool(p, include_scr)) { free(key); return false; }
         } else if (!json_skip_value(p)) {
             free(key);
             return false;
@@ -4096,11 +4115,21 @@ static void anthropic_prepare_live_continuation(server *s, request *r,
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
  * prompt plus the small amount of protocol state needed to translate the reply. */
+#define DS4_SERVER_SCR_GUARDS
+#include "ds4_server_scr.h"
+#undef DS4_SERVER_SCR_GUARDS
+
 static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_tokens,
                                int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
+    if (!server_scr_chat_guard(s, body)) {
+        snprintf(err, errlen, "SCR requires stateless chat: prohibited stateful input or malformed JSON");
+        request_free(r);
+        return false;
+    }
     r->model_syntax = server_model_syntax_for_engine(e);
     const char *p = body;
+    bool bad_reuse = false;
     bool got_messages = false;
     bool tool_choice_none = false;
     bool got_thinking = false;
@@ -4127,6 +4156,14 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
             if (!parse_messages(&p, &msgs)) {
                 free(key);
                 goto bad;
+            }
+            if (!server_scr_images_guard(s, &msgs)) {
+                free(key);
+                snprintf(err, errlen, "SCR requires text-only chat");
+                chat_msgs_free(&msgs);
+                free(tool_schemas);
+                request_free(r);
+                return false;
             }
             got_messages = true;
         } else if (!strcmp(key, "tools")) {
@@ -4203,8 +4240,14 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "reuse")) {
+            if (!parse_reuse_mode(&p, &r->reuse_exact)) {
+                free(key);
+                bad_reuse = true;
+                goto bad;
+            }
         } else if (!strcmp(key, "stream_options")) {
-            if (!parse_stream_options(&p, &r->stream_include_usage)) {
+            if (!parse_stream_options(&p, &r->stream_include_usage, &r->stream_include_ds4_scr)) {
                 free(key);
                 goto bad;
             }
@@ -4268,6 +4311,13 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    if (!server_scr_images_guard(s, &msgs)) {
+        snprintf(err, errlen, "SCR requires text-only chat");
+        chat_msgs_free(&msgs);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
@@ -4288,7 +4338,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
 bad:
     chat_msgs_free(&msgs);
     free(tool_schemas);
-    snprintf(err, errlen, "invalid JSON request");
+    snprintf(err, errlen, "%s", bad_reuse ? REUSE_MODE_ERROR : "invalid JSON request");
     request_free(r);
     return false;
 }
@@ -5593,6 +5643,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     request_init(r, REQ_COMPLETION, def_tokens);
     r->model_syntax = server_model_syntax_for_engine(e);
     const char *p = body;
+    bool bad_reuse = false;
     char *prompt = NULL;
     bool got_thinking = false;
     bool thinking_enabled = true;
@@ -5673,8 +5724,14 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "reuse")) {
+            if (!parse_reuse_mode(&p, &r->reuse_exact)) {
+                free(key);
+                bad_reuse = true;
+                goto bad;
+            }
         } else if (!strcmp(key, "stream_options")) {
-            if (!parse_stream_options(&p, &r->stream_include_usage)) {
+            if (!parse_stream_options(&p, &r->stream_include_usage, &r->stream_include_ds4_scr)) {
                 free(key);
                 goto bad;
             }
@@ -5737,7 +5794,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     return true;
 bad:
     free(prompt);
-    snprintf(err, errlen, "invalid JSON request");
+    snprintf(err, errlen, "%s", bad_reuse ? REUSE_MODE_ERROR : "invalid JSON request");
     request_free(r);
     return false;
 }
@@ -10144,6 +10201,13 @@ struct server {
     server_slot *slots;
     int slot_count;
     int ctx_size;
+    int scr_tail_tokens;
+    int scr_max_ranges;
+    int scr_planner_budget_ms;
+    server_reuse_telemetry reuse;
+    ds4_scr_pool *scr_pool; /* --kv-disk-dir under --scr; NULL otherwise. */
+    bool scr_ownership_fatal, scr_listener_owned;
+    int scr_listener_fd;
     bool batched_mode;
     pthread_t *slot_threads;
     pthread_t decode_thread;
@@ -10215,6 +10279,11 @@ struct job {
     request req;
     bool done;
     bool cancelled;
+    bool scr_terminal_success; /* Assigned worker outcome; false on early return. */
+    bool scr_repair_failed;
+    job_reuse_telemetry reuse;
+    const char *scr_finish;
+    int scr_delivery; /* -1: unknown on early return; 0/1: final delivery failed/succeeded. */
     pthread_mutex_t mu;
     pthread_cond_t cv;
     job *next;
@@ -11968,7 +12037,7 @@ static uint64_t trace_begin(
         server *s,
         const job *j,
         int cached,
-        int effective_prompt_tokens,
+        const ds4_tokens *prompt_for_sync,
         const trace_cache_diag *cache_diag,
         const char *cache_source,
         int disk_cached,
@@ -11980,14 +12049,14 @@ static uint64_t trace_begin(
     fprintf(s->trace, "\n===== request %llu ", (unsigned long long)id);
     trace_time(s->trace);
     fprintf(s->trace,
-            " =====\nkind: %s\nmodel: %s\nstream: %d\ntools: %d\nthink_mode: %s\nprompt_tokens: %d\neffective_prompt_tokens: %d\ncached_tokens: %d\nmax_tokens: %d\ntemperature: %.3f\ntop_k: %d\ntop_p: %.3f\nmin_p: %.3f\nignore_eos: %d\nseed: %llu\n",
+            " =====\nkind: %s\nmodel: %s\nstream: %d\ntools: %d\nthink_mode: %s\nprompt_tokens: %d\neffective_prompt_tokens: %d\ncached_tokens: %d\nmax_tokens: %d\ntemperature: %.9g\ntop_k: %d\ntop_p: %.9g\nmin_p: %.9g\nignore_eos: %d\nseed: %llu\n",
             j->req.kind == REQ_CHAT ? "chat" : "completion",
             j->req.model ? j->req.model : "",
             j->req.stream ? 1 : 0,
             j->req.has_tools ? 1 : 0,
             ds4_think_mode_name(j->req.think_mode),
             j->req.prompt.len,
-            effective_prompt_tokens,
+            prompt_for_sync ? prompt_for_sync->len : -1,
             cached,
             j->req.max_tokens,
             j->req.temperature,
@@ -11996,6 +12065,7 @@ static uint64_t trace_begin(
             j->req.min_p,
             j->req.ignore_eos ? 1 : 0,
             (unsigned long long)j->req.seed);
+    trace_prompt_ids(s->trace, &j->req.prompt, prompt_for_sync);
     fprintf(s->trace, "stream_include_usage: %d\n",
             j->req.stream_include_usage ? 1 : 0);
     trace_write_cache_diag(s, cache_diag, &j->req.tool_replay, cached,
@@ -12471,6 +12541,10 @@ static int server_session_sync(server *s, server_slot *slot,
            DS4_SESSION_SYNC_INTERRUPTED : 0;
 }
 
+#define DS4_SERVER_SCR_RUNTIME
+#include "ds4_server_scr.h"
+#undef DS4_SERVER_SCR_RUNTIME
+
 static int server_multimodal_resume_frontier(int live, int common,
                                              int prompt_len,
                                              bool image_state_matches) {
@@ -12556,6 +12630,24 @@ static int server_session_sync_multimodal(server *s, server_slot *slot,
            DS4_SESSION_SYNC_INTERRUPTED : 0;
 }
 
+static int server_session_sync_physical(server *s, server_slot *slot,
+                                        const ds4_tokens *prompt,
+                                        char *err, size_t errlen) {
+    if (!s || !slot || !prompt) return 1;
+    pthread_mutex_lock(&s->inference_mu);
+    bool mapped = ds4_session_has_physical_coordinates(slot->session);
+    pthread_mutex_unlock(&s->inference_mu);
+    if (!mapped) return server_session_sync(s, slot, prompt, err, errlen);
+    if (s->batched_mode) {
+        snprintf(err, errlen, "mapped recovery does not support batched prefill");
+        return 1;
+    }
+    if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
+    int rc = ds4_session_sync_physical(slot->session, prompt, err, errlen);
+    server_prefill_leave(s);
+    return rc;
+}
+
 static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
                                                    const char *suffix,
                                                    int *tokens_appended,
@@ -12571,7 +12663,7 @@ static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
     ds4_tokens target = {0};
     build_prompt_from_exact_prefix_and_text_suffix(s->engine, live, suffix, &target);
     const int before = ds4_session_pos(slot->session);
-    bool ok = server_session_sync(s, slot, &target, err, errlen) == 0;
+    bool ok = server_session_sync_physical(s, slot, &target, err, errlen) == 0;
     if (ok && tokens_appended) {
         int delta = ds4_session_pos(slot->session) - before;
         *tokens_appended = delta > 0 ? delta : 0;
@@ -12595,13 +12687,17 @@ static int server_generation_rewind(server *s, server_slot *slot,
         return 0;
     }
     if (resample) pos--;
-    ds4_session_rewind(slot->session, pos);
+    if (ds4_session_rewind_physical(slot->session, pos, err, errlen)) {
+        pthread_mutex_unlock(&s->inference_mu);
+        return 1;
+    }
     ds4_tokens prefix = {0};
     ds4_tokens_copy(&prefix, ds4_session_tokens(slot->session));
     bool rebuild = ds4_session_common_prefix(slot->session, &prefix) != prefix.len;
     pthread_mutex_unlock(&s->inference_mu);
-    int rc = rebuild ? server_session_sync_multimodal(s, slot, &prefix,
-        r->images, r->image_count, err, errlen) : 0;
+    int rc = !rebuild ? 0 : r->image_count ?
+        server_session_sync_multimodal(s, slot, &prefix, r->images, r->image_count, err, errlen) :
+        server_session_sync_physical(s, slot, &prefix, err, errlen);
     ds4_tokens_free(&prefix);
     if (rc == 0 && resample)
         rc = server_eval_token(s, slot, last_token, err, errlen);
@@ -12670,6 +12766,10 @@ static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
     buf_free(&names);
 }
 
+#define DS4_SERVER_SCR_TRANSPORT
+#include "ds4_server_scr.h"
+#undef DS4_SERVER_SCR_TRANSPORT
+
 static void server_progress_cb(void *ud, const char *event, int current, int total) {
     server_prefill_progress *p = ud;
     if (!p || !event || job_cancelled(p->request_job)) return;
@@ -12678,32 +12778,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     if (!is_chunk && !is_display) return;
 
     double now = now_sec();
-    /* Keep the HTTP/SSE connection alive while prefill runs.  We write the SSE
-     * response headers the first time the callback fires and then emit a
-     * comment line (`:` prefix, ignored by SSE clients) every few seconds.
-     * A failed write marks the job cancelled; the session callback then stops
-     * prefill at the next backend-safe boundary. */
-    if (p->stream && p->fd >= 0 && !p->stream_failed) {
-        if (!p->headers_sent) {
-            p->headers_sent = true;
-            if (sse_headers(p->fd, p->enable_cors)) {
-                p->last_keepalive = now;
-            } else {
-                p->stream_failed = true;
-                job_mark_cancelled(p->request_job);
-                return;
-            }
-        } else if (now - p->last_keepalive >= 5.0) {
-            static const char ka[] = ": prefill\n\n";
-            if (send_all(p->fd, ka, sizeof(ka) - 1)) {
-                p->last_keepalive = now;
-            } else {
-                p->stream_failed = true;
-                job_mark_cancelled(p->request_job);
-                return;
-            }
-        }
-    }
+    if (!server_prefill_keepalive(p, now)) return;
     if (is_display) return;
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
@@ -12987,24 +13062,47 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
 
     ds4_tokens canonical = {0};
     ds4_tokenize_rendered_chat(s->engine, rendered.ptr ? rendered.ptr : "", &canonical);
-    const int live_len = ds4_session_pos(slot->session);
-    const int common = ds4_session_common_prefix(slot->session, &canonical);
-    if (common == live_len && canonical.len == live_len) goto done;
-
-    size_t live_text_len = 0;
-    char *live_text = render_tokens_text(s->engine,
-                                         ds4_session_tokens(slot->session),
-                                         &live_text_len);
-    if (live_text_len == rendered.len &&
-        (live_text_len == 0 || memcmp(live_text, rendered.ptr, live_text_len) == 0))
-    {
-        /* The graph already represents the bytes the next request will render.
-         * Token-level canonicalization would only replace a valid sampled
-         * history with a different BPE spelling of the same transcript. */
-        free(live_text);
+    pthread_mutex_lock(&s->inference_mu);
+    const bool mapped = ds4_session_has_physical_coordinates(slot->session);
+    int live_len = ds4_session_pos(slot->session);
+    int common = mapped ? 0 : ds4_session_common_prefix(slot->session, &canonical);
+    ds4_logical_comparison comparison = {0};
+    char comparison_err[160] = {0};
+    int comparison_rc = mapped ? ds4_session_compare_logical(slot->session, &canonical,
+        rendered.ptr ? rendered.ptr : "", rendered.len, &comparison,
+        comparison_err, sizeof(comparison_err)) : 0;
+    if (mapped && !comparison_rc) {
+        live_len = comparison.live_tokens;
+        common = comparison.common_tokens;
+    }
+    pthread_mutex_unlock(&s->inference_mu);
+    if (comparison_rc) {
+        pthread_mutex_lock(&s->inference_mu);
+        ds4_session_invalidate(slot->session);
+        pthread_mutex_unlock(&s->inference_mu);
+        trace_event(s, trace_id, "logical tool checkpoint comparison failed: %s", comparison_err);
+        j->scr_repair_failed = true;
         goto done;
     }
-    free(live_text);
+    if ((common == live_len && canonical.len == live_len) ||
+        (mapped && comparison.text_equal)) goto done;
+
+    if (!mapped) {
+        size_t live_text_len = 0;
+        char *live_text = render_tokens_text(s->engine,
+                                             ds4_session_tokens(slot->session),
+                                             &live_text_len);
+        if (live_text_len == rendered.len &&
+            (live_text_len == 0 || memcmp(live_text, rendered.ptr, live_text_len) == 0))
+        {
+            /* The graph already represents the bytes the next request will render.
+             * Token-level canonicalization would only replace a valid sampled
+             * history with a different BPE spelling of the same transcript. */
+            free(live_text);
+            goto done;
+        }
+        free(live_text);
+    }
 
     if (j->req.image_count != 0) {
         /* Rebuilding through the text-only disk cache would either lose the
@@ -13028,9 +13126,13 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
 
     char err[160] = {0};
     pthread_mutex_lock(&s->inference_mu);
-    ds4_session_rewrite_result rr =
+    /* A logical rewrite cannot reuse physical indices as compressed positions.
+     * Until remapping is proven, changed mapped content takes the explicit fresh
+     * logical rebuild below, with its full replay count and timing. */
+    ds4_session_rewrite_result rr = mapped ? DS4_SESSION_REWRITE_REBUILD_NEEDED :
         ds4_session_rewrite_from_common(slot->session, &canonical, common,
                                         err, sizeof(err));
+    if (mapped) snprintf(err, sizeof(err), "mapped logical canonical rewrite");
     pthread_mutex_unlock(&s->inference_mu);
     if (rr == DS4_SESSION_REWRITE_OK) {
         server_log(DS4_LOG_KVCACHE,
@@ -13046,7 +13148,7 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
          * a very long conversation from token zero. */
         char *path = NULL;
         ds4_tokens effective = {0};
-        int loaded = kv_cache_try_load_text(s, slot,
+        int loaded = (mapped || server_scr_enabled(s)) ? 0 : kv_cache_try_load_text(s, slot,
                                             rendered.ptr ? rendered.ptr : "",
                                             &effective, &path, NULL, false);
         if (loaded == 0) {
@@ -13131,6 +13233,7 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
                        rebuild_ctx, ctx, source, loaded, replay_tokens,
                        canonical.len, sync_err);
             trace_event(s, trace_id, "tool checkpoint canonicalization failed after rebuild request: %s", sync_err);
+            if (server_scr_enabled(s)) j->scr_repair_failed = true;
         }
         ds4_tokens_free(&effective);
         free(path);
@@ -13139,6 +13242,7 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
                    "ds4-server: tool checkpoint canonicalization failed ctx=%s common=%d live=%d canonical=%d error=\"%s\"",
                    ctx, common, live_len, canonical.len, err);
         trace_event(s, trace_id, "tool checkpoint canonicalization failed: %s", err);
+        if (server_scr_enabled(s)) j->scr_repair_failed = true;
     }
 
 done:
@@ -13403,16 +13507,21 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     char err[160];
     err[0] = '\0';
     const bool multimodal = j->req.image_count != 0;
+    const bool scr = server_scr_enabled(s);
+    int old_pos = 0, common = 0;
+    bool live_vision_match = false;
+    trace_cache_diag cache_diag = {0};
+    if (!scr) {
     pthread_mutex_lock(&s->inference_mu);
-    const int old_pos = ds4_session_pos(slot->session);
-    const int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
-    const bool live_vision_match =
+    old_pos = ds4_session_pos(slot->session);
+    common = ds4_session_common_prefix(slot->session, &j->req.prompt);
+    live_vision_match =
         ds4_session_vision_prefix_matches(slot->session,
                                          j->req.images, j->req.image_count);
     pthread_mutex_unlock(&s->inference_mu);
-    trace_cache_diag cache_diag = {0};
     trace_cache_capture(&cache_diag, ds4_session_tokens(slot->session),
                         &j->req.prompt, old_pos, common);
+    }
     ds4_tokens effective_prompt = {0};
     const ds4_tokens *prompt_for_sync = &j->req.prompt;
     const bool responses_protocol = j->req.api == API_RESPONSES;
@@ -13428,6 +13537,12 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
      * exact token-prefix match.  Exact token/text/disk matching remains the
      * fallback when the live state is absent or no longer describes the
      * request. */
+    int cached = 0, disk_cached = 0;
+    char *disk_cache_path = NULL;
+    uint8_t disk_cache_ext_flags = 0;
+    const char *cache_source = scr ? "scr" : "none";
+    /* SCR sees canonical input before any ordinary live/disk cache mutation. */
+    if (!scr) {
     /* Reuse probe: the single source of truth for "does this request reuse
      * this slot's live state?", shared with slot routing (job_slot_score) so
      * execution and routing can never disagree.  Tier order and conditions
@@ -13459,8 +13574,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         return;
     }
 
-    int cached = reuse.reuse_tokens;
-    const char *cache_source = "none";
+    cached = reuse.reuse_tokens;
     /* Whether the selected tier actually produced a reusable live prefix. */
     bool live_materialized = false;
     switch (reuse.kind) {
@@ -13584,9 +13698,6 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         }
         return;
     }
-    int disk_cached = 0;
-    char *disk_cache_path = NULL;
-    uint8_t disk_cache_ext_flags = 0;
     if (cached == 0 && old_pos > 0) {
         server_log(DS4_LOG_WARNING,
                    "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d vision=%s reason=%s",
@@ -13618,6 +13729,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             prompt_for_sync = &effective_prompt;
         }
     }
+    }
     const bool responses_reasoning_state_preserved =
         cached > 0 &&
         ((!strcmp(cache_source, "responses-visible") ||
@@ -13629,14 +13741,14 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         j->req.responses_requires_live_reasoning &&
         !responses_reasoning_state_preserved;
     const int prompt_tokens = prompt_for_sync->len;
-    /* OpenAI usage details: the reusable prefix is a cache read, while the
-     * effective prompt suffix evaluated by ds4_session_sync() is written into
-     * the live KV cache and can be reused by the next request. */
+    /* Ordinary exact-prefix usage counts reusable reads and suffix writes.
+     * SCR bypasses both: approximate retention is only in its separate receipt,
+     * while prompt usage still describes the full canonical request. */
     j->req.cache_read_tokens = cached;
-    j->req.cache_write_tokens = prompt_tokens > cached ? prompt_tokens - cached : 0;
+    j->req.cache_write_tokens = !scr && prompt_tokens > cached ? prompt_tokens - cached : 0;
 
     const double t0 = now_sec();
-    uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
+    uint64_t trace_id = trace_begin(s, j, cached, prompt_for_sync, &cache_diag,
                                     cache_source, disk_cached, disk_cache_path);
     char ctx_span[48];
     request_ctx_span(ctx_span, sizeof(ctx_span), cached, prompt_tokens);
@@ -13704,7 +13816,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     ds4_session_set_display_progress(slot->session, server_progress_cb, &progress);
 
     int cold_store_len = 0;
-    if (!multimodal && cached == 0 &&
+    if (!scr && !multimodal && cached == 0 &&
         s->kv.enabled &&
         prompt_for_sync->len >= s->kv.opt.min_tokens &&
         s->kv.opt.cold_max_tokens > 0 &&
@@ -13717,7 +13829,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                          anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
     }
     int suppressed_continued_last = -1;
-    if (cold_store_len >= s->kv.opt.min_tokens) {
+    if (!scr && cold_store_len >= s->kv.opt.min_tokens) {
         /* A cold checkpoint can land exactly on the continued-checkpoint
          * frontier.  The prefill progress callback would then write the same
          * prefix as "continued" while we are intentionally stopping there to
@@ -13764,11 +13876,17 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_tokens_free(&prefix);
     }
 
-    int prompt_sync_rc = multimodal ?
+    int prompt_sync_rc = scr ?
+        server_scr_prefill_with_keepalive(s, slot, j, &progress,
+                                          err, sizeof(err)) : multimodal ?
         server_session_sync_multimodal(s, slot, prompt_for_sync,
                                        j->req.images, j->req.image_count,
                                        err, sizeof(err)) :
         server_session_sync(s, slot, prompt_for_sync, err, sizeof(err));
+    if (prompt_sync_rc != 0 && !j->reuse.error_phase) {
+        j->reuse.error_phase = "prefill";
+        j->reuse.error_code = prompt_sync_rc;
+    }
     if (prompt_sync_rc != 0) {
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(slot->session, NULL, NULL);
@@ -13802,7 +13920,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (!thinking_live_continuation) thinking_live_clear(s, slot);
     ds4_session_set_progress(slot->session, NULL, NULL);
     ds4_session_set_display_progress(slot->session, NULL, NULL);
-    if (!multimodal) kv_cache_maybe_store_continued(s, slot);
+    if (!scr && !multimodal) kv_cache_maybe_store_continued(s, slot);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -13810,7 +13928,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                req_flags[0] ? " " : "",
                req_flags,
                now_sec() - t0);
-    if (cold_store_len == prompt_for_sync->len) {
+    if (!scr && cold_store_len == prompt_for_sync->len) {
         if (!multimodal && kv_cache_store_live_prefix(s, slot, prompt_for_sync,
                                        cold_store_len, "cold")) {
             kv_cache_slot_note_store(slot, cold_store_len);
@@ -13821,8 +13939,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         }
     }
     char id[96];
-    responses_random_id(id, sizeof(id),
-                        j->req.kind == REQ_CHAT ? "chatcmpl-" : "cmpl-");
+    if (j->reuse.request[0])
+        snprintf(id, sizeof(id), "%s", j->reuse.request);
+    else responses_random_id(id, sizeof(id),
+                             j->req.kind == REQ_CHAT ? "chatcmpl-" : "cmpl-");
 
     bool structured_stream = request_uses_structured_stream(&j->req);
     anthropic_stream anthropic_live = {0};
@@ -13912,6 +14032,7 @@ decode_again:
     int room = ds4_session_ctx(slot->session) - ds4_session_pos(slot->session);
     int max_tokens = server_decode_budget(j->req.max_tokens,
                                           recovery_completion, room);
+    if (j->reuse.seq && j->reuse.decode_started <= 0.0) j->reuse.decode_started = now_sec();
     bool saw_tool_start = false;
     bool saw_tool_end = false;
     bool saw_orphan_tool_end = false;
@@ -13941,7 +14062,7 @@ decode_again:
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
         if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
-            if (!multimodal) kv_cache_maybe_store_continued(s, slot);
+            if (!scr && !multimodal) kv_cache_maybe_store_continued(s, slot);
         }
         float temperature = j->req.temperature;
         int top_k = j->req.top_k;
@@ -13974,6 +14095,7 @@ decode_again:
             snprintf(err, sizeof(err), "failed to select a non-EOS token");
             break;
         }
+        if (j->reuse.seq && j->reuse.first_token <= 0.0) j->reuse.first_token = now_sec();
         if (ds4_token_is_stop_for_think_mode(s->engine,
                                              token,
                                              j->req.think_mode)) {
@@ -13986,7 +14108,7 @@ decode_again:
         int toks[17];
         int ntok = 0;
         const int block_start = ds4_session_pos(slot->session);
-        if (!s->batched_mode &&
+        if (!s->batched_mode && !server_scr_enabled(s) &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
@@ -14341,12 +14463,12 @@ decode_again:
                            req_flags);
                 trace_event(s, trace_id,
                             "unterminated tool call; continuing with model-visible tool error");
-                if (continue_after_invalid_dsml(s, slot, &j->req, &thinking,
+                bool recovered = continue_after_invalid_dsml(s, slot, &j->req, &thinking,
                                                 "unterminated tool call",
                                                 &recovery_tokens,
                                                 recovery_err,
-                                                sizeof(recovery_err)))
-                {
+                                                sizeof(recovery_err));
+                if (recovered) {
                     dsml_recovery_attempted = true;
                     recovery_completion += completion;
                     server_log(DS4_LOG_GENERATION,
@@ -14443,12 +14565,12 @@ decode_again:
                            req_flags);
                 trace_event(s, trace_id,
                             "invalid tool call; continuing with model-visible tool error");
-                if (continue_after_invalid_dsml(s, slot, &j->req, &thinking,
+                bool recovered = continue_after_invalid_dsml(s, slot, &j->req, &thinking,
                                                 detail,
                                                 &recovery_tokens,
                                                 recovery_err,
-                                                sizeof(recovery_err)))
-                {
+                                                sizeof(recovery_err));
+                if (recovered) {
                     dsml_recovery_attempted = true;
                     recovery_completion += completion;
                     server_log(DS4_LOG_GENERATION,
@@ -14613,6 +14735,19 @@ decode_again:
         thinking_live_clear(s, slot);
     }
 
+    if (scr && j->scr_repair_failed) {
+        final_finish = "error";
+        snprintf(err, sizeof(err), "tool checkpoint canonicalization failed");
+    }
+    if (j->reuse.seq) {
+        j->reuse.generated = completion;
+        j->reuse.decode_finished = now_sec();
+        if (!strcmp(final_finish, "error") && !j->reuse.error_phase) {
+            j->reuse.error_phase = "decode";
+            j->reuse.error_code = 1;
+        }
+        if (!job_cancelled(j) && !server_reuse_stream(s, slot, j)) job_mark_cancelled(j);
+    }
     bool response_ok = !job_cancelled(j);
     if (response_ok && j->req.stream) {
         if (j->req.api == API_ANTHROPIC) {
@@ -14738,6 +14873,12 @@ decode_again:
                        now_sec() - t0);
         }
     }
+    if (scr) {
+        j->scr_finish = final_finish;
+        j->scr_delivery = response_ok ? 1 : 0;
+        j->scr_terminal_success = !j->scr_repair_failed &&
+            server_scr_terminal_success(response_ok, final_finish);
+    }
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&parsed_calls);
@@ -14756,10 +14897,40 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     slot->running = j;
     pthread_mutex_unlock(&s->model_mu);
 
+    j->scr_terminal_success = false;
+    j->scr_repair_failed = false;
+    j->scr_finish = "error";
+    j->scr_delivery = -1;
+    j->reuse = (job_reuse_telemetry){.enqueued = j->reuse.enqueued};
+    server_reuse_admit(s, slot, j);
+    if (server_scr_enabled(s) && server_scr_quarantined(s)) {
+        /* Complete the usual worker/client handshake without touching the slot. */
+        http_error(j->fd, s->enable_cors, 503, "SCR ownership quarantined");
+        j->reuse.error_phase = "quarantine";
+        j->reuse.error_code = 503;
+        goto finished;
+    }
     ds4_session_set_cancel(slot->session, job_cancelled, j);
     if (!job_cancelled(j)) generate_job_inner(s, slot, j);
-    ds4_session_set_cancel(slot->session, NULL, NULL);
-
+    if (server_scr_enabled(s)) {
+        bool cancelled = job_cancelled(j);
+        bool success = j->scr_terminal_success && !cancelled;
+        if (cancelled && !j->reuse.error_phase) j->reuse.error_phase = "cancelled";
+        ds4_scr_retire_receipt r = {0};
+        if (!success) r = server_scr_retire_owned(s, slot);
+        else server_scr_pool_save(s, slot, j);
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: scr terminal slot=%d request=%p finish=%s delivery=%d success=%d cancelled=%d retire_checked=%d outcome=%d attempted=%d charge_known=%d charge_before=%llu charge_after=%llu",
+                   slot->id, (void *)j, j->scr_finish, j->scr_delivery,
+                   success, job_cancelled(j), !success, r.outcome, r.attempted,
+                   r.charge_known, (unsigned long long)r.charged_bytes_before,
+                   (unsigned long long)r.charged_bytes_after);
+    }
+    if (!server_scr_enabled(s) || !server_scr_quarantined(s))
+        ds4_session_set_cancel(slot->session, NULL, NULL);
+finished:
+    /* After owned retirement, so the archive action reflects terminal state. */
+    server_reuse_store(s, slot, j);
     pthread_mutex_lock(&s->model_mu);
     if (slot->running == j) slot->running = NULL;
     pthread_cond_broadcast(&s->model_cv);
@@ -14915,6 +15086,7 @@ static void dispatch_jobs_locked(server *s) {
 }
 
 static bool enqueue(server *s, job *j) {
+    j->reuse.enqueued = now_sec();
     pthread_mutex_lock(&s->mu);
     if (s->stopping) {
         pthread_mutex_unlock(&s->mu);
@@ -15312,6 +15484,12 @@ static void *client_main(void *arg) {
         goto done;
     }
 
+    if (server_scr_enabled(s) && !strcmp(hr.method, "POST") &&
+        strcmp(hr.path, "/v1/chat/completions")) {
+        http_error(fd, s->enable_cors, 400, "SCR supports only stateless text chat completions");
+        http_request_free(&hr);
+        goto done;
+    }
     request req;
     char err[160];
     bool ok = false;
@@ -15437,7 +15615,17 @@ typedef struct {
     bool enable_cors;
     int batched_sessions;
     int mixed_prefill_quantum;
+    int scr_tail_tokens;
+    int scr_max_ranges;
+    int scr_planner_budget_ms;
+    /* --scr (or a nonzero --scr-tail-tokens) selects the one production SCR
+     * stack: logical coordinates, batch capture and the configured padding. */
+    bool scr_enabled, scr_max_ranges_present;
 } server_config;
+
+#define DS4_SERVER_SCR_CONFIG
+#include "ds4_server_scr.h"
+#undef DS4_SERVER_SCR_CONFIG
 
 static int parse_int_arg(const char *s, const char *opt) {
     char *end = NULL;
@@ -15508,7 +15696,24 @@ static void log_context_memory(ds4_backend backend, int ctx_size,
                    (caches * (double)session_count + (double)m.scratch_bytes) / gib);
     }
 }
-static void server_close_resources(server *s) {
+static int server_close_resources(server *s) {
+    server_scr_pool_close(s);
+    server_reuse_close(s);
+    /* Checked retirement, not an already-fenced receipt, discharges each source
+     * before any slot/session/engine destruction. Failed ownership is retained. */
+    if (server_scr_enabled(s)) {
+        if (server_scr_quarantined(s)) return 1;
+        for (int i = 0; i < s->slot_count; ++i) {
+            if (!s->slots[i].session) continue;
+            uint64_t before = ds4_session_scr_archive_bytes(s->slots[i].session);
+            int rc = ds4_session_scr_archive_release(s->slots[i].session);
+            server_log(DS4_LOG_DEFAULT, "ds4-server: scr teardown slot=%d result=%d charge_before=%llu charge_after=%llu disposal=%s",
+                i, rc, (unsigned long long)before,
+                (unsigned long long)ds4_session_scr_archive_bytes(s->slots[i].session),
+                rc ? "retained" : "released");
+            if (rc) return 1;
+        }
+    }
     if (s->trace) {
         fclose(s->trace);
         s->trace = NULL;
@@ -15522,7 +15727,13 @@ static void server_close_resources(server *s) {
         live_tool_state_free(&slot->anthropic_live);
         visible_live_free(&slot->thinking_live);
         free(slot->live_text);
-        if (slot->session) ds4_session_free(slot->session);
+        slot->live_text = NULL;
+        slot->live_text_len = 0;
+        slot->live_text_pos = 0;
+        if (ds4_session_dispose_checked(&slot->session)) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: session disposal retained slot=%d and engine ownership", i);
+            return 1;
+        }
     }
     free(s->slot_threads);
     free(s->slots);
@@ -15539,6 +15750,7 @@ static void server_close_resources(server *s) {
     ds4_engine_close(s->engine);
     ds4_tp_free(s->tp_leader);
     memset(s, 0, sizeof(*s));
+    return 0;
 }
 
 static void usage(FILE *fp, const char *topic) {
@@ -15586,12 +15798,23 @@ static server_config parse_options(int argc, char **argv) {
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
         .mixed_prefill_quantum = 128,
+        .scr_max_ranges = (int)DS4_SCR_MULTI_MAX_RANGES,
+        .scr_planner_budget_ms = DS4_SCR_PLANNER_DEFAULT_BUDGET_MS,
     };
     c.kv_cache = kv_cache_default_options();
 
     bool directional_steering_scale_set = false;
+    bool scr_incompatible = false;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
+        if (!strcmp(arg, "--vision") || !strcmp(arg, "--batched-session") ||
+            !strcmp(arg, "--mixed-prefill-quantum") ||
+            /* --kv-disk-dir and --kv-disk-space-mb select the checkpoint pool. */
+            (!strncmp(arg, "--kv-disk-", 10) && strcmp(arg, "--kv-disk-dir") &&
+             strcmp(arg, "--kv-disk-space-mb")) || !strncmp(arg, "--kv-cache-", 11) ||
+            !strcmp(arg, "--gpu-vram") || !strcmp(arg, "--gpu-devices") ||
+            !strcmp(arg, "--cuda-tensor-parallel") || !strcmp(arg, "--cpu") ||
+            !strcmp(arg, "--cuda") || !strcmp(arg, "--rocm")) scr_incompatible = true;
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
             const char *topic = (i + 1 < argc && argv[i + 1][0] != '-') ?
                 argv[i + 1] : NULL;
@@ -15613,7 +15836,7 @@ static server_config parse_options(int argc, char **argv) {
                        dist_parse_err[0] ? dist_parse_err : "invalid distributed option");
             exit(2);
         }
-        if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
+        if (dist_parse == DS4_DIST_CLI_MATCHED) { scr_incompatible = true; continue; }
 
         char tp_parse_err[256] = {0};
         ds4_tp_cli_parse_result tp_parse =
@@ -15631,7 +15854,7 @@ static server_config parse_options(int argc, char **argv) {
                        "invalid tensor-parallel option");
             exit(2);
         }
-        if (tp_parse == DS4_TP_CLI_MATCHED) continue;
+        if (tp_parse == DS4_TP_CLI_MATCHED) { scr_incompatible = true; continue; }
 
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
@@ -15660,6 +15883,32 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.dspark_strict = true;
         } else if (!strcmp(arg, "--mtp-exact-sampling")) {
             c.engine.dspark_exact_sampling = true;
+        } else if (!strcmp(arg, "--scr")) {
+            c.scr_enabled = true;
+        } else if (!strcmp(arg, "--scr-tail-tokens")) {
+            c.scr_tail_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--scr-logical-coordinates") ||
+                   !strcmp(arg, "--scr-capture-batch") || !strcmp(arg, "--scr-capture-batch-trial") ||
+                   !strcmp(arg, "--scr-batch-suffix") || !strcmp(arg, "--scr-noncapturing-fresh-once")) {
+            /* Retired selectors: SCR always runs the production stack. Accepted
+             * so existing launch scripts keep starting. */
+        } else if (!strcmp(arg, "--scr-padding-policy")) {
+            /* Retired selector: SCR always pads fresh gaps with the planner's
+             * ordinary space. Only that historical value is still accepted. */
+            if (strcmp(need_arg(&i, argc, argv, arg), "planner-fresh-gap-space-v1")) {
+                fprintf(stderr, "ds4-server: unsupported SCR padding policy\n");
+                exit(1);
+            }
+        } else if (!strcmp(arg, "--scr-max-ranges")) {
+            c.scr_max_ranges_present = true;
+            c.scr_max_ranges = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--scr-planner-budget-ms")) {
+            uint32_t budget = 0;
+            if (ds4_scr_parse_planner_budget(need_arg(&i, argc, argv, arg), &budget)) {
+                fprintf(stderr, "ds4-server: --scr-planner-budget-ms must be 0..60000\n");
+                exit(2);
+            }
+            c.scr_planner_budget_ms = (int)budget;
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
@@ -15778,6 +16027,7 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.cuda_tensor_parallel = true;
         } else if (!strcmp(arg, "--backend")) {
             c.engine.backend = parse_backend_arg(need_arg(&i, argc, argv, arg), arg);
+            if (c.engine.backend != DS4_BACKEND_METAL) scr_incompatible = true;
         } else if (!strcmp(arg, "--cpu")) {
             c.engine.backend = DS4_BACKEND_CPU;
         } else {
@@ -15795,6 +16045,11 @@ static server_config parse_options(int argc, char **argv) {
     }
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
+    }
+    server_scr_resolve_config(&c);
+    if (!server_scr_config_valid(&c, scr_incompatible)) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: SCR requires eight-aligned archive capacity 128..%u <= context, K1..%u, Metal, loopback, and no MTP/DSpark/batch/KV-cache tuning/vision/GPU/TP/distributed overrides", DS4_SCR_ARCHIVE_MAX_CAPACITY, DS4_SCR_MULTI_MAX_RANGES);
+        exit(2);
     }
     char tp_err[256];
     if (!ds4_tp_adopt_distributed_options(&c.engine.tp,
@@ -15895,6 +16150,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    if (cfg.scr_tail_tokens && !ds4_engine_is_deepseek41(engine)) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: SCR requires actual DeepSeek4.1 model identity");
+        ds4_engine_close(engine);
+        return 2;
+    }
+
     if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
         ds4_dist_generation_options gen = {
             .ctx_size = cfg.ctx_size,
@@ -15943,6 +16204,9 @@ int main(int argc, char **argv) {
     s.engine = engine;
     s.tp_leader = tp_leader;
     s.ctx_size = cfg.ctx_size;
+    s.scr_tail_tokens = cfg.scr_tail_tokens;
+    s.scr_max_ranges = cfg.scr_max_ranges;
+    s.scr_planner_budget_ms = cfg.scr_planner_budget_ms;
     s.slot_count = slot_count;
     s.batched_mode = cfg.batched_sessions > 0;
     s.qwen4_batch_mtp = cfg.engine.backend == DS4_BACKEND_METAL &&
@@ -15973,12 +16237,14 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&s.model_mu, NULL);
     pthread_cond_init(&s.model_cv, NULL);
     pthread_mutex_init(&s.trace_mu, NULL);
+    server_reuse_init(&s, getenv("DS4_SCR_METADATA_DIR"));
 
     for (int i = 0; i < slot_count; i++) {
         server_slot *slot = &s.slots[i];
         slot->srv = &s;
         slot->id = i;
-        if (ds4_session_create(&slot->session, engine, cfg.ctx_size) != 0) {
+        if (ds4_session_create(&slot->session, engine, cfg.ctx_size) != 0 ||
+            server_scr_apply_startup(&cfg, slot->session, NULL, 0) != 0) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: failed to create %s session %d/%d",
                        ds4_backend_name(cfg.engine.backend), i + 1, slot_count);
@@ -15987,7 +16253,9 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (cfg.kv_disk_dir) {
+    if (cfg.kv_disk_dir && server_scr_enabled(&s)) {
+        server_scr_pool_open(&s, cfg.kv_disk_dir, cfg.kv_disk_space_mb);
+    } else if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
     }
@@ -16069,17 +16337,19 @@ int main(int argc, char **argv) {
         return 1;
     }
     g_listen_fd = lfd;
+    s.scr_listener_fd = lfd;
+    s.scr_listener_owned = true;
     server_log(DS4_LOG_DEFAULT, "ds4-server: listening on http://%s:%d", cfg.host, cfg.port);
 
-    while (!g_stop_requested) {
+    while (!g_stop_requested && (!server_scr_enabled(&s) || !server_scr_quarantined(&s))) {
         int fd = accept(lfd, NULL, NULL);
         if (fd < 0) {
-            if (g_stop_requested) break;
+            if (g_stop_requested || (server_scr_enabled(&s) && server_scr_quarantined(&s))) break;
             if (errno == EINTR) continue;
             server_log(DS4_LOG_DEFAULT, "ds4-server: accept failed: %s", strerror(errno));
             continue;
         }
-        if (g_stop_requested) {
+        if (g_stop_requested || (server_scr_enabled(&s) && server_scr_quarantined(&s))) {
             close(fd);
             break;
         }
@@ -16103,10 +16373,13 @@ int main(int argc, char **argv) {
         }
         pthread_detach(th);
     }
+    pthread_mutex_lock(&s.mu);
+    s.scr_listener_owned = false;
     if (g_listen_fd >= 0) {
         close(lfd);
         g_listen_fd = -1;
     }
+    pthread_mutex_unlock(&s.mu);
 
     server_log(DS4_LOG_DEFAULT, "ds4-server: shutdown requested, draining requests");
     server_request_worker_stop(&s);
@@ -16123,7 +16396,7 @@ int main(int argc, char **argv) {
     while (s.clients > 0) pthread_cond_wait(&s.clients_cv, &s.mu);
     pthread_mutex_unlock(&s.mu);
 
-    for (int i = 0; s.kv.enabled && i < s.slot_count; i++) {
+    for (int i = 0; !s.scr_ownership_fatal && s.kv.enabled && i < s.slot_count; i++) {
         server_slot *slot = &s.slots[i];
         const ds4_tokens *tokens = ds4_session_tokens(slot->session);
         if (!tokens || tokens->len < s.kv.opt.min_tokens) continue;
@@ -16132,8 +16405,7 @@ int main(int argc, char **argv) {
                    i, tokens->len);
         kv_cache_store_current(&s, slot, "shutdown");
     }
-    server_close_resources(&s);
-    return 0;
+    return server_close_resources(&s);
 }
 #else
 
@@ -21630,6 +21902,8 @@ static void test_kv_cache_file_size_must_fit_budget(void) {
     TEST_ASSERT(!kv_cache_file_size_fits(&kc, UINT64_MAX, 1, 0, NULL, NULL));
 }
 
+#include "tests/test_server_trace_ids.h"
+
 static void test_sha1_bytes_hex_matches_known_vector(void) {
     char sha[41];
     sha1_bytes_hex("abc", 3, sha);
@@ -23085,6 +23359,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_continued_uses_aligned_frontiers();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
+    test_server_trace_ids();
     test_sha1_bytes_hex_matches_known_vector();
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_lookup_rejects_wrong_model();

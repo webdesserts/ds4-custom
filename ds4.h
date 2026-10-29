@@ -404,6 +404,12 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
 void ds4_engine_tp_unbind(ds4_engine *e);
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
+/* Exclusive disposal: zero clears *owner; failure retains the session and its
+ * engine ownership/charges. SSD-enabled owners must use this on every exit path.
+ * Successful cleanup can report resolved syscall diagnostics on stderr. */
+int ds4_session_dispose_checked(ds4_session **owner);
+/* Compatibility wrapper. Unresolved SSD cleanup is a fatal contract violation,
+ * not a silent return that permits callers to orphan a slot or close its engine. */
 void ds4_session_free(ds4_session *s);
 int ds4_session_power(ds4_session *s);
 int ds4_session_set_power(ds4_session *s, int power_percent);
@@ -421,6 +427,8 @@ void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn
  * usable, but a partial layer-major pass is invalidated and the next sync
  * rebuilds it. Do not assume an interrupted session can be saved or decoded. */
 void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud);
+/* Planner budget in milliseconds; 0 is explicit immediate expiry, max60000. */
+int ds4_session_set_scr_planner_budget(ds4_session *s, uint32_t budget_ms);
 void ds4_session_report_progress(ds4_session *s, const char *event, int current, int total);
 /* Distributed coordinator sessions return 1 when the full layer route is
  * available, 0 when it is still incomplete, and -1 for a local API error. */
@@ -439,6 +447,20 @@ typedef enum {
  * state is refilled from scratch. */
 #define DS4_SESSION_SYNC_INTERRUPTED 2
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
+/* Preserve an identical known physical prefix and its pad provenance, including
+ * after rewind. An appended suffix is ordinary content; no pads are inserted.
+ * Unmapped sessions retain ordinary sync behavior. Logical replacement differs. */
+int ds4_session_sync_physical(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
+bool ds4_session_has_physical_coordinates(const ds4_session *s);
+typedef struct {
+    int live_tokens, common_tokens; /* Logical coordinates, excluding recorded pads. */
+    bool text_equal;
+} ds4_logical_comparison;
+/* Compare a headed transcript without allocating a full projection. NULL text
+ * requests token comparison only. Call under the same session exclusion as sync. */
+int ds4_session_compare_logical(ds4_session *s, const ds4_tokens *logical,
+                                const char *text, size_t text_len,
+                                ds4_logical_comparison *out, char *err, size_t errlen);
 int ds4_session_sync_multimodal(ds4_session *s,
                                 const ds4_tokens *prompt,
                                 const ds4_vision_span *images,
@@ -607,6 +629,9 @@ bool ds4_session_rewind_speculative(ds4_session *s, int pos);
  * Otherwise the checkpoint becomes invalid: sync the retained prefix before eval.
  * Callers retaining images must use sync_multimodal for that rebuild. */
 void ds4_session_rewind(ds4_session *s, int pos);
+/* Checked physical-token rewind. Coordinate refusal preserves prior state;
+ * successful truncation does not imply that compressed model state is valid. */
+int ds4_session_rewind_physical(ds4_session *s, int pos, char *err, size_t errlen);
 int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
@@ -647,6 +672,8 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
 #define DS4_SESSION_LAYER_PAYLOAD_MAGIC UINT32_C(0x4c565344) /* "DSVL" */
 #define DS4_SESSION_LAYER_PAYLOAD_VERSION UINT32_C(1)
 #define DS4_SESSION_LAYER_PAYLOAD_U32_FIELDS 14u
+
+#include "ds4_scr.h"
 
 uint64_t ds4_session_payload_bytes(ds4_session *s);
 int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,

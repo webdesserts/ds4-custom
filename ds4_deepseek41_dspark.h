@@ -351,6 +351,10 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_markov(ds41_dspark *d, const ds4_model 
  * cache proportional to the context is copied. */
 static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *g,
         const ds4_model *m, const ds4_weights *w, const int *tokens, uint32_t count) {
+    /* Refuse before verifier snapshots shallow-copy target graph pointers.
+     * Rejected proposals have no SCR archive/capture publication protocol. */
+    if (!g || g->archive || g->archive_pending || g->archive_capture_pending)
+        return false;
     if (!d || !g->valid || count < 2 || count > DS41_VERIFY_ROWS ||
         g->pos > g->ctx || count > g->ctx - g->pos || !ds41_tp_batch_enabled(g)) return false;
     /* Prepost the complete small-row exchange window, as in V4.0 verification.

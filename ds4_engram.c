@@ -2,6 +2,8 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "ds4_engram.h"
+#define DS4_SCR_OBSERVATION_CLOCK
+#include "ds4_scr.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -125,18 +127,41 @@ void ds4_engram_table_close(ds4_engram_table *t) {
     *t = (ds4_engram_table){.fd = -1};
 }
 
-static bool read_row(int fd, uint64_t offset, uint8_t row[DS4_ENGRAM_ROW_BYTES]) {
+static uint64_t observation_begin(ds4_engram_observation *o) {
+    uint64_t start = 0;
+    if (o && !o->clock_failed && !ds4_observation_clock(&start)) o->clock_failed = true;
+    return start;
+}
+static void observation_elapsed(ds4_engram_observation *o, uint64_t start, uint64_t *sum) {
+    uint64_t end;
+    if (!o || o->clock_failed) return;
+    if (!ds4_observation_clock(&end) || end < start) o->clock_failed = true;
+    else ds4_observation_add_u64(sum, end - start, &o->time_overflow);
+}
+static void observation_count(ds4_engram_observation *o, uint64_t *sum, uint64_t value) {
+    if (o) ds4_observation_add_u64(sum, value, &o->counters_overflow);
+}
+
+static bool read_row(int fd, uint64_t offset, uint8_t row[DS4_ENGRAM_ROW_BYTES],
+                      ds4_engram_observation *o) {
+    uint64_t began = observation_begin(o);
+    if (o) observation_count(o, &o->row_attempts, 1);
     size_t done = 0;
     while (done < DS4_ENGRAM_ROW_BYTES) {
+        if (o) observation_count(o, &o->pread_calls, 1);
         ssize_t n = pread(fd, row + done, DS4_ENGRAM_ROW_BYTES - done,
                           (off_t)(offset + done));
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) {
             if (n == 0) errno = EIO;
+            observation_elapsed(o, began, o ? &o->row_read_nanoseconds : NULL);
             return false;
         }
         done += (size_t)n;
+        if (o) observation_count(o, &o->read_bytes, (uint64_t)n);
     }
+    if (o) observation_count(o, &o->rows_completed, 1);
+    observation_elapsed(o, began, o ? &o->row_read_nanoseconds : NULL);
     return true;
 }
 
@@ -168,8 +193,8 @@ static void init_engram_bf16(void) {
     }
 }
 
-bool ds4_engram_read(const ds4_engram_table *t, const uint32_t *rows,
-                     size_t count, float *out) {
+static bool engram_read(const ds4_engram_table *t, const uint32_t *rows,
+                         size_t count, float *out, ds4_engram_observation *o) {
     if (!t || t->fd < 0 || (count && (!rows || !out)) ||
         count > SIZE_MAX / (DS4_ENGRAM_DIM * sizeof(*out))) {
         errno = EINVAL;
@@ -184,7 +209,7 @@ bool ds4_engram_read(const ds4_engram_table *t, const uint32_t *rows,
     pthread_once(&engram_bf16_once, init_engram_bf16);
     uint8_t raw[DS4_ENGRAM_ROW_BYTES];
     for (size_t i = 0; i < count; i++) {
-        if (!read_row(t->fd, t->offset + (uint64_t)rows[i] * sizeof(raw), raw)) return false;
+        if (!read_row(t->fd, t->offset + (uint64_t)rows[i] * sizeof(raw), raw, o)) return false;
         for (int j = 0; j < DS4_ENGRAM_DIM; j++) {
             const uint16_t value = engram_bf16[raw[DS4_ENGRAM_DIM + j / 32]][raw[j]];
             if (value == UINT16_MAX) {
@@ -221,10 +246,14 @@ typedef struct {
     float *out;
     size_t count, readers;
     int error[ENGRAM_READERS];
+    bool observe;
+    ds4_engram_observation observations[ENGRAM_READERS];
 } engram_batch;
 
 static void read_batch_part(void *context, size_t part) {
     engram_batch *batch = context;
+    ds4_engram_observation *o = batch->observe ? &batch->observations[part] : NULL;
+    if (o) o->enabled = true;
     const engram_request *request = batch->request;
     const size_t begin = batch->count * part / batch->readers;
     const size_t end = batch->count * (part + 1) / batch->readers;
@@ -234,7 +263,7 @@ static void read_batch_part(void *context, size_t part) {
         if (i > begin && request[i].row == request[i - 1].row) {
             memcpy(dst, previous, DS4_ENGRAM_DIM * sizeof(*dst));
         } else {
-            if (!ds4_engram_read(batch->table, &request[i].row, 1, dst)) {
+            if (!engram_read(batch->table, &request[i].row, 1, dst, o)) {
                 batch->error[part] = errno ? errno : EIO;
                 return;
             }
@@ -256,8 +285,9 @@ static void *read_batch_thread(void *context) {
 }
 #endif
 
-bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
-                           size_t tokens, size_t stride, float *out) {
+static bool engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
+                               size_t tokens, size_t stride, float *out,
+                               ds4_engram_observation *o) {
     if (!t || t->fd < 0 || (tokens && (!rows || !out || stride < DS4_ENGRAM_COLS)) ||
         tokens > SIZE_MAX / (DS4_ENGRAM_COLS * DS4_ENGRAM_DIM * sizeof(*out)) ||
         (tokens && tokens - 1 > (SIZE_MAX / sizeof(*rows) - DS4_ENGRAM_COLS) / stride)) {
@@ -289,7 +319,7 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
         }
         qsort(request, count, sizeof(*request), request_order);
         engram_batch batch = {.table = t, .request = request, .count = count,
-            .out = out + start * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM, .readers = 1};
+            .out = out + start * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM, .readers = 1, .observe = o != NULL};
         /* Fixed concurrency hides random-read latency without caching the table.
          * Each worker owns disjoint output rows; all finish before GPU use. */
         if (count >= ENGRAM_PARALLEL_MIN_ROWS) {
@@ -316,6 +346,10 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
 #endif
         } else
         read_batch_part(&batch, 0);
+        /* All worker results, including completed bytes before failure, are
+         * private until this existing join. Error precedence below is unchanged. */
+        if (o) for (size_t i = 0; i < batch.readers; i++)
+            ds4_engram_observation_add(o, &batch.observations[i]);
         for (size_t i = 0; i < batch.readers; i++) {
             if (batch.error[i]) {
                 errno = batch.error[i];
@@ -350,7 +384,26 @@ struct ds4_engram_reader {
     ds4_engram_table tables[2];
     uint32_t ids[2][DS4_ENGRAM_COLS];
     float *out;
+    ds4_engram_observation *observation;
+    ds4_engram_observation result, parts[2][TOKEN_READERS];
+    uint64_t observation_start;
+    bool observation_finalized;
 };
+
+static void reader_finalize_observation(ds4_engram_reader *r, bool complete) {
+    if (!r->result.enabled || r->observation_finalized) return;
+    for (unsigned t = 0; t < 2; ++t)
+        for (unsigned i = 0; i < TOKEN_READERS; ++i)
+            ds4_engram_observation_add(&r->result, &r->parts[t][i]);
+    r->result.failed_calls = !complete || r->errors[0] || r->errors[1];
+    observation_elapsed(&r->result, r->observation_start, &r->result.call_wall_nanoseconds);
+    r->observation_finalized = true;
+}
+
+/* Owner only, with workers completed or joined. Never publish on wait0. */
+static void reader_publish_observation(ds4_engram_reader *r) {
+    if (r->observation) { *r->observation = r->result; r->observation = NULL; }
+}
 
 static void *read_token_thread(void *context) {
     const engram_read_worker *worker = context;
@@ -366,13 +419,19 @@ static void *read_token_thread(void *context) {
         for (unsigned table = 0; table < 2; table++) {
             const unsigned first = index * DS4_ENGRAM_COLS / TOKEN_READERS;
             const unsigned end = (index + 1u) * DS4_ENGRAM_COLS / TOKEN_READERS;
-            const bool ok = ds4_engram_read(&r->tables[table], r->ids[table] + first,
-                end - first, r->out + (table * DS4_ENGRAM_COLS + first) * DS4_ENGRAM_DIM);
+            ds4_engram_observation part = {.enabled = r->result.enabled};
+            const bool ok = engram_read(&r->tables[table], r->ids[table] + first,
+                end - first, r->out + (table * DS4_ENGRAM_COLS + first) * DS4_ENGRAM_DIM,
+                part.enabled ? &part : NULL);
             const int error = ok ? 0 : errno ? errno : EIO;
             pthread_mutex_lock(&r->mutex);
+            r->parts[table][index] = part;
             if (!r->errors[table]) r->errors[table] = error;
             if (++r->completed[table] == TOKEN_READERS) {
-                if (table == 1) r->active = false;
+                if (table == 1) {
+                    reader_finalize_observation(r, true);
+                    r->active = false;
+                }
                 pthread_cond_broadcast(&r->done);
             }
             pthread_mutex_unlock(&r->mutex);
@@ -417,8 +476,9 @@ fail:
     return NULL;
 }
 
-bool ds4_engram_reader_start(ds4_engram_reader *r,
-    const ds4_engram_table tables[2], const uint32_t ids[2][DS4_ENGRAM_COLS], float *out) {
+static bool reader_start(ds4_engram_reader *r,
+    const ds4_engram_table tables[2], const uint32_t ids[2][DS4_ENGRAM_COLS], float *out,
+    ds4_engram_observation *observation, const ds4_engram_observation *initial, uint64_t start) {
     if (!r || !tables || !ids || !out) { errno = EINVAL; return false; }
     for (unsigned t = 0; t < 2; t++) {
         if (tables[t].fd < 0) { errno = EINVAL; return false; }
@@ -431,6 +491,13 @@ bool ds4_engram_reader_start(ds4_engram_reader *r,
         errno = EBUSY;
         return false;
     }
+    reader_publish_observation(r);
+    r->observation = observation;
+    r->result = initial ? *initial : (ds4_engram_observation){0};
+    if (observation) *observation = r->result;
+    r->observation_start = start;
+    r->observation_finalized = false;
+    memset(r->parts, 0, sizeof(r->parts));
     memcpy(r->tables, tables, sizeof(r->tables));
     memcpy(r->ids, ids, sizeof(r->ids));
     memset(r->errors, 0, sizeof(r->errors));
@@ -453,6 +520,7 @@ bool ds4_engram_reader_wait(ds4_engram_reader *r, unsigned table) {
     }
     while (r->completed[table] < TOKEN_READERS) pthread_cond_wait(&r->done, &r->mutex);
     const int error = r->errors[table];
+    if (table == 1) reader_publish_observation(r);
     pthread_mutex_unlock(&r->mutex);
     if (error) errno = error;
     return !error;
@@ -466,8 +534,59 @@ void ds4_engram_reader_free(ds4_engram_reader *r) {
     pthread_mutex_unlock(&r->mutex);
     for (unsigned i = 0; i < r->threads; i++)
         if (pthread_join(r->workers[i].thread, NULL)) abort();
+    /* Upstream free may stop workers that have not started this generation.
+     * After join, report actual partial work rather than a measured zero/success. */
+    reader_finalize_observation(r, r->completed[1] == TOKEN_READERS);
+    reader_publish_observation(r);
     pthread_cond_destroy(&r->done);
     pthread_cond_destroy(&r->work);
     pthread_mutex_destroy(&r->mutex);
     free(r);
+}
+
+bool ds4_engram_reader_start_observed(ds4_engram_reader *r,
+    const ds4_engram_table tables[2], const uint32_t ids[2][DS4_ENGRAM_COLS], float *out,
+    ds4_engram_observation *o) {
+    if (!o) return reader_start(r, tables, ids, out, NULL, NULL, 0);
+    ds4_engram_observation initial = {.enabled = true, .calls = 1};
+    uint64_t start = observation_begin(&initial);
+    bool ok = reader_start(r, tables, ids, out, o, &initial, start);
+    if (!ok) { *o = initial; o->failed_calls = 1; observation_elapsed(o, start, &o->call_wall_nanoseconds); }
+    return ok;
+}
+
+bool ds4_engram_reader_start(ds4_engram_reader *r,
+    const ds4_engram_table tables[2], const uint32_t ids[2][DS4_ENGRAM_COLS], float *out) {
+    return ds4_engram_reader_start_observed(r, tables, ids, out, NULL);
+}
+
+bool ds4_engram_read(const ds4_engram_table *t, const uint32_t *rows,
+                     size_t count, float *out) {
+    return engram_read(t, rows, count, out, NULL);
+}
+bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
+                           size_t tokens, size_t stride, float *out) {
+    return engram_read_batch(t, rows, tokens, stride, out, NULL);
+}
+
+bool ds4_engram_read_observed(const ds4_engram_table *t, const uint32_t *rows,
+                              size_t count, float *out, ds4_engram_observation *o) {
+    if (!o) return engram_read(t, rows, count, out, NULL);
+    *o = (ds4_engram_observation){.enabled = true, .calls = 1};
+    uint64_t began = observation_begin(o);
+    bool ok = engram_read(t, rows, count, out, o);
+    observation_elapsed(o, began, &o->call_wall_nanoseconds);
+    o->failed_calls = !ok;
+    return ok;
+}
+bool ds4_engram_read_batch_observed(const ds4_engram_table *t, const uint32_t *rows,
+                                    size_t tokens, size_t stride, float *out,
+                                    ds4_engram_observation *o) {
+    if (!o) return engram_read_batch(t, rows, tokens, stride, out, NULL);
+    *o = (ds4_engram_observation){.enabled = true, .calls = 1, .batch_calls = 1};
+    uint64_t began = observation_begin(o);
+    bool ok = engram_read_batch(t, rows, tokens, stride, out, o);
+    observation_elapsed(o, began, &o->call_wall_nanoseconds);
+    o->failed_calls = !ok;
+    return ok;
 }

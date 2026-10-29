@@ -24,11 +24,23 @@ DS4_TEST_MTP ?= gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
 DS4_DSPARK_MODEL ?= $(DS4_TEST_MODEL)
 DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf
 
+.DEFAULT_GOAL := all
+
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o
+METAL_CORE_OBJS = $(CORE_OBJS) $(CACHE_REUSE_LIB)
 CPU_CORE_OBJS = ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
-else
+endif
+
+# cache-reuse-utils planner (pinned Git rev in adapter/cache-reuse/Cargo.toml).
+CARGO ?= cargo
+CARGO_JOBS ?= 2
+CACHE_REUSE_LIB ?= $(abspath adapter/cache-reuse/target/release/libds4_cache_reuse.a)
+$(CACHE_REUSE_LIB): adapter/cache-reuse/Cargo.toml adapter/cache-reuse/Cargo.lock adapter/cache-reuse/src/lib.rs
+	$(CARGO) build -j $(CARGO_JOBS) --release --locked --manifest-path adapter/cache-reuse/Cargo.toml
+
+ifneq ($(UNAME_S),Darwin)
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= $(shell if [ -x /usr/local/cuda/bin/nvcc ]; then \
 	printf '%s' /usr/local/cuda; \
@@ -94,38 +106,38 @@ help:
 	@echo "  make mtp-verify-depth  Run legacy MTP speculative verification smoke if MTP GGUF is present"
 	@echo "  make clean        Remove build outputs"
 
-ds4: ds4_cli.o ds4_help.o ds4_prompt_prefix.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
-	$(CC) $(CFLAGS) -o $@ ds4_cli.o ds4_help.o ds4_prompt_prefix.o linenoise.o ds4_gpu_args.o $(CORE_OBJS) $(METAL_LDLIBS)
+ds4: ds4_cli.o ds4_help.o ds4_prompt_prefix.o linenoise.o ds4_gpu_args.o $(METAL_CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ ds4_cli.o ds4_help.o ds4_prompt_prefix.o linenoise.o ds4_gpu_args.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
 
-ds4-server: ds4_server.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(CORE_OBJS)
-	$(CC) $(CFLAGS) -o $@ ds4_server.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(CORE_OBJS) $(METAL_LDLIBS)
+ds4-server: ds4_server.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(METAL_CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ ds4_server.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
 
-ds4-bench: ds4_bench.o ds4_help.o ds4_gpu_args.o $(CORE_OBJS)
-	$(CC) $(CFLAGS) -o $@ ds4_bench.o ds4_help.o ds4_gpu_args.o $(CORE_OBJS) $(METAL_LDLIBS)
+ds4-bench: ds4_bench.o ds4_help.o ds4_gpu_args.o $(METAL_CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ ds4_bench.o ds4_help.o ds4_gpu_args.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
 
-ds4-eval: ds4_eval.o ds4_eval_cases.o ds4_help.o $(CORE_OBJS)
-	$(CC) $(CFLAGS) -o $@ ds4_eval.o ds4_eval_cases.o ds4_help.o $(CORE_OBJS) $(METAL_LDLIBS)
+ds4-eval: ds4_eval.o ds4_eval_cases.o ds4_help.o $(METAL_CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ ds4_eval.o ds4_eval_cases.o ds4_help.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
 
-ds4-agent: ds4_agent.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
-	$(CC) $(CFLAGS) -o $@ ds4_agent.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args.o $(CORE_OBJS) $(METAL_LDLIBS)
+ds4-agent: ds4_agent.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args.o $(METAL_CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ ds4_agent.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
 
-gguf-tools/quality-testing/score_official: gguf-tools/quality-testing/score_official.c ds4.h ds4_distributed.h ds4_tp.h $(CORE_OBJS) rax.o ds4_gpu_args.o
-	$(CC) $(QUALITY_CFLAGS) -I. -o $@ gguf-tools/quality-testing/score_official.c $(CORE_OBJS) rax.o ds4_gpu_args.o $(METAL_LDLIBS)
+gguf-tools/quality-testing/score_official: gguf-tools/quality-testing/score_official.c ds4.h ds4_distributed.h ds4_tp.h $(METAL_CORE_OBJS) rax.o ds4_gpu_args.o
+	$(CC) $(QUALITY_CFLAGS) -I. -o $@ gguf-tools/quality-testing/score_official.c $(METAL_CORE_OBJS) rax.o ds4_gpu_args.o $(METAL_LDLIBS)
 
 tests/test_metal_session_batch.o: tests/test_metal_session_batch.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_metal_session_batch.c
 
-tests/test_metal_session_batch: tests/test_metal_session_batch.o $(CORE_OBJS)
+tests/test_metal_session_batch: tests/test_metal_session_batch.o $(METAL_CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 tests/test_metal_tp_spec.o: tests/test_metal_tp_spec.c ds4.h ds4_tp.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
-tests/test_metal_tp_spec: tests/test_metal_tp_spec.o $(CORE_OBJS)
+tests/test_metal_tp_spec: tests/test_metal_tp_spec.o $(METAL_CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
-tests/test_metal_tp_cancel: tests/test_metal_tp_cancel.c ds4.h ds4_tp.h $(CORE_OBJS)
-	$(CC) $(CFLAGS) -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)
+tests/test_metal_tp_cancel: tests/test_metal_tp_cancel.c ds4.h ds4_tp.h $(METAL_CORE_OBJS)
+	$(CC) $(CFLAGS) -I. -o $@ $< $(METAL_CORE_OBJS) $(METAL_LDLIBS)
 
 test-metal-session-batch: tests/test_metal_session_batch
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_metal_session_batch
@@ -133,7 +145,7 @@ test-metal-session-batch: tests/test_metal_session_batch
 speed-bench/metal_decode_schedule_bench.o: speed-bench/metal_decode_schedule_bench.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
-speed-bench/metal_decode_schedule_bench: speed-bench/metal_decode_schedule_bench.o $(CORE_OBJS)
+speed-bench/metal_decode_schedule_bench: speed-bench/metal_decode_schedule_bench.o $(METAL_CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 metal-decode-schedule-bench: speed-bench/metal_decode_schedule_bench
@@ -141,7 +153,7 @@ metal-decode-schedule-bench: speed-bench/metal_decode_schedule_bench
 speed-bench/metal_prefill_variant_bench.o: speed-bench/metal_prefill_variant_bench.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
-speed-bench/metal_prefill_variant_bench: speed-bench/metal_prefill_variant_bench.o $(CORE_OBJS)
+speed-bench/metal_prefill_variant_bench: speed-bench/metal_prefill_variant_bench.o $(METAL_CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 metal-prefill-variant-bench: speed-bench/metal_prefill_variant_bench
@@ -149,7 +161,7 @@ metal-prefill-variant-bench: speed-bench/metal_prefill_variant_bench
 speed-bench/session_concurrency_bench.o: speed-bench/session_concurrency_bench.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
-speed-bench/session_concurrency_bench: speed-bench/session_concurrency_bench.o $(CORE_OBJS)
+speed-bench/session_concurrency_bench: speed-bench/session_concurrency_bench.o $(METAL_CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 session-concurrency-bench: speed-bench/session_concurrency_bench
@@ -169,7 +181,7 @@ test-mxfp4-metal: check-mxfp4-half-lut tests/test_mxfp4_metal
 tests/test_metal_moe_prefill.o: tests/test_metal_moe_prefill.c ds4_gpu.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
 
-tests/test_metal_moe_prefill: tests/test_metal_moe_prefill.o $(CORE_OBJS)
+tests/test_metal_moe_prefill: tests/test_metal_moe_prefill.o $(METAL_CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 test-metal-moe-prefill: tests/test_metal_moe_prefill
@@ -178,7 +190,7 @@ test-metal-moe-prefill: tests/test_metal_moe_prefill
 tests/test_qwen4_moe_mm_specialize.o: tests/test_qwen4_moe_mm_specialize.c ds4_gpu.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
 
-tests/test_qwen4_moe_mm_specialize: tests/test_qwen4_moe_mm_specialize.o $(CORE_OBJS)
+tests/test_qwen4_moe_mm_specialize: tests/test_qwen4_moe_mm_specialize.o $(METAL_CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 .PHONY: test-qwen4-moe-mm-specialize
@@ -188,7 +200,7 @@ test-qwen4-moe-mm-specialize: tests/test_qwen4_moe_mm_specialize
 tests/test_qwen4_conv_parallel.o: tests/test_qwen4_conv_parallel.c ds4_gpu.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
 
-tests/test_qwen4_conv_parallel: tests/test_qwen4_conv_parallel.o $(CORE_OBJS)
+tests/test_qwen4_conv_parallel: tests/test_qwen4_conv_parallel.o $(METAL_CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 .PHONY: test-qwen4-prefill-reuse
@@ -199,7 +211,7 @@ test-qwen4-prefill-reuse: tests/test_qwen4_conv_parallel tests/test_qwen4_moe_mm
 tests/test_q8_prefill_variants.o: tests/test_q8_prefill_variants.c ds4_gpu.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
 
-tests/test_q8_prefill_variants: tests/test_q8_prefill_variants.o $(CORE_OBJS)
+tests/test_q8_prefill_variants: tests/test_q8_prefill_variants.o $(METAL_CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 .PHONY: test-q8-prefill-variants
@@ -209,7 +221,7 @@ test-q8-prefill-variants: tests/test_q8_prefill_variants
 tests/test_metal_ssd_experts.o: tests/test_metal_ssd_experts.c ds4_gpu.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
 
-tests/test_metal_ssd_experts: tests/test_metal_ssd_experts.o $(CORE_OBJS)
+tests/test_metal_ssd_experts: tests/test_metal_ssd_experts.o $(METAL_CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 .PHONY: test-metal-ssd-experts
@@ -218,8 +230,8 @@ test-metal-ssd-experts: tests/test_metal_ssd_experts
 	./tests/test_metal_ssd_experts --q4
 	./tests/test_metal_ssd_experts --mxfp4
 
-tests/test_metal_command_memory: tests/test_metal_command_memory.c ds4_gpu.h $(CORE_OBJS)
-	$(CC) $(CFLAGS) -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)
+tests/test_metal_command_memory: tests/test_metal_command_memory.c ds4_gpu.h $(METAL_CORE_OBJS)
+	$(CC) $(CFLAGS) -I. -o $@ $< $(METAL_CORE_OBJS) $(METAL_LDLIBS)
 
 .PHONY: test-metal-command-memory
 test-metal-command-memory: tests/test_metal_command_memory
@@ -232,7 +244,7 @@ test-metal-command-memory: tests/test_metal_command_memory
 tests/test_deepseek41_metal.o: tests/test_deepseek41_metal.c ds4_gpu.h ds4_deepseek41_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
 
-tests/test_deepseek41_metal: tests/test_deepseek41_metal.o $(CORE_OBJS)
+tests/test_deepseek41_metal: tests/test_deepseek41_metal.o $(METAL_CORE_OBJS)
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
 
 .PHONY: test-deepseek41-metal
@@ -257,19 +269,19 @@ tests/test_deepseek41_prefill.o: tests/test_deepseek41_prefill.c ds4.c ds4_gpu.h
 tests/test_deepseek41_prefill: tests/test_deepseek41_prefill.o $(filter-out ds4.o,$(CORE_OBJS))
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
 
-tests/test_metal_tp_bulk: tests/test_metal_tp_bulk.c ds4_gpu.h ds4_tp.h $(CORE_OBJS)
-	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)
+tests/test_metal_tp_bulk: tests/test_metal_tp_bulk.c ds4_gpu.h ds4_tp.h $(METAL_CORE_OBJS)
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ $< $(METAL_CORE_OBJS) $(METAL_LDLIBS)
 
 tests/test_deepseek41_cli.o: tests/test_deepseek41_cli.c ds4_cli.c ds4.h
 	$(CC) $(CFLAGS) -Wno-unused-function -I. -c -o $@ $<
 
-tests/test_deepseek41_cli: tests/test_deepseek41_cli.o ds4_help.o ds4_prompt_prefix.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
+tests/test_deepseek41_cli: tests/test_deepseek41_cli.o ds4_help.o ds4_prompt_prefix.o linenoise.o ds4_gpu_args.o $(METAL_CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 tests/test_metal_dense_mpp.o: tests/test_metal_dense_mpp.c ds4_gpu.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
 
-tests/test_metal_dense_mpp: tests/test_metal_dense_mpp.o $(CORE_OBJS)
+tests/test_metal_dense_mpp: tests/test_metal_dense_mpp.o $(METAL_CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 test-metal-dense-mpp: tests/test_metal_dense_mpp
@@ -1345,6 +1357,20 @@ ds4.o ds4_cpu.o ds4_agent.o ds4_agent_cpu.o ds4_server.o ds4_server_cpu.o \
 ds4_test.o ds4_agent_test.o \
 ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o tests/test_session_state.o \
 tests/test_session_state_gpu.o: ds4_tool_text.h
+
+# SCR declarations, engine and server parts are textually included; rebuild
+# the including objects when any of them changes.
+SCR_ENGINE_DEPS = ds4_scr.h ds4_scr_engine.inc adapter/include/cache_reuse_utils.h
+ds4.o ds4_cpu.o ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o ds4_verify_test_hooks.o: $(SCR_ENGINE_DEPS)
+ds4_engram.o: ds4_scr.h
+ds4_server.o ds4_server_cpu.o ds4_test.o: ds4_scr.h ds4_server_scr.h adapter/include/cache_reuse_utils.h
+
+# Strict-host SCR suite: never links ds4_metal.o or opens a model.
+SCR_HOST_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o \
+	ds4_engram.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o
+.PHONY: check-scr-host
+check-scr-host: $(SCR_HOST_OBJS) $(CACHE_REUSE_LIB)
+	CC="$(CC)" sh tests/run-scr-host.sh
 
 clean:
 	rm -f tests/test_mmvq_cuda tests/test_mmvq_rocm

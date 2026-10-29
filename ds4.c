@@ -40860,6 +40860,13 @@ bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix) 
  * window; index-source layers publish selections for following reuse layers.
  * Engram tables are never GPU resources, only bounded decoded row buffers.
  */
+#define DS4_SCR_ENGINE_COORDINATES
+#include "ds4_scr_engine.inc"
+#undef DS4_SCR_ENGINE_COORDINATES
+#define DS4_SCR_ENGINE_ARCHIVE
+#include "ds4_scr_engine.inc"
+#undef DS4_SCR_ENGINE_ARCHIVE
+
 #define DS41_PREFILL_CAP 8192u
 #define DS41_INDEX_BATCH 32u
 #define DS41_CARRY_ROWS(X) \
@@ -40967,6 +40974,8 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
 typedef struct {
     uint32_t ctx, pos, prefill_cap, carry_cap;
     uint64_t allocation_bytes;
+    ds41_scr_archive *archive, *archive_pending;
+    bool archive_capture_pending;
     bool valid, streaming, encoder_resident, compact_carry, prefill_alias, quality;
     uint32_t tp_world, tp_rank;
     ds4_gpu_tensor *tp_logits_half;
@@ -40981,6 +40990,9 @@ typedef struct {
     uint32_t (*prefill_ids)[2][DS4_ENGRAM_COLS];
     ds4_engram_table table[2];
     ds4_engram_reader *engram_reader;
+    ds4_engram_observation engram_io;
+    ds4_scr_closed_observation closed_io;
+    ds4_scr_owner_observation retired_io[2];
     float rows[2][DS4_ENGRAM_COLS * DS4_ENGRAM_DIM];
     ds4_gpu_tensor *window[40];
     ds4_gpu_tensor *compressed[4], *index_cache[4];
@@ -40997,6 +41009,30 @@ typedef struct {
 #undef DS41_FIELD
 } ds41_gpu_graph;
 
+/* Keep upstream Engram scheduling/conversion authoritative. Readers measure
+ * privately and the exclusive graph owner merges only completed call results. */
+static bool ds41_engram_batch_observe(const ds4_engram_table *table, const uint32_t *rows,
+                                      size_t tokens, size_t stride, float *out,
+                                      ds4_engram_observation *sum) {
+    ds4_engram_observation part;
+    bool observe = sum && sum->enabled;
+    bool ok = ds4_engram_read_batch_observed(table, rows, tokens, stride, out, observe ? &part : NULL);
+    if (observe) ds4_engram_observation_add(sum, &part);
+    return ok;
+}
+static bool ds41_engram_read_observe(const ds4_engram_table *table, const uint32_t *rows,
+                                     size_t count, float *out, ds4_engram_observation *sum) {
+    ds4_engram_observation part;
+    bool observe = sum && sum->enabled;
+    bool ok = ds4_engram_read_observed(table, rows, count, out, observe ? &part : NULL);
+    if (observe) ds4_engram_observation_add(sum, &part);
+    return ok;
+}
+
+static ds41_scr_archive *ds41_graph_capture_archive(ds41_gpu_graph *g) {
+    return g->archive_capture_pending ? g->archive_pending : g->archive;
+}
+
 static bool ds41_read_array(const ds4_model *m, const char *key, uint32_t type,
                             uint64_t count, void *out, size_t bytes) {
     ds4_array_ref arr;
@@ -41007,6 +41043,20 @@ static bool ds41_read_array(const ds4_model *m, const char *key, uint32_t type,
 
 static void ds41_graph_free(ds41_gpu_graph *g) {
     if (!g) return;
+    const ds41_scr_archive *owned_archives[] = {g->archive, g->archive_pending};
+    bool unresolved = false;
+    for (uint32_t i = 0; i < 2u; ++i) {
+        const ds41_scr_archive *a = owned_archives[i];
+        if (!a || !a->raw) continue;
+        unresolved = true;
+        fprintf(stderr, "ds4: unchecked graph destruction with owned SCR raw state; checked session disposal required\n");
+        fprintf(stderr, "ds4: retained slot=%u fd=%d cleanup_path=%s archive_charge=%llu; named cleanup survives process exit\n",
+                i, a->raw->fd, a->raw->cleanup_path, (unsigned long long)a->allocation_bytes);
+    }
+    if (unresolved) _Exit(EXIT_FAILURE);
+    if (g->archive || g->archive_pending) ds4_gpu_synchronize();
+    ds41_archive_free(g->archive_pending);
+    ds41_archive_free(g->archive);
     ds41_dspark_free(g->dspark);
     ds4_engram_reader_free(g->engram_reader);
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -41093,6 +41143,9 @@ static ds4_context_memory ds41_graph_memory(uint32_t ctx) {
 }
 
 static void ds41_graph_reset(ds41_gpu_graph *g) {
+    g->archive_capture_pending = false;
+    ds41_archive_invalidate(g->archive);
+    if (g->archive && (g->image_count || g->tp_world != 1u)) g->archive->lost = true;
     g->pos = 0;
     g->valid = true;
     ds4_engram_history_reset(&g->history);
@@ -41108,6 +41161,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     g->table[0].fd = g->table[1].fd = -1;
     if (!ctx || ctx > 1048576 || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41) return false;
     g->ctx = ctx;
+    const char *observe_io = getenv("DS4_SCR_OBSERVE_IO");
+    g->engram_io.enabled = observe_io && !strcmp(observe_io, "1");
+    g->closed_io.known = true;
     g->prefill_cap = ds41_prefill_limit(ctx);
     g->carry_cap = ds41_carry_cap(ctx);
     g->compact_carry = !getenv("DS4_METAL_DISABLE_V41_COMPACT_CARRY");
@@ -41470,6 +41526,7 @@ static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
             if (!ds41_norm(g->latent, g->latent, m, l->attn_compressor_norm) ||
                 !ds41_matmul(g->index_k, m, l->indexer_attn_k, g->latent, true) ||
                 !ds41_norm(g->index_k, g->index_k, m, l->indexer_k_norm) ||
+                !ds41_archive_capture_owner(ds41_graph_capture_archive(g), owner, rope_pos, 1, g->latent, g->index_k) ||
                 !ds41_rope(g->index_k, 1, DS4_N_INDEXER_HEAD_DIM, il, rope_pos, false) ||
                 !ds4_gpu_dsv41_quantize(g->index_k, 128, 1, DS4_V41_FP4_E8M0) ||
                 !ds4_gpu_tensor_copy(g->index_cache[owner], (uint64_t)(n_comp - 1u) * 128u * 4u,
@@ -41555,6 +41612,7 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t heads = DS4_N_HEAD / g->tp_world;
     const uint32_t head0 = g->tp_rank * heads;
     if (!projected && !ds41_attention_project(g, m, l)) return false;
+    if (!ds41_archive_capture_window(ds41_graph_capture_archive(g), il, pos, 1, g->kv)) return false;
     if (!ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false) ||
         !ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, pos, false) ||
         !ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0) ||
@@ -41848,6 +41906,7 @@ static bool ds41_attention_publish_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
     return ds41_norm_batch(b->latent, b->latent, m, l->attn_compressor_norm, rows) &&
         ds41_project_rows(b->index_k, m, l->indexer_attn_k, b->latent, rows, true) &&
         ds41_norm_batch(b->index_k, b->index_k, m, l->indexer_k_norm, rows) &&
+        ds41_archive_capture_owner(ds41_graph_capture_archive(g), owner, first * ratio, rows, b->latent, b->index_k) &&
         ds4_gpu_dsv41_rope_stride(b->index_k, DS4_N_INDEXER_HEAD_DIM, 1, rows,
                                   first * ratio, ratio, true, false) &&
         ds4_gpu_dsv41_quantize(b->index_k, DS4_N_INDEXER_HEAD_DIM, rows, DS4_V41_FP4_E8M0) &&
@@ -41940,6 +41999,7 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
     const uint64_t sinks = l->attn_sinks->abs_offset +
         (uint64_t)g->tp_rank * heads * sizeof(float);
     ds41_prefill_row *b = &g->batch;
+    if (!ds41_archive_capture_window(ds41_graph_capture_archive(g), il, start, count, b->kv)) return false;
     if (!ds4_gpu_dsv41_rope(b->q, DS4_N_HEAD_DIM, heads, count, start, ratio != 0, false) ||
         !ds4_gpu_dsv41_rope(b->kv, DS4_N_HEAD_DIM, 1, count, start, ratio != 0, false) ||
         !ds4_gpu_dsv41_quantize(b->kv, DS4_N_HEAD_DIM, count, DS4_V41_FP8_E8M0)) return false;
@@ -42152,14 +42212,19 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;
     const bool overlap_engram = g->engram_reader && !ds41_image_at(g, g->pos) &&
         !getenv("DS4_DISABLE_V41_ENGRAM_OVERLAP");
-    if (overlap_engram && !ds4_engram_reader_start(g->engram_reader,
-            g->table, ids, &g->rows[0][0])) return false;
+    ds4_engram_observation reader_observation;
+    if (overlap_engram && !ds4_engram_reader_start_observed(g->engram_reader,
+            g->table, ids, &g->rows[0][0], g->engram_io.enabled ? &reader_observation : NULL)) {
+        if (g->engram_io.enabled) ds4_engram_observation_add(&g->engram_io, &reader_observation);
+        return false;
+    }
     for (uint32_t i = 0; !overlap_engram && !ds41_image_at(g, g->pos) && i < 2; i++) {
 #ifdef __APPLE__
-        if (!ds4_engram_read_batch(&g->table[i], ids[i], 1, DS4_ENGRAM_COLS, g->rows[i]))
-            return false;
+        if (!ds41_engram_batch_observe(&g->table[i], ids[i], 1, DS4_ENGRAM_COLS,
+                                        g->rows[i], &g->engram_io)) return false;
 #else
-        if (!ds4_engram_read(&g->table[i], ids[i], DS4_ENGRAM_COLS, g->rows[i])) return false;
+        if (!ds41_engram_read_observe(&g->table[i], ids[i], DS4_ENGRAM_COLS,
+                                       g->rows[i], &g->engram_io)) return false;
 #endif
     }
     const float initial_pre[] = {1, 0, 0, 0};
@@ -42206,7 +42271,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     if (ok && logits) ok = ds41_graph_logits(g, m, w, logits);
     /* Even a failed GPU layer must finish the reader before this graph (or
      * a borrowed row graph) can leave scope or reuse its host output rows. */
-    if (overlap_engram && !ds4_engram_reader_wait(g->engram_reader, 1)) ok = false;
+    if (overlap_engram) {
+        if (!ds4_engram_reader_wait(g->engram_reader, 1)) ok = false;
+        if (g->engram_io.enabled) ds4_engram_observation_add(&g->engram_io, &reader_observation);
+    }
     if (!ok) {
         g->valid = false;
         return false;
@@ -42345,8 +42413,11 @@ static void ds41_encoder_acquire(ds41_gpu_graph *g, const ds4_model *m,
         getenv("DS4_METAL_DISABLE_V41_LAYER_PREFILL") ||
         getenv("DS4_METAL_DISABLE_V41_ENCODER_RESIDENCY")) return;
     /* A wide layer sweep reads each encoder layer only once, without pinning
-     * a second long-lived set of experts or discarding the decode cache. */
-    if (g->carry_cap && !getenv("DS4_METAL_DISABLE_V41_WIDE_PREFILL")) return;
+     * a second long-lived set of experts or discarding the decode cache. An
+     * active SCR capture bounds every call to its arena, so no wide sweep can
+     * run and residency is the only way to avoid one disk sweep per chunk. */
+    if (g->carry_cap && !getenv("DS4_METAL_DISABLE_V41_WIDE_PREFILL") &&
+        !ds41_archive_capturing(ds41_graph_capture_archive(g))) return;
     const uint32_t cache = ds4_gpu_stream_expert_cache_configured_count();
     uint64_t expert_bytes = 0, bytes = 0;
     if (!ds4_streaming_routed_expert_bytes(w, &expert_bytes)) return;
@@ -42445,6 +42516,7 @@ static bool ds41_decoder_prepare(ds41_gpu_graph *g, const ds4_model *m,
         if (ok && !publish && batch_attention)
             ok = ds41_matmul_batch(active.kv, m, l->attn_kv, active.norm, count, true) &&
                 ds41_norm_batch(active.kv, active.kv, m, l->attn_kv_a_norm, count) &&
+                ds41_archive_capture_window(ds41_graph_capture_archive(g), il, initial_start + off, count, active.kv) &&
                 ds4_gpu_dsv41_rope(active.kv, DS4_N_HEAD_DIM, 1, count,
                                    initial_start + off, true, false) &&
                 ds4_gpu_dsv41_quantize(active.kv, DS4_N_HEAD_DIM, count, DS4_V41_FP8_E8M0);
@@ -42463,6 +42535,7 @@ static bool ds41_decoder_prepare(ds41_gpu_graph *g, const ds4_model *m,
                 if (!batch_attention)
                     ok = ds41_matmul(row.kv, m, l->attn_kv, row.norm, true) &&
                         ds41_norm(row.kv, row.kv, m, l->attn_kv_a_norm) &&
+                        ds41_archive_capture_window(ds41_graph_capture_archive(g), il, row.pos, 1, row.kv) &&
                         ds41_rope(row.kv, 1, DS4_N_HEAD_DIM, il, row.pos, false) &&
                         ds4_gpu_dsv41_quantize(row.kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0);
                 if (ok) ok = ds4_gpu_tensor_copy(g->window[il],
@@ -42485,6 +42558,7 @@ typedef struct {
     float *out;
     uint32_t count, ready;
     bool active, ok, cancel, done;
+    ds4_engram_observation observation, *observation_target;
 } ds41_engram_prefetch;
 
 static void *ds41_engram_prefetch_read(void *arg) {
@@ -42493,9 +42567,9 @@ static void *ds41_engram_prefetch_read(void *arg) {
     for (uint32_t off = 0; off < p->count; off += 2048u) {
         const uint32_t count = p->count - off < 2048u ? p->count - off : 2048u;
         if (__atomic_load_n(&p->cancel, __ATOMIC_RELAXED) ||
-            !ds4_engram_read_batch(p->table, p->ids + (size_t)off * 2u * DS4_ENGRAM_COLS,
+            !ds41_engram_batch_observe(p->table, p->ids + (size_t)off * 2u * DS4_ENGRAM_COLS,
                 count, 2u * DS4_ENGRAM_COLS,
-                p->out + (size_t)off * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM)) {
+                p->out + (size_t)off * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM, &p->observation)) {
             p->ok = false;
             break;
         }
@@ -42523,6 +42597,7 @@ static bool ds41_engram_prefetch_join(ds41_engram_prefetch *p, bool cancel) {
     if (!p->active) return true;
     if (cancel) __atomic_store_n(&p->cancel, true, __ATOMIC_RELAXED);
     if (pthread_join(p->thread, NULL)) ds4_die("cannot join V4.1 Engram reader safely");
+    ds4_engram_observation_add(p->observation_target, &p->observation);
     p->active = false;
     return p->ok;
 }
@@ -42530,7 +42605,8 @@ static bool ds41_engram_prefetch_join(ds41_engram_prefetch *p, bool cancel) {
 static bool ds41_engram_prefetch_start(ds41_engram_prefetch *p, ds41_gpu_graph *g,
                                       uint32_t table, uint32_t count) {
     *p = (ds41_engram_prefetch){.table = &g->table[table], .count = count,
-        .ids = g->prefill_ids[0][table], .out = ds4_gpu_tensor_contents(g->engram_prefetch)};
+        .ids = g->prefill_ids[0][table], .out = ds4_gpu_tensor_contents(g->engram_prefetch),
+        .observation = {.enabled = g->engram_io.enabled}, .observation_target = &g->engram_io};
     if (!p->out || pthread_create(&p->thread, NULL, ds41_engram_prefetch_read, p))
         return false;
     p->active = true;
@@ -42548,7 +42624,7 @@ static uint32_t ds41_encoder_chunk_cap(const ds41_gpu_graph *g, uint32_t count) 
  * travel down the stack with their token, while only source layers append KV.
  * A failed partial chunk cannot be snapshotted: its layers have different
  * frontiers, so the caller must rebuild from its retained token history. */
-static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
+static bool ds41_graph_prefill_sweep_body(ds41_gpu_graph *g, const ds4_model *m,
                               const ds4_weights *w, const int *tokens, uint32_t total_count,
                               ds4_session_progress_fn progress, void *progress_ud,
                               int total, ds4_session_cancel_fn cancel, void *cancel_ud,
@@ -42728,11 +42804,11 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                         ds41_engram_prefetch_join(&engram_prefetch, false);
                 } else if (getenv("DS4_METAL_DISABLE_V41_BATCH_ENGRAM")) {
                     for (uint32_t t = 0; ok && t < count; t++)
-                        ok = ds4_engram_read(&g->table[engram], ids[off + t][engram], DS4_ENGRAM_COLS,
-                                             ds4_gpu_tensor_contents(g->rows_view[t].engram_rows));
+                        ok = ds41_engram_read_observe(&g->table[engram], ids[off + t][engram], DS4_ENGRAM_COLS,
+                                             ds4_gpu_tensor_contents(g->rows_view[t].engram_rows), &g->engram_io);
                 } else {
-                    ok = ds4_engram_read_batch(&g->table[engram], ids[off][engram], count,
-                        2u * DS4_ENGRAM_COLS, ds4_gpu_tensor_contents(g->batch.engram_rows));
+                    ok = ds41_engram_batch_observe(&g->table[engram], ids[off][engram], count,
+                        2u * DS4_ENGRAM_COLS, ds4_gpu_tensor_contents(g->batch.engram_rows), &g->engram_io);
                 }
             }
             const double t_engram = profile ? now_sec() : 0;
@@ -42886,6 +42962,18 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     return ok;
 }
 
+#ifndef DS41_PREFILL_BODY_RUN
+#define DS41_PREFILL_BODY_RUN ds41_graph_prefill_sweep_body
+#endif
+/* Ordinary callers use the surviving batch prefill body. */
+static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
+                              const ds4_weights *w, const int *tokens, uint32_t count,
+                              ds4_session_progress_fn progress, void *progress_ud,
+                              int total, ds4_session_cancel_fn cancel, void *cancel_ud,
+                              bool encoder_only, bool resume_encoder) {
+    return DS41_PREFILL_BODY_RUN(g, m, w, tokens, count, progress, progress_ud,
+        total, cancel, cancel_ud, encoder_only, resume_encoder);
+}
 static bool ds41_graph_prefill(ds41_gpu_graph *g, const ds4_model *m,
                               const ds4_weights *w, const int *tokens, uint32_t count,
                               ds4_session_progress_fn progress, void *progress_ud,
@@ -42940,6 +43028,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                                    const ds4_model *model, const ds4_weights *weights) {
     if (!graphs || !tokens || count < 2 || count > DS4_TP_BATCH_MAX_ROWS ||
         prefill_rows > (uint32_t)count) return false;
+    /* Session batching cannot publish SCR capture or mapped-coordinate state. */
+    for (int i = 0; i < count; ++i)
+        if (!graphs[i] || graphs[i]->archive ||
+            graphs[i]->archive_pending || graphs[i]->archive_capture_pending) return false;
     /* Sparse block masks scale with context, even when prefill caps match.
      * Attention and Engram history remain private to each session. */
     ds41_gpu_graph *g = ds41_batch_workspace(graphs, count);
@@ -42980,7 +43072,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         float (*disk_rows)[DS4_ENGRAM_COLS * DS4_ENGRAM_DIM] =
             engram && (uint32_t)i < prefill_rows ? engram[i] : s->rows;
         for (unsigned table = 0; ok && table < 2; table++)
-            ok = ds4_engram_read(&s->table[table], ids[table], DS4_ENGRAM_COLS, disk_rows[table]);
+            ok = ds41_engram_read_observe(&s->table[table], ids[table], DS4_ENGRAM_COLS,
+                                          disk_rows[table], &s->engram_io);
         if (ok) ok = ds4_gpu_tensor_write(g->rows_view[i].pre, 0, initial_pre, sizeof(initial_pre)) &&
             ds4_gpu_embed_token_hc_tensor(g->rows_view[i].residual, model->map, model->size,
                 weights->token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)tokens[i], DS4_N_EMBD, DS4_N_HC);
@@ -61168,11 +61261,28 @@ typedef struct {
     uint8_t fingerprint[32];
 } ds4_vision_identity;
 
+#define DS4_SCR_ENGINE_COORDINATES
+#include "ds4_scr_engine.inc"
+#undef DS4_SCR_ENGINE_COORDINATES
+
 struct ds4_session {
     ds4_engine *engine;
+    /* Pad provenance describes checkpoint IDs even when its graph is invalid.
+     * Only the new owning route may publish a nonempty coordinate map. */
+    ds41_scr_coordinates scr_coordinates;
+    uint64_t scr_coordinate_charge, scr_coordinate_serial;
+    uint32_t scr_planner_budget_ms;
+    ds4_scr_padding_policy scr_padding_policy;
+    int scr_padding_token;
+    bool scr_padding_selected;
+    bool scr_capture_batch_chunks; /* Explicit selected fast body; known unequal logits. */
     ds4_dist_session *distributed;
     uint64_t tp_session_id;
     uint64_t glm_reserved_graph_bytes;
+    bool scr_policy_active; /* Opt-in operation owns callbacks/publication. */
+    bool scr_multi_active; /* Exclusive private transaction, never reentrant. */
+    bool scr_refresh_capture; /* Refresh source call batches capture headlessly. */
+    const struct ds41_policy_owner *scr_dense_owner; /* Stack scope, never public. */
 #ifndef DS4_NO_GPU
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     ds41_gpu_graph ds41_graph;
@@ -61280,6 +61390,90 @@ struct ds4_session {
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
 };
+
+/* Persistent map heap joins the graph/engine ledger at publication. A broken
+ * internal ledger cannot be repaired by silently subtracting guessed bytes. */
+static bool ds41_session_coordinate_charge_valid(const ds4_session *s) {
+    if (!s) return false;
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    if (s->ds41_graph_ready) {
+        size_t bytes;
+        return s->engine && ds41_coordinates_heap_bytes(s->scr_coordinates.capacity, &bytes) &&
+            bytes == s->scr_coordinate_charge && bytes <= s->ds41_graph.allocation_bytes &&
+            bytes <= s->engine->ds41_session_bytes;
+    }
+#endif
+    /* Unpublished host-only metadata has no graph charge. */
+    return s->scr_coordinate_charge == 0;
+}
+static void ds41_session_coordinates_clear(ds4_session *s) {
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    ds41_scr_archive *a = s && s->ds41_graph_ready ? s->ds41_graph.archive : NULL;
+    if (a && a->writer_state == DS41_ARCHIVE_ARMED) {
+        a->writer_state = DS41_ARCHIVE_INCOMPATIBLE; a->range.valid = false;
+    }
+#endif
+    if (!ds41_session_coordinate_charge_valid(s))
+        ds4_die("SCR coordinate charge invariant violated");
+    if (s->scr_coordinate_charge) {
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+        s->ds41_graph.allocation_bytes -= s->scr_coordinate_charge;
+        s->engine->ds41_session_bytes -= s->scr_coordinate_charge;
+#endif
+        s->scr_coordinate_charge = 0;
+    }
+    ds41_coordinates_free(&s->scr_coordinates);
+}
+
+typedef struct {
+    const uint32_t *pads;
+    uint32_t before, count, capacity;
+    uint64_t identity, serial;
+    int token;
+    bool mapped;
+} ds41_coordinate_append;
+
+/* Published maps were fully validated at their owning commit. Generation only
+ * changes transcript length, so bind/check the descriptor in constant time. */
+static bool ds41_session_coordinates_begin_append(ds4_session *s, int token,
+                                                   ds41_coordinate_append *next) {
+    if (!s || !next) return false;
+    memset(next, 0, sizeof(*next));
+    ds41_scr_coordinates *m = &s->scr_coordinates;
+    if (!m->identity)
+        return !m->pads && !m->count && !m->capacity && !m->physical_tokens;
+    size_t bytes;
+    if (s->scr_policy_active || s->scr_multi_active || s->scr_dense_owner ||
+        !s->checkpoint_valid || !s->logits || s->checkpoint.len < 0 || s->checkpoint.len >= s->ctx_size ||
+        m->physical_tokens != (uint32_t)s->checkpoint.len || m->count > m->capacity ||
+        m->count > m->physical_tokens || (m->capacity && !m->pads) ||
+        (!m->capacity && m->pads) ||
+        (m->count && m->pads[m->count - 1] >= m->physical_tokens) ||
+        !ds41_coordinates_heap_bytes(m->capacity, &bytes) || bytes != s->scr_coordinate_charge ||
+        m->identity > s->scr_coordinate_serial || s->scr_coordinate_serial == UINT64_MAX ||
+        token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
+    *next = (ds41_coordinate_append){m->pads, m->physical_tokens, m->count, m->capacity,
+                                    m->identity, ++s->scr_coordinate_serial, token, true};
+    return true;
+}
+
+static bool ds41_session_coordinates_finish_append(ds4_session *s,
+                                                    const ds41_coordinate_append *next) {
+    if (!s || !next) return false;
+    ds41_scr_coordinates *m = &s->scr_coordinates;
+    if (!next->mapped)
+        return !m->identity && !m->pads && !m->count && !m->capacity && !m->physical_tokens;
+    if (!s->checkpoint_valid || !s->checkpoint.v || s->ctx_size <= 0 ||
+        next->before >= (uint32_t)s->ctx_size || s->checkpoint.cap < s->checkpoint.len ||
+        s->checkpoint.len != (int)(next->before + 1u) ||
+        s->checkpoint.v[next->before] != next->token ||
+        s->scr_coordinate_serial != next->serial || m->identity != next->identity ||
+        m->physical_tokens != next->before || m->pads != next->pads ||
+        m->count != next->count || m->capacity != next->capacity) return false;
+    m->physical_tokens = next->before + 1u;
+    m->identity = next->serial;
+    return true;
+}
 
 static bool ds4_session_tp_leader(const ds4_session *s);
 
@@ -62214,6 +62408,10 @@ static bool ds4_session_is_ds41(const ds4_session *s) {
     return s && s->engine && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41;
 }
 
+#define DS4_SCR_ENGINE_GUARDS
+#include "ds4_scr_engine.inc"
+#undef DS4_SCR_ENGINE_GUARDS
+
 static void ds4_session_dspark_capture_invalidate(ds4_session *s) {
 #ifndef DS4_NO_GPU
     if (!s) return;
@@ -62354,6 +62552,7 @@ static bool ds4_layer_payload_range_valid(uint32_t layer_start, uint32_t layer_e
 uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
                                          uint32_t layer_start,
                                          uint32_t layer_end) {
+    if (s && s->scr_coordinates.count) return 0;
     if (!s || !s->checkpoint_valid ||
         !ds4_layer_payload_range_valid(layer_start, layer_end))
         return 0;
@@ -62423,6 +62622,10 @@ uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
 int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
                                    uint32_t layer_start, uint32_t layer_end,
                                    char *err, size_t errlen) {
+    if (s && s->scr_coordinates.count) {
+        payload_set_err(err, errlen, "physical-pad coordinates are not serializable");
+        return 1;
+    }
     if (!s || !fp || !s->checkpoint_valid ||
         !ds4_layer_payload_range_valid(layer_start, layer_end)) {
         payload_set_err(err, errlen, "invalid session layer payload save");
@@ -62691,6 +62894,10 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                                    const int *tokens, uint32_t n_tokens,
                                    uint32_t layer_start, uint32_t layer_end,
                                    char *err, size_t errlen) {
+    if (s && s->scr_coordinates.count) {
+        payload_set_err(err, errlen, "reset physical-pad coordinates before loading state");
+        return 1;
+    }
     if (!s || !fp || !tokens ||
         !ds4_layer_payload_range_valid(layer_start, layer_end)) {
         payload_set_err(err, errlen, "invalid session layer payload load");
@@ -63479,8 +63686,12 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
     }
     if (!rc && !ds4_gpu_synchronize()) rc = 1;
     if (!rc) {
+        /* Padded imports refuse at the public boundary. An unpadded identity
+         * map belongs to the old transcript, not the snapshot being loaded. */
+        ds41_session_coordinates_clear(s);
         s->checkpoint_valid = false;
         g->valid = false;
+        ds41_archive_invalidate(g->archive);
         rc = payload_read_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * 4u, &remaining, err, errlen);
         if (!rc && !ds4_gpu_tensor_write(g->logits, 0, s->logits,
                                          (uint64_t)DS4_N_VOCAB * 4u)) {
@@ -63512,6 +63723,7 @@ static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows);
 #endif
 
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
+    if (s && s->scr_coordinates.count) return 0;
     if (s && !s->distributed && ds4_session_is_qwen4(s)) {
 #ifndef DS4_HAS_QWEN4_GPU
         return 0;
@@ -63609,6 +63821,10 @@ void ds4_session_payload_file_free(ds4_session_payload_file *payload) {
 
 int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
                               char *err, size_t errlen) {
+    if (s && s->scr_coordinates.count) {
+        payload_set_err(err, errlen, "physical-pad coordinates are not serializable");
+        return 1;
+    }
     if (!out) {
         payload_set_err(err, errlen, "invalid session payload staging request");
         return 1;
@@ -63897,6 +64113,10 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
 #endif
 
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
+    if (s && s->scr_coordinates.count) {
+        payload_set_err(err, errlen, "physical-pad coordinates are not serializable");
+        return 1;
+    }
     if (!s || !fp || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
@@ -64248,6 +64468,10 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 }
 
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
+    if (s && s->scr_coordinates.count) {
+        payload_set_err(err, errlen, "reset physical-pad coordinates before loading state");
+        return 1;
+    }
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
@@ -64877,6 +65101,10 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
 }
 
 int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen) {
+    if (s && s->scr_coordinates.count) {
+        payload_set_err(err, errlen, "physical-pad coordinates are not serializable");
+        return 1;
+    }
     if (!s || !snap) {
         payload_set_err(err, errlen, "invalid session snapshot save");
         return 1;
@@ -64923,6 +65151,10 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
 }
 
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen) {
+    if (s && s->scr_coordinates.count) {
+        payload_set_err(err, errlen, "reset physical-pad coordinates before loading state");
+        return 1;
+    }
     if (!s || !snap || !snap->ptr || snap->len == 0) {
         payload_set_err(err, errlen, "invalid session snapshot load");
         return 1;
@@ -71709,6 +71941,295 @@ static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cach
 }
 #endif
 
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+static bool ds4_session_cancelled(ds4_session *s);
+static bool ds41_archive_raw_cancel(void *opaque) {
+    return ds4_session_cancelled((ds4_session *)opaque);
+}
+#endif
+/* Archive numerical staging deliberately has no live-prefix readiness guard:
+ * it cannot install state, publish logits, or move the native frontier. */
+int ds4_session_scr_archive_prepare(ds4_session *s, uint32_t start, uint32_t count) {
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    if (!ds41_scr_engine_compatible(s) || s->distributed || !s->ds41_graph_ready ||
+        s->engine->backend != DS4_BACKEND_METAL || ds4_gpu_commands_active()) return 1;
+    ds41_gpu_graph *g = &s->ds41_graph;
+    const uint64_t bytes = ds41_archive_bytes(count);
+    if (!bytes || start % 8u || start > g->ctx || count > g->ctx - start ||
+        start > 1048576u - count || g->archive || g->archive_pending || g->pos || s->checkpoint.len ||
+        !g->valid || g->tp_world != 1u || g->image_count ||
+        bytes > UINT64_MAX - g->allocation_bytes || bytes > UINT64_MAX - s->engine->ds41_session_bytes ||
+        !ds41_memory_admit(s->engine, s->engine->ds41_session_bytes + bytes, false)) return 1;
+    ds41_scr_archive *a = ds41_archive_alloc(start, count, s, &s->engine->model);
+    if (!a) return 1;
+    a->cancelled = ds41_archive_raw_cancel;
+    g->archive = a;
+    g->allocation_bytes += bytes;
+    s->engine->ds41_session_bytes += bytes;
+    const char *directory = getenv("TMPDIR");
+    if (!directory || !*directory) directory = "/tmp";
+    if (!ds41_raw_open(a->raw, directory, count, ds41_raw_bytes(count))) {
+        int saved = errno;
+        fprintf(stderr, "ds4: SCR raw preparation failed errno=%d; retiring owned candidate\n", saved);
+        a->retiring = true;
+        (void)ds4_session_scr_archive_release(s);
+        errno = saved;
+        return 1;
+    }
+    return 0;
+#else
+    (void)s; (void)start; (void)count;
+    return 1;
+#endif
+}
+
+int ds4_session_scr_archive_flush(ds4_session *s) {
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    if (!s || !s->engine || s->distributed || !s->ds41_graph_ready ||
+        s->engine->backend != DS4_BACKEND_METAL) return 1;
+    ds41_gpu_graph *g = &s->ds41_graph;
+    ds41_scr_archive *a = g->archive;
+    if (!a || a->session != s || a->model != &s->engine->model ||
+        !g->valid || !s->checkpoint_valid || g->encoder_resident ||
+        s->checkpoint.len <= 0 || !s->checkpoint.v ||
+        g->pos != (uint32_t)s->checkpoint.len || g->tp_world != 1u || g->image_count ||
+        ds4_gpu_commands_active()) return 1;
+    if (g->pos < a->start) return 0;
+    if (!ds41_archive_flush(a, g->pos, ds41_archive_raw_cancel, s)) {
+        a->lost = true;
+        return ds4_session_cancelled(s) ? DS4_SESSION_SYNC_INTERRUPTED : 1;
+    }
+    return 0;
+#else
+    (void)s;
+    return 1;
+#endif
+}
+
+int ds4_session_scr_archive_seal(ds4_session *s, const int *tokens, uint32_t count) {
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    if (!s || !s->engine || s->distributed || !s->ds41_graph_ready || !tokens ||
+        s->engine->backend != DS4_BACKEND_METAL) return 1;
+    ds41_gpu_graph *g = &s->ds41_graph;
+    ds41_scr_archive *a = g->archive;
+    if (!a || count < 128u || count > a->cap || count % 8u ||
+        !ds41_archive_shape(a, g->ctx) || !g->valid || !s->checkpoint_valid || g->image_count ||
+        g->tp_world != 1u || g->pos != a->start + count || s->checkpoint.len < 0 ||
+        g->pos != (uint32_t)s->checkpoint.len || !s->checkpoint.v ||
+        memcmp(tokens, s->checkpoint.v + a->start, (size_t)count * sizeof(int))) return 1;
+    return ds41_archive_seal(a, s, &s->engine->model, tokens, count) ? 0 : 1;
+#else
+    (void)s; (void)tokens; (void)count;
+    return 1;
+#endif
+}
+
+int ds4_session_scr_archive_stage(ds4_session *s, uint32_t source_start,
+                                  uint32_t destination_start, const int *tokens, uint32_t count) {
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    if (s && s->ds41_graph.archive) s->ds41_graph.archive->range.valid = false;
+    if (!s || !s->engine || s->distributed || !s->ds41_graph_ready ||
+        s->engine->backend != DS4_BACKEND_METAL) return 1;
+    ds41_gpu_graph *g = &s->ds41_graph;
+    if (g->tp_world != 1u || g->image_count) return 1;
+    return ds41_archive_materialize(g->archive, s, &s->engine->model, source_start,
+                                    destination_start, tokens, count, g->ctx) ? 0 : 1;
+#else
+    (void)s; (void)source_start; (void)destination_start; (void)tokens; (void)count;
+    return 1;
+#endif
+}
+
+uint64_t ds4_session_scr_archive_bytes(const ds4_session *s) {
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    if (!s || !s->ds41_graph_ready) return 0;
+    const ds41_gpu_graph *g = &s->ds41_graph;
+    uint64_t source = g->archive ? g->archive->allocation_bytes : 0;
+    uint64_t pending = g->archive_pending ? g->archive_pending->allocation_bytes : 0;
+    return source > UINT64_MAX - pending ? UINT64_MAX : source + pending;
+#else
+    (void)s;
+    return 0;
+#endif
+}
+
+ds4_scr_archive_snapshot ds4_session_scr_archive_snapshot(const ds4_session *s) {
+    ds4_scr_archive_snapshot view = {0};
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    if (!s || !s->engine || s->distributed || !s->ds41_graph_ready ||
+        s->engine->backend != DS4_BACKEND_METAL ||
+        !ds4_engine_is_deepseek41(s->engine) || s->scr_policy_active ||
+        s->scr_multi_active || s->scr_dense_owner ||
+        s->ds41_graph.encoder_resident || ds4_gpu_commands_active()) return view;
+    const ds41_gpu_graph *g = &s->ds41_graph;
+    const ds41_scr_archive *a = g->archive, *pending = g->archive_pending;
+    if (g->tp_world != 1u || g->image_count || g->archive_capture_pending ||
+        (a && (a->session != s || a->model != &s->engine->model ||
+               a->allocation_bytes > g->allocation_bytes ||
+               a->allocation_bytes > s->engine->ds41_session_bytes)) ||
+        (pending && (pending == a || pending->session != s ||
+               pending->model != &s->engine->model ||
+               pending->allocation_bytes > g->allocation_bytes ||
+               pending->allocation_bytes > s->engine->ds41_session_bytes)) ||
+        ds4_session_scr_archive_bytes(s) > g->allocation_bytes ||
+        ds4_session_scr_archive_bytes(s) > s->engine->ds41_session_bytes) return view;
+    view.observation_known = true;
+    view.observation_time_known = ds4_observation_clock(&view.observed_nanoseconds);
+    view.active_io = ds41_archive_observe(a);
+    view.extra_io = ds41_archive_observe(pending);
+    view.closed_io = g->closed_io;
+    memcpy(view.retired_io, g->retired_io, sizeof(view.retired_io));
+    view.engram_io = g->engram_io;
+    view.extra_owner_known = true;
+    view.extra_owner_present = pending != NULL;
+    view.extra_owner_retiring = pending && pending->retiring;
+    view.extra_owner_accounted_bytes = pending ? pending->allocation_bytes : 0;
+    view.presence_known = true;
+    if (!a) return view;
+    view.present = true;
+    view.sealed = a->sealed;
+    view.lost = a->lost;
+    view.retiring = a->retiring;
+    view.start = a->start;
+    view.end = a->end;
+    view.capacity = a->cap;
+    view.sealed_tokens = ds41_archive_count(a);
+    view.generation = a->generation;
+    view.source_generation = a->source_generation;
+    view.accounted_bytes = a->allocation_bytes;
+    view.append_armed = a->writer_state == DS41_ARCHIVE_ARMED;
+    view.append_incompatible = a->writer_state == DS41_ARCHIVE_INCOMPATIBLE;
+    view.append_blocked = a->writer_state == DS41_ARCHIVE_BLOCKED;
+    view.append_saturated = a->writer_state == DS41_ARCHIVE_SATURATED;
+    view.history_hole = a->history_hole;
+    view.certified_captured_tokens = a->sealed && a->captured_end >= a->start ?
+        a->captured_end - a->start : 0u;
+    if (a->raw) {
+        view.backend_written_tokens = a->raw->written_tokens;
+        view.backend_committed_tokens = a->raw->committed_tokens;
+        view.raw_readable = a->raw->readable;
+        view.raw_writable = a->raw->writable;
+        view.io_state_known = !a->retiring && a->raw->fd >= 0 && a->raw->identity_known &&
+            !a->raw->identity_lost && a->raw->readable;
+        view.file_bytes = a->raw->file_bytes;
+        uint64_t published_bytes = ds41_raw_bytes(view.sealed_tokens);
+        view.unpublished_file_bytes = view.file_bytes > published_bytes ?
+            view.file_bytes - published_bytes : 0u;
+        view.pending_known = (view.append_armed || view.append_saturated) && !a->lost &&
+            a->captured_end >= a->raw_origin && a->captured_end - a->raw_origin < 8u;
+        if (view.pending_known) view.pending_tokens = a->captured_end - a->raw_origin;
+    }
+    view.provenance_known = view.io_state_known && a->sealed &&
+        a->source_generation && a->source_generation <= a->generation &&
+        !(a->lost && a->generation == UINT64_MAX) &&
+        a->start <= a->end && view.sealed_tokens >= 128u && view.sealed_tokens <= a->cap &&
+        a->imported_tokens <= view.sealed_tokens &&
+        (!a->rebased ? !a->imported_tokens :
+            (a->start == 0u && a->rebase_head_end >= 128u && !(a->rebase_head_end % 8u) &&
+             a->rebase_head_end <= a->end && a->imported_tokens <= a->rebase_head_end &&
+             a->predecessor_generation && a->predecessor_start < a->predecessor_end &&
+             a->predecessor_end - a->predecessor_start <= a->predecessor_capacity));
+    if (view.provenance_known) {
+        view.rebased = a->rebased;
+        view.published_imported_tokens = a->imported_tokens;
+        view.published_computed_tokens = view.sealed_tokens - a->imported_tokens;
+        if (a->rebased) {
+            view.rebase_head_end = a->rebase_head_end;
+            view.predecessor_start = a->predecessor_start;
+            view.predecessor_end = a->predecessor_end;
+            view.predecessor_capacity = a->predecessor_capacity;
+            view.predecessor_generation = a->predecessor_generation;
+            view.predecessor_coordinate_identity = a->predecessor_coordinate_identity;
+        }
+    }
+#else
+    (void)s;
+#endif
+    return view;
+}
+
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+/* Each slot keeps its charge until its own checked retirement succeeds. */
+static int ds41_session_archive_release_slot(ds4_session *s, bool pending) {
+    if (!s || !s->engine || !s->ds41_graph_ready) return 1;
+    ds41_gpu_graph *g = &s->ds41_graph;
+    ds41_scr_archive **slot = pending ? &g->archive_pending : &g->archive;
+    ds41_scr_archive *a = *slot;
+    if (!a) return 0;
+    if ((g->archive && g->archive_pending &&
+         (g->archive == g->archive_pending ||
+          (g->archive->raw && g->archive->raw == g->archive_pending->raw))) ||
+        (!pending && g->archive_capture_pending) ||
+        a->session != s || a->model != &s->engine->model ||
+        a->allocation_bytes > g->allocation_bytes ||
+        a->allocation_bytes > s->engine->ds41_session_bytes) return 1;
+    if (pending) g->archive_capture_pending = false;
+    a->range.valid = false;
+    a->retiring = true;
+    if (ds4_gpu_commands_active() || !ds4_gpu_synchronize()) return 1;
+    const uint64_t bytes = a->allocation_bytes;
+    ds4_scr_owner_observation *observation = &g->retired_io[pending ? 1 : 0];
+    if (!ds41_archive_free_observed(a, observation)) return 1;
+    ds41_archive_observation_closed(&g->closed_io, observation);
+    *slot = NULL;
+    g->allocation_bytes -= bytes;
+    s->engine->ds41_session_bytes -= bytes;
+    return 0;
+}
+#endif
+int ds4_session_scr_archive_release(ds4_session *s) {
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    if (ds41_session_archive_release_slot(s, true)) return 1;
+    return ds41_session_archive_release_slot(s, false);
+#else
+    (void)s;
+    return 1;
+#endif
+}
+
+ds4_scr_retire_outcome ds4_session_scr_archive_retire_once(
+    ds4_session *s, ds4_scr_retire_receipt *receipt) {
+    ds4_scr_retire_receipt r = { .outcome = DS4_SCR_RETIRE_INVALID };
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    if (!s || !s->engine || s->distributed || !s->ds41_graph_ready ||
+        s->engine->backend != DS4_BACKEND_METAL ||
+        !ds4_engine_is_deepseek41(s->engine) || s->scr_policy_active ||
+        s->scr_multi_active || s->scr_dense_owner ||
+        s->ds41_graph.encoder_resident || ds4_gpu_commands_active()) goto done;
+    ds41_gpu_graph *g = &s->ds41_graph;
+    ds41_scr_archive *a = g->archive, *pending = g->archive_pending;
+    if (g->tp_world != 1u || g->image_count || g->archive_capture_pending ||
+        (a && (a->session != s || a->model != &s->engine->model ||
+               a->allocation_bytes > g->allocation_bytes ||
+               a->allocation_bytes > s->engine->ds41_session_bytes)) ||
+        (pending && (pending == a || pending->session != s ||
+               pending->model != &s->engine->model ||
+               pending->allocation_bytes > g->allocation_bytes ||
+               pending->allocation_bytes > s->engine->ds41_session_bytes)) ||
+        ds4_session_scr_archive_bytes(s) > g->allocation_bytes ||
+        ds4_session_scr_archive_bytes(s) > s->engine->ds41_session_bytes) goto done;
+    r.charge_known = true;
+    if (!a && !pending) { r.outcome = DS4_SCR_RETIRE_ABSENT; goto done; }
+    r.charged_bytes_before = r.charged_bytes_after = ds4_session_scr_archive_bytes(s);
+    if ((a && a->retiring) || (pending && pending->retiring)) {
+        r.outcome = DS4_SCR_RETIRE_ALREADY_FENCED; goto done;
+    }
+    r.attempted = true;
+    if (ds4_session_scr_archive_release(s)) {
+        r.outcome = DS4_SCR_RETIRE_FAILED_RETAINED;
+        r.charged_bytes_after = ds4_session_scr_archive_bytes(s);
+    } else {
+        r.outcome = DS4_SCR_RETIRE_RELEASED;
+        r.charged_bytes_after = 0;
+    }
+done:
+#else
+    (void)s;
+#endif
+    if (receipt) *receipt = r;
+    return r.outcome;
+}
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     return ds4_engine_open_internal(out, opt, NULL);
 }
@@ -74269,6 +74790,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     ds4_session *s = xcalloc(1, sizeof(*s));
     s->engine = e;
     s->ctx_size = ctx_size;
+    s->scr_planner_budget_ms = 5000u;
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
         if (ctx_size > 1048576 ||
@@ -74711,8 +75233,9 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 #endif
 }
 
-void ds4_session_free(ds4_session *s) {
+static void ds4_session_free_contents(ds4_session *s) {
     if (!s) return;
+    ds41_session_coordinates_clear(s);
     if (s->glm_reserved_graph_bytes && s->engine) {
         s->engine->glm_session_graph_bytes -= s->glm_reserved_graph_bytes;
         s->engine->glm_session_count--;
@@ -74784,6 +75307,42 @@ void ds4_session_free(ds4_session *s) {
     free(s->dspark_conf_features);
 #endif
     free(s);
+}
+
+int ds4_session_dispose_checked(ds4_session **owner) {
+    if (!owner) return 1;
+    ds4_session *s = *owner;
+    if (!s) return 0;
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    ds41_gpu_graph *g = &s->ds41_graph;
+    ds41_scr_archive *a = s->ds41_graph_ready ? g->archive : NULL;
+    ds41_scr_archive *pending = s->ds41_graph_ready ? g->archive_pending : NULL;
+    if ((a && a->raw) || (pending && pending->raw)) {
+        /* No map/graph destruction precedes both checked ownership discharges. */
+        if (!s->engine || s->scr_policy_active || s->scr_multi_active || s->scr_dense_owner ||
+            g->encoder_resident || ds4_session_scr_archive_release(s)) return 1;
+    }
+#endif
+    ds4_session_free_contents(s);
+    *owner = NULL;
+    return 0;
+}
+
+void ds4_session_free(ds4_session *s) {
+    if (!ds4_session_dispose_checked(&s)) return;
+    fprintf(stderr, "ds4: legacy session free encountered unresolved SCR raw ownership; process stopping without a core dump\n");
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    if (s && s->ds41_graph_ready) {
+        const ds41_scr_archive *owned[] = {s->ds41_graph.archive, s->ds41_graph.archive_pending};
+        for (uint32_t i = 0; i < 2u; ++i) {
+            const ds41_scr_archive *a = owned[i];
+            if (!a || !a->raw) continue;
+            fprintf(stderr, "ds4: retained slot=%u fd=%d cleanup_path=%s archive_charge=%llu; named cleanup is not discharged by process exit\n",
+                    i, a->raw->fd, a->raw->cleanup_path, (unsigned long long)a->allocation_bytes);
+        }
+    }
+#endif
+    _Exit(EXIT_FAILURE);
 }
 
 int ds4_session_distributed_route_ready(ds4_session *s, char *err, size_t errlen) {
@@ -74912,6 +75471,11 @@ void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud) 
     s->cancel = fn;
     s->cancel_ud = ud;
 }
+int ds4_session_set_scr_planner_budget(ds4_session *s, uint32_t budget_ms) {
+    if (!s || budget_ms > 60000u) return 1;
+    s->scr_planner_budget_ms = budget_ms;
+    return 0;
+}
 
 static bool ds4_session_cancelled(ds4_session *s) {
     return s && s->cancel && s->cancel(s->cancel_ud);
@@ -74927,6 +75491,9 @@ void ds4_session_report_progress(ds4_session *s, const char *event, int current,
 }
 
 int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen) {
+    if (ds41_coordinates_restricted(s)) {
+        payload_set_err(err, errlen, "physical coordinates do not support layer-slice reset"); return 1;
+    }
     if (!s) {
         if (errlen) snprintf(err, errlen, "missing layer-slice session");
         return 1;
@@ -74963,6 +75530,9 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
                                          float *logits,
                                          char *err,
                                          size_t errlen) {
+    if (ds41_coordinates_restricted(s)) {
+        payload_set_err(err, errlen, "physical coordinates do not support external hidden-state heads"); return 1;
+    }
     if (!s || !s->engine || !hidden_hc || n_tokens == 0 || !logits) {
         if (errlen) snprintf(err, errlen, "invalid output-head hidden-state input");
         return 1;
@@ -75762,6 +76332,9 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
 
 int ds4_session_glm_tp_spec_cycle(ds4_session *s, int token, int limit,
                                  char *err, size_t errlen) {
+    if (ds41_coordinates_restricted(s)) {
+        payload_set_err(err, errlen, "physical coordinates do not support TP speculation"); return 1;
+    }
 #ifndef DS4_NO_GPU
     if (s && s->engine && s->engine->tp.active && s->engine->tp.rank == 1 &&
         s->checkpoint_valid && ds4_session_is_glm(s) &&
@@ -75831,6 +76404,9 @@ int ds4_session_eval_layer_slice(ds4_session *s,
     if (!s || !s->engine) {
         if (errlen) snprintf(err, errlen, "missing layer-slice session");
         return 1;
+    }
+    if (ds41_coordinates_restricted(s)) {
+        payload_set_err(err, errlen, "physical coordinates do not support layer-slice evaluation"); return 1;
     }
     const uint32_t executable_layers = ds4_model_normal_layer_count();
     if (executable_layers == 0 ||
@@ -76535,6 +77111,7 @@ static int ds4_session_sync_lockstep(ds4_session *s, const ds4_tokens *prompt,
  * once its matching prefill completes, surfacing worker-side failures
  * here instead of as a gate timeout mid-decode. */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+    if (ds41_session_sync_entry_guard(s, err, errlen)) return 1;
 #ifndef DS4_NO_GPU
     if (s) s->dspark_rewind_end = 0;
 #endif
@@ -76625,6 +77202,10 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     return rc;
 }
 
+#define DS4_SCR_ENGINE_SESSION
+#include "ds4_scr_engine.inc"
+#undef DS4_SCR_ENGINE_SESSION
+
 int ds4_session_sync_multimodal(
         ds4_session *s,
         const ds4_tokens *prompt,
@@ -76632,6 +77213,7 @@ int ds4_session_sync_multimodal(
         size_t image_count,
         char *err,
         size_t errlen) {
+    if (ds41_session_multimodal_entry_guard(s, err, errlen)) return 1;
     if (!s || !prompt || (image_count != 0 && !images)) {
         snprintf(err, errlen, "invalid multimodal prompt");
         return 1;
@@ -76679,6 +77261,7 @@ int ds4_session_sync_multimodal(
     if (ds4_session_is_ds41(s)) {
         s->ds41_graph.images = images;
         s->ds41_graph.image_count = image_count;
+        if (image_count && s->ds41_graph.archive) s->ds41_graph.archive->lost = true;
     }
 #endif
 #ifndef DS4_NO_GPU
@@ -76857,94 +77440,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
     (void)backend_name; (void)e;
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (ds4_session_is_ds41(s)) {
-        ds41_gpu_graph *g = &s->ds41_graph;
-        if (!s->ds41_graph_ready) {
-            snprintf(err, errlen, "V4.1 graph is not initialized");
-            return 1;
-        }
-        if (!s->checkpoint_valid || !g->valid || g->pos != (uint32_t)s->checkpoint.len ||
-            !ds4_tokens_starts_with(prompt, &s->checkpoint)) {
-            ds41_graph_reset(g);
-            s->checkpoint.len = 0;
-            s->checkpoint_valid = false;
-        }
-        bool pending_logits = false, interrupted = false, decoder_pending = false;
-        ds41_encoder_residency encoder = {0};
-        ds41_encoder_acquire(g, &e->model, &e->weights,
-            (uint32_t)(prompt->len - s->checkpoint.len), &encoder, s->cancel, s->cancel_ud);
-        for (int i = s->checkpoint.len; i < prompt->len;) {
-            if (ds4_session_cancelled(s)) {
-                interrupted = true;
-                break;
-            }
-            const uint32_t remaining = (uint32_t)(prompt->len - i);
-            if (g->encoder_resident && remaining < 768u)
-                ds41_encoder_release(g, &e->model, &encoder);
-            const uint32_t short_count = decoder_pending ? 0u :
-                ds41_short_prefill_count(g, &e->weights, remaining);
-            const uint32_t count = short_count ? short_count : g->encoder_resident ?
-                (remaining - 512u < g->prefill_cap ? remaining - 512u : g->prefill_cap) :
-                ds41_prefill_count(g, remaining);
-            const bool defer_decoder = !g->encoder_resident && count >= 16384u &&
-                remaining - count >= 8192u &&
-                !getenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX") &&
-                !getenv("DS4_METAL_DISABLE_V41_DEFER_DECODER");
-            /* Never add an encoder sweep just to defer the decoder. A short
-             * remainder finishes the pending decoder here, then runs normally. */
-            const bool layer_major = count > 1u;
-            const bool ok = short_count ?
-                ds41_graph_short_prefill(g, &e->model, &e->weights, prompt->v + i, count) :
-                layer_major ?
-                (defer_decoder || decoder_pending ?
-                 ds41_graph_prefill_sweep(g, &e->model, &e->weights, prompt->v + i, count,
-                    s->progress, s->progress_ud, prompt->len, s->cancel, s->cancel_ud,
-                    defer_decoder, decoder_pending) :
-                 ds41_graph_prefill(g, &e->model, &e->weights, prompt->v + i, count,
-                    s->progress, s->progress_ud, prompt->len, s->cancel, s->cancel_ud)) :
-                ds41_graph_step(g, &e->model, &e->weights, prompt->v[i], NULL);
-            if (!ok) {
-                ds41_encoder_release(g, &e->model, &encoder);
-                s->checkpoint_valid = false;
-                if (ds4_session_cancelled(s)) {
-                    snprintf(err, errlen, "interrupted");
-                    return DS4_SESSION_SYNC_INTERRUPTED;
-                }
-                snprintf(err, errlen, "V4.1 prefill failed at position %d", i);
-                return 1;
-            }
-            for (uint32_t t = 0; t < count; t++)
-                token_vec_push(&s->checkpoint, prompt->v[i + (int)t]);
-            i += (int)count;
-            decoder_pending = defer_decoder;
-            pending_logits = true;
-            s->checkpoint_valid = false;
-            if (s->progress)
-                s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
-        }
-        ds41_encoder_release(g, &e->model, &encoder);
-        if (decoder_pending) {
-            s->checkpoint_valid = false;
-            g->valid = false;
-            snprintf(err, errlen, "interrupted");
-            return DS4_SESSION_SYNC_INTERRUPTED;
-        }
-        /* Prefill needs only its final output head. An interrupted prefix must
-         * still have matching logits before it can be saved or continued. */
-        if (pending_logits) {
-            if (!ds41_graph_logits(g, &e->model, &e->weights, s->logits)) {
-                g->valid = false;
-                snprintf(err, errlen, "V4.1 prefill output head failed");
-                return 1;
-            }
-            s->checkpoint_valid = true;
-            if (s->progress)
-                s->progress(s->progress_ud, "prefill_chunk", s->checkpoint.len, prompt->len);
-        }
-        if (interrupted) {
-            snprintf(err, errlen, "interrupted");
-            return DS4_SESSION_SYNC_INTERRUPTED;
-        }
-        return 0;
+        return ds41_session_prefix(s, prompt, false, NULL, err, errlen);
     }
 #endif
     if (ds4_session_is_glm(s)) {
@@ -77879,8 +78375,10 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
     }
 
     if (common == s->checkpoint.len) {
-        return ds4_session_sync(s, prompt, err, errlen) == 0 ?
-            DS4_SESSION_REWRITE_OK : DS4_SESSION_REWRITE_ERROR;
+        int rc = s->scr_coordinates.identity ?
+            ds4_session_sync_physical(s, prompt, err, errlen) :
+            ds4_session_sync(s, prompt, err, errlen);
+        return rc == 0 ? DS4_SESSION_REWRITE_OK : DS4_SESSION_REWRITE_ERROR;
     }
 
     if (ds4_session_rewrite_requires_rebuild(s->checkpoint.len, prompt->len, common)) {
@@ -77901,13 +78399,38 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
     return i;
 }
 
+/* Full map validation happens at publication. Head readers bind the published
+ * descriptor in constant time, as generation does, without rescanning a prompt. */
+static bool ds41_coordinates_head_supported(const ds4_session *s) {
+    if (!s || s->scr_policy_active || s->scr_multi_active || s->scr_dense_owner) return false;
+    const ds41_scr_coordinates *m = &s->scr_coordinates;
+    if (!m->identity) return !m->pads && !m->count && !m->capacity &&
+        !m->physical_tokens && !s->scr_coordinate_charge;
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    size_t bytes;
+    return ds41_coordinates_eval_supported(s) && s->ds41_graph_ready &&
+        s->checkpoint_valid && s->logits && s->checkpoint.v && s->checkpoint.len > 0 &&
+        s->checkpoint.cap >= s->checkpoint.len && s->checkpoint.len < s->ctx_size &&
+        s->ds41_graph.valid && !s->ds41_graph.encoder_resident && !ds4_gpu_commands_active() &&
+        s->ds41_graph.pos == (uint32_t)s->checkpoint.len &&
+        m->physical_tokens == (uint32_t)s->checkpoint.len && m->count <= m->capacity &&
+        m->count <= m->physical_tokens && (m->capacity ? m->pads != NULL : m->pads == NULL) &&
+        (!m->count || m->pads[m->count - 1u] < m->physical_tokens) &&
+        m->identity <= s->scr_coordinate_serial &&
+        ds41_coordinates_heap_bytes(m->capacity, &bytes) && bytes == s->scr_coordinate_charge &&
+        bytes <= s->ds41_graph.allocation_bytes && bytes <= s->engine->ds41_session_bytes;
+#else
+    return false;
+#endif
+}
+
 int ds4_session_argmax(ds4_session *s) {
-    if (!s || !s->checkpoint_valid || !s->logits) return -1;
+    if (!ds41_coordinates_head_supported(s) || !s->checkpoint_valid || !s->logits) return -1;
     return sample_argmax(s->logits, DS4_N_VOCAB);
 }
 
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
-    if (!s || !s->checkpoint_valid || !s->logits) return -1;
+    if (!ds41_coordinates_head_supported(s) || !s->checkpoint_valid || !s->logits) return -1;
     if (getenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == NULL) {
         return argmax_f32_excluding_unrolled8(
                 s->logits, DS4_N_VOCAB, excluded_id);
@@ -77927,7 +78450,7 @@ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
 
 int ds4_session_argmax_ignoring_eos(ds4_session *s,
                                     ds4_think_mode think_mode) {
-    if (!s || !s->checkpoint_valid || !s->logits) return -1;
+    if (!ds41_coordinates_head_supported(s) || !s->checkpoint_valid || !s->logits) return -1;
     int best = -1;
     float best_logit = DS4_NEG_INF;
     for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
@@ -77956,13 +78479,13 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 }
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
-    if (!s || !s->checkpoint_valid || !s->logits) return -1;
+    if (!ds41_coordinates_head_supported(s) || !s->checkpoint_valid || !s->logits) return -1;
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
                               top_p, min_p, rng, s->sample_probs);
 }
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
-    if (!s || !out || k <= 0) return 0;
+    if (!ds41_coordinates_head_supported(s) || !out || k <= 0) return 0;
     if (k > (int)DS4_N_VOCAB) k = (int)DS4_N_VOCAB;
     for (int i = 0; i < k; i++) {
         out[i].id = -1;
@@ -77999,7 +78522,7 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
 }
 
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
-    if (!s || !out || token < 0 || token >= (int)DS4_N_VOCAB) return 0;
+    if (!ds41_coordinates_head_supported(s) || !out || token < 0 || token >= (int)DS4_N_VOCAB) return 0;
 
     float max_logit = DS4_NEG_INF;
     for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
@@ -78021,13 +78544,14 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
 }
 
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
-    if (!s || !out || cap < (int)DS4_N_VOCAB) return 0;
+    if (!ds41_coordinates_head_supported(s) || !out || cap < (int)DS4_N_VOCAB) return 0;
     memcpy(out, s->logits, (size_t)DS4_N_VOCAB * sizeof(out[0]));
     return (int)DS4_N_VOCAB;
 }
 
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
-    if (!s || !logits || n != (int)DS4_N_VOCAB) return 1;
+    if (!s || s->scr_policy_active || s->scr_multi_active || s->scr_dense_owner ||
+        s->scr_coordinates.identity || !logits || n != (int)DS4_N_VOCAB) return 1;
     memcpy(s->logits, logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
     return 0;
 }
@@ -78898,6 +79422,10 @@ static void ds4_session_prepare_support_draft(ds4_session *s,
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (!s) return 1;
+    if (!ds41_coordinates_eval_supported(s)) {
+        if (errlen) snprintf(err, errlen, "physical coordinates require the owning Flash41 Metal route");
+        return 1;
+    }
 #ifndef DS4_NO_GPU
     s->dspark_rewind_end = 0;
 #endif
@@ -78944,21 +79472,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     ds4_engine *e = s->engine;
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (ds4_session_is_ds41(s)) {
-        ds41_dspark *d = s->ds41_graph.dspark;
-        const bool rewindable = d && d->rewind_end == s->ds41_graph.pos &&
-            d->rewind_end && d->rewind_end < d->verify_start + d->verify_count;
-        if (!s->ds41_graph_ready ||
-            (!s->checkpoint_valid && s->checkpoint.len != 0) ||
-            s->ds41_graph.pos != (uint32_t)s->checkpoint.len ||
-            !ds41_graph_step(&s->ds41_graph, &e->model, &e->weights, token, s->logits)) {
-            s->checkpoint_valid = false;
-            if (errlen) snprintf(err, errlen, "V4.1 decode failed at position %d", s->checkpoint.len);
-            return 1;
-        }
-        token_vec_push(&s->checkpoint, token);
-        s->checkpoint_valid = true;
-        if (rewindable) d->rewind_end = s->ds41_graph.pos;
-        return 0;
+        return ds41_session_eval_scalar(s, token, err, errlen);
     }
 #endif
 #ifdef DS4_HAS_QWEN4_GPU
@@ -79107,6 +79621,10 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (!s || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "decode requires a synchronized checkpoint");
+        return 1;
+    }
+    if (!ds41_coordinates_eval_supported(s)) {
+        payload_set_err(err, errlen, "physical coordinates require the owning Flash41 Metal route");
         return 1;
     }
     if (ds4_session_tp_leader(s)) {
@@ -79802,7 +80320,10 @@ static bool ds41_sessions_batch_supported(ds4_decode_item *items, int count,
     ds41_gpu_graph *graphs[DS4_TP_BATCH_MAX_ROWS];
     for (int i = 0; i < count; i++) {
         ds4_session *s = items[i].session;
+        /* Padded sessions use the checked scalar generation owner until batch
+         * publication carries the same map tickets for every participating row. */
         if (!s || s->engine != e || !s->ds41_graph_ready || !s->checkpoint_valid || s->distributed ||
+            s->scr_coordinates.identity ||
             (cuda ? !ds41_cuda_row_batch_supported(&s->ds41_graph, &e->weights) : s->ds41_graph.streaming) ||
             s->ds41_graph.imatrix || s->ds41_graph.quality ||
             !s->ds41_graph.valid || s->ds41_graph.image_count ||
@@ -81525,6 +82046,11 @@ static bool qwen4_batch_spec_next(const ds4_engine *e) {
 int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count,
                                                int (*accepted)[2], int *n_accepted,
                                                char *err, size_t errlen) {
+    if (items && count > 0 && accepted && n_accepted) for (int i = 0; i < count; ++i) {
+        if (ds41_coordinates_restricted(items[i].session)) {
+            payload_set_err(err, errlen, "physical coordinates do not support speculative batches"); return 1;
+        }
+    }
     if (!items || count <= 0 || !accepted || !n_accepted) {
         if (err && errlen) snprintf(err, errlen, "empty speculative decode batch");
         return 1;
@@ -81712,6 +82238,11 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
 
 int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
                             char *err, size_t errlen) {
+    if (items && count > 1) for (int i = 0; i < count; ++i) {
+        if (ds41_session_batch_restricted(items[i].session)) {
+            payload_set_err(err, errlen, "SCR coordinates/capture ownership require separate scalar decode"); return 1;
+        }
+    }
     if (!items || count <= 0) {
         if (err && errlen) snprintf(err, errlen, "empty decode batch");
         return 1;
@@ -81791,6 +82322,14 @@ int ds4_sessions_eval_batch_with_prefill(
         const ds4_tokens *prefill_prompt,
         char *err,
         size_t errlen) {
+    if (ds41_session_batch_restricted(prefill_session)) {
+        payload_set_err(err, errlen, "SCR coordinates/capture ownership do not support mixed prefill"); return 1;
+    }
+    if (items && count > 0) for (int i = 0; i < count; ++i) {
+        if (ds41_session_batch_restricted(items[i].session)) {
+            payload_set_err(err, errlen, "SCR coordinates/capture ownership do not support mixed decode"); return 1;
+        }
+    }
     if (!items || count <= 0 || !prefill_session || !prefill_prompt ||
         !prefill_session->engine) {
         if (err && errlen) snprintf(err, errlen, "invalid mixed model batch");
@@ -82993,6 +83532,9 @@ static int ds41_session_tp_verify(ds4_session *s, const int *tokens, uint32_t co
  * through the gated single-token decode in lockstep with the leader. */
 int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
                               uint32_t flags, char *err, size_t errlen) {
+    if (ds41_coordinates_restricted(s)) {
+        payload_set_err(err, errlen, "physical coordinates do not support TP speculation"); return 1;
+    }
 #ifdef DS4_NO_GPU
     (void)s; (void)drafts; (void)draft_n; (void)flags;
     snprintf(err, errlen, "GPU support is not compiled in");
@@ -86201,6 +86743,9 @@ static int ds4_session_eval_speculative_argmax_impl(
         bool ignore_eos, ds4_think_mode think_mode,
         int *accepted, int accepted_cap,
         char *err, size_t errlen) {
+    if (ds41_coordinates_restricted(s)) {
+        payload_set_err(err, errlen, "physical coordinates require ordinary scalar decode"); return -1;
+    }
     if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
     if (!s->checkpoint_valid) {
         payload_set_err(err, errlen, "speculative decode requires a synchronized checkpoint");
@@ -87076,6 +87621,9 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                                  float top_p, float min_p, uint64_t *rng,
                                  int *accepted, int accepted_cap,
                                  char *err, size_t errlen) {
+    if (ds41_coordinates_restricted(s)) {
+        payload_set_err(err, errlen, "physical coordinates require ordinary scalar decode"); return -1;
+    }
     if (temperature <= 0.0f) {
         return ds4_session_eval_speculative_argmax(
             s, first_token, max_tokens, eos_token,
@@ -87228,6 +87776,7 @@ void ds4_session_invalidate(ds4_session *s) {
     }
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
+    ds41_session_coordinates_clear(s);
     s->mtp_draft_valid = false;
     free(s->checkpoint_images);
     s->checkpoint_images = NULL;
@@ -87244,6 +87793,7 @@ void ds4_session_invalidate(ds4_session *s) {
 /* Internal state-only restore. The coordinator must replay from this prefix
  * before sampling; the TP worker acknowledges it before any gated eval. */
 int ds4_session_restore_speculative_prefix(ds4_session *s, int pos) {
+    if (ds41_coordinates_restricted(s)) return 1;
 #ifdef DS4_NO_GPU
     (void)s; (void)pos;
     return 1;
@@ -87347,6 +87897,7 @@ static bool dspark_rewind_recent(ds4_session *s, int pos) {
 #endif
 
 bool ds4_session_rewind_speculative(ds4_session *s, int pos) {
+    if (ds41_coordinates_restricted(s)) return false;
 #ifdef DS4_NO_GPU
     (void)s; (void)pos;
     return false;
@@ -87380,7 +87931,7 @@ bool ds4_session_rewind_speculative(ds4_session *s, int pos) {
 #endif
 }
 
-void ds4_session_rewind(ds4_session *s, int pos) {
+static void ds4_session_rewind_impl(ds4_session *s, int pos) {
     if (!s) return;
     if (pos < 0) pos = 0;
     if (pos >= s->checkpoint.len) return;
@@ -87439,6 +87990,40 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     s->glm_mtp_rollback_valid = false;
     ds4_session_glm_cap_dense_cache(s);
 #endif
+}
+
+int ds4_session_rewind_physical(ds4_session *s, int pos, char *err, size_t errlen) {
+    if (!s || s->checkpoint.len < 0) {
+        if (err && errlen) snprintf(err, errlen, "invalid session transcript for physical rewind");
+        return 1;
+    }
+    if (pos < 0) pos = 0;
+    if (pos >= s->checkpoint.len) return 0;
+    ds41_scr_coordinates *m = &s->scr_coordinates;
+    const bool mapped = m->identity || m->pads || m->count || m->capacity || m->physical_tokens;
+    const uint64_t serial = m->identity > s->scr_coordinate_serial ? m->identity : s->scr_coordinate_serial;
+    if (mapped && (serial == UINT64_MAX || s->checkpoint.len < 0 ||
+        !ds41_coordinates_match(m, s->checkpoint.v, (uint32_t)s->checkpoint.len, DS4_N_VOCAB))) {
+        if (err && errlen) snprintf(err, errlen, "physical rewind coordinate binding refused");
+        return 1;
+    }
+    /* Admission above is read-only. Truncation below allocates nothing and
+     * retains provenance even though Flash41 invalidates its model frontier. */
+    ds4_session_rewind_impl(s, pos);
+    if (mapped && !ds41_coordinates_truncate(m, (uint32_t)pos, serial + 1)) {
+        s->checkpoint_valid = false;
+        if (err && errlen) snprintf(err, errlen, "physical rewind coordinate transition failed");
+        return 1;
+    }
+    if (mapped) s->scr_coordinate_serial = m->identity;
+    return 0;
+}
+
+void ds4_session_rewind(ds4_session *s, int pos) {
+    if (!s) return;
+    char err[128];
+    if (ds4_session_rewind_physical(s, pos, err, sizeof(err)))
+        fprintf(stderr, "ds4: rewind refused: %s\n", err);
 }
 
 int ds4_session_pos(ds4_session *s) {
