@@ -749,7 +749,10 @@ static int server_scr_apply_startup(const server_config *c, ds4_session *session
 static bool server_scr_config_valid(const server_config *c, bool incompatible) {
     /* Tuning flags without SCR are a launch mistake, not a silent no-op. */
     if (!c->scr_enabled) return !c->scr_max_ranges_present;
-    if (c->engine.glm_mtp || c->engine.dspark || c->engine.mtp_path || c->batched_sessions) return false;
+    /* DSpark speculation is the one support model SCR coexists with, and
+     * only as the --dspark/--mtp-model pair; legacy MTP stays refused. */
+    if (c->engine.glm_mtp || c->engine.dspark != (c->engine.mtp_path != NULL) ||
+        c->batched_sessions) return false;
     return c->scr_max_ranges >= 1 && c->scr_max_ranges <= (int)DS4_SCR_MULTI_MAX_RANGES && !incompatible && c->engine.backend == DS4_BACKEND_METAL &&
         !c->engine.cuda_tensor_parallel && c->engine.tp.role == DS4_TP_NONE &&
         c->engine.distributed.role == DS4_DISTRIBUTED_NONE &&

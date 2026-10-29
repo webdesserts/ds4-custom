@@ -48,6 +48,10 @@ sh tools/verify-pins.sh             # verifies Cargo.toml, Cargo.lock, and vendo
 - **`--scr` Production Stack:**
   - Passing `--scr` (or a nonzero `--scr-tail-tokens C`) enables the full SCR stack: logical coordinates, batched capture, planner fresh-gap space padding, archive capacity defaulting to `--ctx`, `--scr-max-ranges` defaulting to `32`, and `--scr-planner-budget-ms` defaulting to `5000` (`0..60000`).
   - Optional tuning flags: `--scr-tail-tokens C` (`128..1048576`, 8-token aligned, `<= ctx`), `--scr-max-ranges K` (`1..32`), `--scr-planner-budget-ms MS` (`0..60000`), `--kv-disk-dir DIR`, and `--kv-disk-space-mb MB`.
+- **DSpark Speculative Decoding (`--scr --dspark --mtp-model FILE`):**
+  - V4.1 DSpark is the one support model `--scr` accepts, and only as the `--dspark`/`--mtp-model` pair; legacy MTP, `--mtp`/`--mtp-timing` and `--batched-session` stay refused. The engine also refuses unless the support GGUF is V4.1 DSpark.
+  - Verifier rows never capture into an archive. Verification refuses while an archive is capturing or retiring; a sealed archive stays published for reuse, but its decode writer is disarmed, so a speculated tail is not appended to that archive.
+  - Commits append the accepted IDs to the physical coordinate map, and speculative rewinds truncate it with the model frontier.
 - **Per-Request `"reuse"` Mode (`"scr" | "exact"`):**
   - `/v1/chat/completions` accepts an optional `"reuse": "scr" | "exact"` field.
   - Under `--scr`, `"scr"` is the default and runs the multi-range planner and checkpoint pool.

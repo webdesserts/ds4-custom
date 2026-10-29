@@ -136,6 +136,18 @@ int main(void) {
             (char *)kv_tuning[i], "4096"};
         assert(cli_exit(ARGC(args), args) == 2);
     }
+    /* DSpark coexists with SCR only as the --dspark/--mtp-model pair. */
+    char *dspark[] = {"server", "--metal", "--scr", "--dspark", "--mtp-model", "/inert/not-opened.gguf"};
+    server_config dc = resolved(ARGC(dspark), dspark);
+    assert(dc.scr_enabled && dc.engine.dspark && dc.engine.mtp_path &&
+        server_scr_config_valid(&dc, false) && cli_exit(ARGC(dspark), dspark) == 0);
+    char *dspark_alone[] = {"server", "--metal", "--scr", "--dspark"};
+    char *mtp_alone[] = {"server", "--metal", "--scr", "--mtp-model", "/inert/not-opened.gguf"};
+    char *batched[] = {"server", "--metal", "--scr", "--batched-session", "2"};
+    char *glm_mtp[] = {"server", "--metal", "--scr", "--mtp-timing"};
+    assert(cli_exit(ARGC(dspark_alone), dspark_alone) == 2 &&
+        cli_exit(ARGC(mtp_alone), mtp_alone) == 2 && cli_exit(ARGC(batched), batched) == 2 &&
+        cli_exit(ARGC(glm_mtp), glm_mtp) == 2);
     /* Incompatible engine modes. */
     for (unsigned mode = 0; mode < 4; mode++) {
         server_config d = c;
@@ -147,6 +159,6 @@ int main(void) {
     }
     assert(DS4_DEFAULT_TEMPERATURE == 1.0f && DS4_DEFAULT_TOP_P == 1.0f &&
         DS4_DEFAULT_MIN_P == 0.05f);
-    puts("scr cli: --scr production stack, tuning flags, retired selectors accepted, deployed argv, K bounds, checkpoint pool options; stub sessions, no model");
+    puts("scr cli: --scr production stack, tuning flags, retired selectors accepted, deployed argv, K bounds, checkpoint pool options, DSpark pair; stub sessions, no model");
     return 0;
 }

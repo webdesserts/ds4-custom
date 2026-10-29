@@ -351,12 +351,19 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_markov(ds41_dspark *d, const ds4_model 
  * cache proportional to the context is copied. */
 static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *g,
         const ds4_model *m, const ds4_weights *w, const int *tokens, uint32_t count) {
-    /* Refuse before verifier snapshots shallow-copy target graph pointers.
-     * Rejected proposals have no SCR archive/capture publication protocol. */
-    if (!g || g->archive || g->archive_pending || g->archive_capture_pending)
+    /* Verifier rows never capture: rejected proposals have no SCR publication
+     * protocol. An archive being captured or retired refuses verification; a
+     * sealed one stays published for reuse, but its decode writer is disarmed
+     * because accepted rows reach the target graph without capture. */
+    if (!g || g->archive_pending || g->archive_capture_pending ||
+        (g->archive && (!g->archive->sealed || g->archive->retiring)))
         return false;
     if (!d || !g->valid || count < 2 || count > DS41_VERIFY_ROWS ||
         g->pos > g->ctx || count > g->ctx - g->pos || !ds41_tp_batch_enabled(g)) return false;
+    if (g->archive && g->archive->writer_state == DS41_ARCHIVE_ARMED) {
+        g->archive->writer_state = DS41_ARCHIVE_INCOMPATIBLE;
+        g->archive->range.valid = false;
+    }
     /* Prepost the complete small-row exchange window, as in V4.0 verification.
      * Bulk-prefill handshakes at every attention/FFN gate are too expensive. */
     const bool tp_block = g->tp_world == 2;
@@ -388,6 +395,8 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *
         memcpy(pool_k, row->verify_previous_kv, sizeof(pool_k));
         memcpy(pool_s, row->verify_previous_score, sizeof(pool_s));
         *row = *g;
+        row->archive = row->archive_pending = NULL;
+        row->archive_capture_pending = false;
         row->residual = res ? res : ds4_gpu_tensor_view(d->verify_residual, i * DS4_N_HC * feature, DS4_N_HC * feature);
         row->pre = pre ? pre : ds4_gpu_tensor_view(d->verify_pre, i * DS4_N_HC * 4u, DS4_N_HC * 4u);
         row->logits = logits ? logits : ds4_gpu_tensor_view(d->verify_logits,

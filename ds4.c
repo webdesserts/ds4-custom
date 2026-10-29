@@ -83487,10 +83487,38 @@ static bool ds41_session_verify(ds4_session *s, const int *tokens, uint32_t coun
         (uint64_t)count * DS4_N_VOCAB * sizeof(float));
 }
 
+/* A mapped transcript gains a verified block's accepted IDs as ordinary
+ * tokens, as scalar generation does one at a time. Bind the published map and
+ * reserve the checkpoint growth before any verifier state is committed. */
+static bool ds41_session_coordinates_block_ready(ds4_session *s, uint32_t keep) {
+    const ds41_scr_coordinates *m = &s->scr_coordinates;
+    if (!m->identity) return !ds41_coordinates_restricted(s);
+    if (s->scr_policy_active || s->scr_multi_active || s->scr_dense_owner ||
+        s->checkpoint.len < 0 || s->checkpoint.cap < s->checkpoint.len ||
+        s->scr_coordinate_serial == UINT64_MAX || m->identity > s->scr_coordinate_serial ||
+        keep > (uint32_t)s->ctx_size - (uint32_t)s->checkpoint.len ||
+        !ds41_coordinates_match(m, s->checkpoint.v, (uint32_t)s->checkpoint.len, DS4_N_VOCAB))
+        return false;
+    const uint32_t need = (uint32_t)s->checkpoint.len + keep;
+    if (need <= (uint32_t)s->checkpoint.cap) return true;
+    uint32_t capacity = s->checkpoint.cap ? (uint32_t)s->checkpoint.cap * 2u : 64u;
+    if (capacity < need) capacity = need;
+    if (capacity > (uint32_t)s->ctx_size) capacity = (uint32_t)s->ctx_size;
+    const uint64_t bytes = (uint64_t)capacity * sizeof(int);
+    if (bytes > UINT64_MAX - s->engine->ds41_session_bytes ||
+        !ds41_memory_admit(s->engine, s->engine->ds41_session_bytes + bytes, false)) return false;
+    int *grown = realloc(s->checkpoint.v, (size_t)bytes);
+    if (!grown) return false;
+    s->checkpoint.v = grown; s->checkpoint.cap = (int)capacity;
+    return true;
+}
+
 static bool ds41_session_commit(ds4_session *s, const int *tokens,
                                 uint32_t count, uint32_t keep) {
     ds4_engine *e = s->engine;
-    if (keep > count || (ds4_session_tp_leader(s) &&
+    const bool mapped = s->scr_coordinates.identity != 0;
+    if (keep > count || !ds41_session_coordinates_block_ready(s, keep)) return false;
+    if ((ds4_session_tp_leader(s) &&
         !ds4_tp_send_verify_commit(e->tp.ctx,
             keep == count ? DS4_TP_VERIFY_COMMIT_FULL : DS4_TP_VERIFY_COMMIT_PREFIX,
             (int32_t)keep))) return false;
@@ -83500,6 +83528,11 @@ static bool ds41_session_commit(ds4_session *s, const int *tokens,
     if (ds4_session_tp_leader(s) && !ds4_tp_wait_command_ack(e->tp.ctx,
         s->tp_session_id, "V4.1 verify commit", err, sizeof(err))) return false;
     for (uint32_t i = 0; i < keep; i++) token_vec_push(&s->checkpoint, tokens[i]);
+    if (mapped && !ds41_coordinates_append(&s->scr_coordinates, keep, (uint32_t)s->ctx_size,
+                                           ++s->scr_coordinate_serial)) {
+        s->checkpoint_valid = s->ds41_graph.valid = false;
+        return false;
+    }
     return true;
 }
 
@@ -86628,7 +86661,7 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
     if (stats) { s->dspark_stats.cycles++; s->dspark_stats.first_tokens++; }
     bool ready = d && !e->quality && !e->dspark_strict && cap > 1 &&
         first_token != eos && g->pos && g->pos <= 1048576u - DS41_DRAFT_ROWS &&
-        ds41_tp_batch_enabled(g);
+        ds41_tp_batch_enabled(g) && ds41_session_coordinates_block_ready(s, (uint32_t)cap);
     /* Old session files contain target caches, not draft features. Warm the
      * window with ordinary decoding instead of inventing missing features. */
     if (ready) for (uint32_t pos = g->pos > 128u ? g->pos - 128u : 0; pos < g->pos; pos++)
@@ -86738,12 +86771,19 @@ fail:
 }
 #endif
 
+/* Mapped or SCR-owned transcripts speculate only where scalar decode runs:
+ * V4.1 DSpark commits and rewinds carry the physical map. */
+static bool ds41_speculation_coordinates_allowed(const ds4_session *s) {
+    return !ds41_coordinates_restricted(s) ||
+        (ds4_session_is_ds41(s) && ds41_coordinates_eval_supported(s));
+}
+
 static int ds4_session_eval_speculative_argmax_impl(
         ds4_session *s, int first_token, int max_tokens, int eos_token,
         bool ignore_eos, ds4_think_mode think_mode,
         int *accepted, int accepted_cap,
         char *err, size_t errlen) {
-    if (ds41_coordinates_restricted(s)) {
+    if (!ds41_speculation_coordinates_allowed(s)) {
         payload_set_err(err, errlen, "physical coordinates require ordinary scalar decode"); return -1;
     }
     if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
@@ -87621,7 +87661,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                                  float top_p, float min_p, uint64_t *rng,
                                  int *accepted, int accepted_cap,
                                  char *err, size_t errlen) {
-    if (ds41_coordinates_restricted(s)) {
+    if (!ds41_speculation_coordinates_allowed(s)) {
         payload_set_err(err, errlen, "physical coordinates require ordinary scalar decode"); return -1;
     }
     if (temperature <= 0.0f) {
@@ -87793,7 +87833,7 @@ void ds4_session_invalidate(ds4_session *s) {
 /* Internal state-only restore. The coordinator must replay from this prefix
  * before sampling; the TP worker acknowledges it before any gated eval. */
 int ds4_session_restore_speculative_prefix(ds4_session *s, int pos) {
-    if (ds41_coordinates_restricted(s)) return 1;
+    if (!ds41_speculation_coordinates_allowed(s)) return 1;
 #ifdef DS4_NO_GPU
     (void)s; (void)pos;
     return 1;
@@ -87805,11 +87845,25 @@ int ds4_session_restore_speculative_prefix(ds4_session *s, int pos) {
         if (!s->checkpoint_valid || !g->valid || !d || pos < 0 ||
             d->rewind_end != (uint32_t)s->checkpoint.len ||
             (uint32_t)pos < d->verify_start || (uint32_t)pos >= d->rewind_end) return 1;
+        /* A mapped transcript is truncated with its frontier; bind it first. */
+        ds41_scr_coordinates *m = &s->scr_coordinates;
+        const uint64_t serial = m->identity > s->scr_coordinate_serial ?
+            m->identity : s->scr_coordinate_serial;
+        if (m->identity && (serial == UINT64_MAX ||
+            !ds41_coordinates_match(m, s->checkpoint.v, (uint32_t)s->checkpoint.len, DS4_N_VOCAB)))
+            return 1;
         if (!ds41_dspark_commit(d, g, (uint32_t)pos - d->verify_start, s->logits)) {
             s->checkpoint_valid = false;
             return -1;
         }
         s->checkpoint.len = pos;
+        if (m->identity) {
+            if (!ds41_coordinates_truncate(m, (uint32_t)pos, serial + 1)) {
+                s->checkpoint_valid = g->valid = false;
+                return -1;
+            }
+            s->scr_coordinate_serial = m->identity;
+        }
         return 0;
     }
 #endif
@@ -87897,7 +87951,7 @@ static bool dspark_rewind_recent(ds4_session *s, int pos) {
 #endif
 
 bool ds4_session_rewind_speculative(ds4_session *s, int pos) {
-    if (ds41_coordinates_restricted(s)) return false;
+    if (!ds41_speculation_coordinates_allowed(s)) return false;
 #ifdef DS4_NO_GPU
     (void)s; (void)pos;
     return false;
@@ -88010,7 +88064,10 @@ int ds4_session_rewind_physical(ds4_session *s, int pos, char *err, size_t errle
     /* Admission above is read-only. Truncation below allocates nothing and
      * retains provenance even though Flash41 invalidates its model frontier. */
     ds4_session_rewind_impl(s, pos);
-    if (mapped && !ds41_coordinates_truncate(m, (uint32_t)pos, serial + 1)) {
+    /* A V4.1 speculative restore already truncated the map with its frontier. */
+    const bool truncated = mapped && m->identity > serial && m->physical_tokens == (uint32_t)pos &&
+        s->checkpoint.len == pos;
+    if (mapped && !truncated && !ds41_coordinates_truncate(m, (uint32_t)pos, serial + 1)) {
         s->checkpoint_valid = false;
         if (err && errlen) snprintf(err, errlen, "physical rewind coordinate transition failed");
         return 1;

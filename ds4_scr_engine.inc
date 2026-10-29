@@ -5173,11 +5173,18 @@ int ds4_session_scr_pool_save(ds4_session *s, ds4_scr_pool *p, bool include_appe
 #if defined(DS4_SCR_ENGINE_GUARDS) && !defined(DS4_SCR_ENGINE_GUARDS_DONE)
 #define DS4_SCR_ENGINE_GUARDS_DONE
 /* Private session entry fences; sync intentionally has the narrower contract. */
-/* SCR has no speculative commit/rollback protocol. Refuse coexistence before
- * a capture owner or mapped transcript can be attached to the target graph. */
+/* V4.1 DSpark is the one speculative decoder SCR coexists with: its verifier
+ * rows never alias the archive, its commit appends the accepted IDs to the
+ * physical map and its rewind truncates the map. Other support models have
+ * no such protocol and are refused before a capture owner or mapped
+ * transcript can be attached to the target graph. */
+static bool ds41_scr_dspark_compatible(const ds4_session *s) {
+    return s && s->engine && ds4_session_is_ds41(s) &&
+        s->engine->support_kind == DS4_SUPPORT_DSPARK && s->engine->dspark_weights.v41;
+}
 static bool ds41_scr_engine_compatible(const ds4_session *s) {
-    return s && s->engine && !s->engine->dspark && !s->engine->mtp_ready &&
-        !s->engine->glm_mtp;
+    return s && s->engine && (!s->engine->dspark || ds41_scr_dspark_compatible(s)) &&
+        !s->engine->mtp_ready && !s->engine->glm_mtp;
 }
 
 static bool ds41_coordinates_restricted(const ds4_session *s) {
@@ -5199,10 +5206,13 @@ static bool ds41_session_batch_restricted(const ds4_session *s) {
 #endif
 }
 
+/* Decode on a published transcript: no SCR prefill owns the session, and an
+ * unmapped transcript carries no coordinate state at all. */
 static bool ds41_coordinates_eval_supported(const ds4_session *s) {
-    return s && (!s->scr_coordinates.identity ||
-        (s->engine && !s->distributed && !s->engine->tp.active &&
-         s->engine->backend == DS4_BACKEND_METAL && ds4_session_is_ds41(s)));
+    if (!s || s->scr_policy_active || s->scr_multi_active || s->scr_dense_owner) return false;
+    if (!s->scr_coordinates.identity) return !ds41_coordinates_restricted(s);
+    return s->engine && !s->distributed && !s->engine->tp.active &&
+        s->engine->backend == DS4_BACKEND_METAL && ds4_session_is_ds41(s);
 }
 
 static int ds41_session_sync_entry_guard(ds4_session *s, char *err, size_t errlen) {

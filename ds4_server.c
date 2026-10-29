@@ -14108,7 +14108,7 @@ decode_again:
         int toks[17];
         int ntok = 0;
         const int block_start = ds4_session_pos(slot->session);
-        if (!s->batched_mode && !server_scr_enabled(s) &&
+        if (!s->batched_mode &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
@@ -16048,7 +16048,7 @@ static server_config parse_options(int argc, char **argv) {
     }
     server_scr_resolve_config(&c);
     if (!server_scr_config_valid(&c, scr_incompatible)) {
-        server_log(DS4_LOG_DEFAULT, "ds4-server: SCR requires eight-aligned archive capacity 128..%u <= context, K1..%u, Metal, loopback, and no MTP/DSpark/batch/KV-cache tuning/vision/GPU/TP/distributed overrides", DS4_SCR_ARCHIVE_MAX_CAPACITY, DS4_SCR_MULTI_MAX_RANGES);
+        server_log(DS4_LOG_DEFAULT, "ds4-server: SCR requires eight-aligned archive capacity 128..%u <= context, K1..%u, Metal, loopback, DSpark only as --dspark with --mtp-model, and no MTP/batch/KV-cache tuning/vision/GPU/TP/distributed overrides", DS4_SCR_ARCHIVE_MAX_CAPACITY, DS4_SCR_MULTI_MAX_RANGES);
         exit(2);
     }
     char tp_err[256];
