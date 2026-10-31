@@ -693,6 +693,60 @@ static int check_draft_low_rows(void) {
 }
 #endif
 
+#ifdef __APPLE__
+/* F32 decode-row matvecs (routers) against per-row matvecs: random weights
+ * and inputs, shapes covering the one-row-per-SIMD-group router (384
+ * outputs), a K tail (5124), a narrow grid that keeps one row per
+ * threadgroup (24 outputs) and a two-row tile (2048), every row count,
+ * auto and off plans. Rows past the count stay NaN. */
+static int check_f32_rows(void) {
+    enum { ROWS = 6 };
+    const struct { uint32_t in, out; } shapes[] = {{5120, 384}, {5124, 384}, {4096, 24}, {4096, 2048}};
+    const char *modes[] = {"auto", "off"};
+    for (size_t sh = 0; sh < sizeof(shapes) / sizeof(*shapes); sh++) {
+        const uint32_t in = shapes[sh].in, out_dim = shapes[sh].out;
+        const uint64_t wb = (uint64_t)in * out_dim * 4, xb = (uint64_t)ROWS * in * 4, ob = (uint64_t)ROWS * out_dim * 4;
+        void *model = NULL;
+        CHECK(posix_memalign(&model, getpagesize(), wb) == 0);
+        float *w = model;
+        for (uint64_t i = 0; i < wb / 4; i++) w[i] = random_value();
+        float *x = malloc(xb), *reference = malloc(ob), *got = malloc(ob);
+        CHECK(x && reference && got);
+        for (uint64_t i = 0; i < xb / 4; i++) x[i] = random_value();
+        ds4_gpu_tensor *xt = upload(x, xb), *ot = upload(NULL, ob);
+        CHECK(xt && ot && ds4_gpu_set_model_map(model, wb));
+        CHECK(ds4_gpu_begin_commands());
+        for (uint32_t r = 0; r < ROWS; r++) {
+            ds4_gpu_tensor *xr = ds4_gpu_tensor_view(xt, (uint64_t)r * in * 4, (uint64_t)in * 4);
+            ds4_gpu_tensor *orow = ds4_gpu_tensor_view(ot, (uint64_t)r * out_dim * 4, (uint64_t)out_dim * 4);
+            CHECK(xr && orow && ds4_gpu_matmul_f32_tensor(orow, model, wb, 0, in, out_dim, xr, 1));
+            ds4_gpu_tensor_free(xr); ds4_gpu_tensor_free(orow);
+        }
+        CHECK(ds4_gpu_end_commands());
+        CHECK(ds4_gpu_tensor_read(ot, 0, reference, ob));
+        for (int mode = 0; mode < 2; mode++) {
+            setenv("DS4_METAL_DECODE_ROWS_MODE", modes[mode], 1);
+            for (uint32_t rows = 1; rows <= ROWS; rows++) {
+                CHECK(ds4_gpu_tensor_fill_f32(ot, NAN, ob / 4));
+                CHECK(ds4_gpu_begin_commands());
+                CHECK(ds4_gpu_dsv41_projection_rows_f32(ot, model, wb, 0, in, out_dim, rows, xt));
+                CHECK(ds4_gpu_end_commands());
+                CHECK(ds4_gpu_tensor_read(ot, 0, got, ob));
+                if (memcmp(got, reference, (uint64_t)rows * out_dim * 4))
+                    fprintf(stderr, "f32 rows mismatch %ux%u mode=%s rows=%u\n", in, out_dim, modes[mode], rows);
+                CHECK(!memcmp(got, reference, (uint64_t)rows * out_dim * 4));
+                for (uint64_t i = (uint64_t)rows * out_dim; i < ob / 4; i++) CHECK(isnan(got[i]));
+            }
+            fprintf(stderr, "V4.1 F32 decode rows %ux%u mode=%s rows 1..%u: PASS\n", in, out_dim, modes[mode], ROWS);
+        }
+        unsetenv("DS4_METAL_DECODE_ROWS_MODE");
+        ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(ot);
+        free(x); free(reference); free(got); free(model);
+    }
+    return 1;
+}
+#endif
+
 static int check_attention_output(bool large) {
     enum { GROUP = 4096, RANK = 1024, GROUPS = 8, OUT = 5120 };
     const uint32_t ROWS = large ? 8192u : 513u;
@@ -1786,6 +1840,11 @@ int main(int argc, char **argv) {
         return ok ? 0 : 1;
     }
 #ifdef __APPLE__
+    if (argc == 2 && !strcmp(argv[1], "--f32-rows")) {
+        const int ok = ds4_gpu_init() && check_f32_rows();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--draft-low-rows")) {
         const int ok = ds4_gpu_init() && check_draft_low_rows();
         ds4_gpu_cleanup();

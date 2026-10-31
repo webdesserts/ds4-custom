@@ -41288,6 +41288,18 @@ static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
            (!round || ds41_bf16(out, (uint32_t)weight->dim[1]));
 }
 
+/* F32 batches (routers, draft mixers) run the exact decode-row plan, one
+ * weight pass for all rows; DS4_METAL_V41_F32_ROWS=0 restores a matvec per
+ * row. */
+static bool ds41_f32_rows_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *v = getenv("DS4_METAL_V41_F32_ROWS");
+        enabled = !(v && !strcmp(v, "0"));
+    }
+    return enabled;
+}
+
 static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
                               const ds4_tensor *weight, const ds4_gpu_tensor *in,
                               uint32_t count, bool round) {
@@ -41304,6 +41316,10 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
             weight->abs_offset, width, outputs, in, count);
     } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F16) {
         ok = ds4_gpu_dsv41_projection_rows(out, m->map, m->size,
+            weight->abs_offset, width, outputs, count, in);
+    } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F32 &&
+               ds41_f32_rows_enabled()) {
+        ok = ds4_gpu_dsv41_projection_rows_f32(out, m->map, m->size,
             weight->abs_offset, width, outputs, count, in);
     } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F32) {
         ok = true;

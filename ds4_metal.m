@@ -21316,6 +21316,34 @@ int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out,
         weight_offset, in_dim, out_dim, x, n_tok, false, 0, 0);
 }
 
+static int ds4_gpu_matmul_f32_tensor_impl(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok, bool exact_rows);
+
+int ds4_gpu_matmul_f32_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok) {
+    return ds4_gpu_matmul_f32_tensor_impl(out, model_map, model_size,
+        weight_offset, in_dim, out_dim, x, n_tok, false);
+}
+
+int ds4_gpu_dsv41_projection_rows_f32(ds4_gpu_tensor *out,
+                                 const void *model_map, uint64_t model_size,
+                                 uint64_t weight_offset, uint32_t width,
+                                 uint32_t outputs, uint32_t rows,
+                                 const ds4_gpu_tensor *in) {
+    if (!width || !outputs || !rows || rows > 8192u || !model_map) return 0;
+    return ds4_gpu_matmul_f32_tensor_impl(out, model_map, model_size,
+        weight_offset, width, outputs, in, rows, true);
+}
+
 int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out,
                                  const void *model_map, uint64_t model_size,
                                  uint64_t weight_offset, uint32_t width,
@@ -22016,7 +22044,7 @@ int ds4_gpu_qkv_pair_quad_compressor_store_tensor(
     return 1;
 }
 
-int ds4_gpu_matmul_f32_tensor(
+static int ds4_gpu_matmul_f32_tensor_impl(
         ds4_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
@@ -22024,7 +22052,8 @@ int ds4_gpu_matmul_f32_tensor(
         uint64_t                in_dim,
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
-        uint64_t                n_tok) {
+        uint64_t                n_tok,
+        bool                    exact_rows) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok == 0 || n_tok > UINT32_MAX) return 0;
     if (in_dim > UINT64_MAX / n_tok / sizeof(float) ||
@@ -22064,14 +22093,25 @@ int ds4_gpu_matmul_f32_tensor(
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
 
-        if (n_tok == 1) {
-            ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_f32_mv_args(in_dim, out_dim, 1);
+        if (n_tok == 1 || exact_rows) {
+            ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_f32_mv_args(in_dim, out_dim, n_tok);
             ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_plain_mv_dispatch(in_dim, 1);
             if (ds4_gpu_plain_mv_single_row(out_dim)) {
                 mv_dispatch.nr0 = 1;
                 mv_dispatch.smem = 32u * sizeof(float);
             }
             mv_args.nr0 = mv_dispatch.nr0;
+            /* Exact multi-row calls on the float4 kernel take the decode-row
+             * plan, as for F16; one row per grid row otherwise. */
+            const uint64_t out_groups =
+                (out_dim + (uint64_t)mv_dispatch.nr0 - 1u) / (uint64_t)mv_dispatch.nr0;
+            const bool plan_rows = exact_rows && n_tok > 1 &&
+                !strcmp(mv_dispatch.function_name, "kernel_mul_mv_f32_f32_4");
+            const ds4_gpu_decode_rows_plan plan = ds4_gpu_plan_decode_rows(
+                mv_dispatch.function_name, true, plan_rows ? (uint32_t)n_tok : 1u,
+                out_groups);
+            mv_dispatch.function_name = plan.name;
+            mv_dispatch.smem *= plan.nr1;
             id<MTLComputePipelineState> pipeline =
                 ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
             if (!pipeline) return 0;
@@ -22085,9 +22125,9 @@ int ds4_gpu_matmul_f32_tensor(
             if (mv_dispatch.smem) {
                 [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
             }
-            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
-                                                  1,
-                                                  1)
+            [enc dispatchThreadgroups:(plan_rows
+                    ? ds4_gpu_decode_rows_grid(&plan, out_groups, (uint32_t)n_tok)
+                    : MTLSizeMake((NSUInteger)out_groups, (NSUInteger)n_tok, 1))
                  threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
 

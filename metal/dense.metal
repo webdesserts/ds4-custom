@@ -1564,7 +1564,7 @@ template [[host_name("kernel_mul_mv_f16_f32_4")]] kernel mul_mv_t_t_4 kernel_mul
 // weight loads into a register tile changed the NR0 = 4 sums.  Row layout, padding
 // and the single-matrix (ne12 == 1) assumption match
 // kernel_mul_mv_q8_0_f32_rows_impl.
-template<short NR0, short NR1>
+template<short NR0, short NR1, typename T0 = half, typename T04 = half4>
 void kernel_mul_mv_f16_f32_4_rows_impl(
         constant ds4_metal_args_mul_mv & args,
         device const char * src0,
@@ -1586,13 +1586,13 @@ void kernel_mul_mv_f16_f32_4_rows_impl(
     const int r0 = tgpig.x*NR0;
     const int r1 = tgpig.y*NR1;
 
-    device const half  * ax [NR0];
-    device const half4 * ax4[NR0];
+    device const T0  * ax [NR0];
+    device const T04 * ax4[NR0];
     FOR_UNROLL (short row = 0; row < NR0; ++row) {
         const uint64_t offset0 = (r0 + row)*args.nb01;
 
-        ax [row] = (device const half  *) (src0 + offset0);
-        ax4[row] = (device const half4 *) (src0 + offset0);
+        ax [row] = (device const T0  *) (src0 + offset0);
+        ax4[row] = (device const T04 *) (src0 + offset0);
     }
 
     const short ix = tiisg/(NW/NF);
@@ -1619,7 +1619,7 @@ void kernel_mul_mv_f16_f32_4_rows_impl(
         }
 
         for (short row = 0; row < NR0; row++) {
-            device const half4 * xb4 = ax4[row] + (ib*NB + il*NF)/4;
+            device const T04 * xb4 = ax4[row] + (ib*NB + il*NF)/4;
 
             FOR_UNROLL (short row1 = 0; row1 < NR1; ++row1) {
                 float sumq = 0.f;
@@ -1638,7 +1638,7 @@ void kernel_mul_mv_f16_f32_4_rows_impl(
 
     for (int i = nb*NB + sgitg*NW + tiisg; i < args.ne00; i += NW*NSG) {
         for (short row = 0; row < NR0; row++) {
-            const half w = ax[row][i];
+            const T0 w = ax[row][i];
             FOR_UNROLL (short row1 = 0; row1 < NR1; ++row1) {
                 sumf[row1][row] += w * y[row1][i];
             }
@@ -1668,6 +1668,32 @@ kernel void NAME( \
         case 4: kernel_mul_mv_f16_f32_4_rows_impl<4, NR1>(args, src0, src1, dst, shmem, POS, tiisg, sgitg); break; \
     } \
 }
+
+// F32-weight counterpart of kernel_mul_mv_f32_f32_4 (routers), same rules.
+#define DS4_F32_4_ROWS_KERNEL(NR1, NAME) \
+[[host_name(#NAME)]] \
+kernel void NAME( \
+        constant ds4_metal_args_mul_mv & args, \
+        device const char * src0, \
+        device const char * src1, \
+        device       char * dst, \
+        threadgroup  char * shmem [[threadgroup(0)]], \
+        uint3  tgpig[[threadgroup_position_in_grid]], \
+        ushort tiisg[[thread_index_in_simdgroup]], \
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) { \
+    switch (args.nr0) { \
+        case 1: kernel_mul_mv_f16_f32_4_rows_impl<1, NR1, float, float4>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break; \
+        case 2: kernel_mul_mv_f16_f32_4_rows_impl<2, NR1, float, float4>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break; \
+        case 4: kernel_mul_mv_f16_f32_4_rows_impl<4, NR1, float, float4>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break; \
+    } \
+}
+
+DS4_F32_4_ROWS_KERNEL(2, kernel_mul_mv_f32_f32_4_rows2)
+DS4_F32_4_ROWS_KERNEL(3, kernel_mul_mv_f32_f32_4_rows3)
+DS4_F32_4_ROWS_KERNEL(4, kernel_mul_mv_f32_f32_4_rows4)
+DS4_F32_4_ROWS_KERNEL(5, kernel_mul_mv_f32_f32_4_rows5)
+DS4_F32_4_ROWS_KERNEL(6, kernel_mul_mv_f32_f32_4_rows6)
+DS4_F32_4_ROWS_KERNEL(8, kernel_mul_mv_f32_f32_4_rows8)
 
 DS4_F16_4_ROWS_KERNEL(2, kernel_mul_mv_f16_f32_4_rows2, tgpig)
 DS4_F16_4_ROWS_KERNEL(3, kernel_mul_mv_f16_f32_4_rows3, tgpig)
