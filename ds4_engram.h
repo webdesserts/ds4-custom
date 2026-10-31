@@ -90,4 +90,20 @@ bool ds4_engram_reader_start_observed(ds4_engram_reader *reader,
 bool ds4_engram_reader_wait(ds4_engram_reader *reader, unsigned table);
 void ds4_engram_reader_free(ds4_engram_reader *reader);
 
+/* Background reads for a small batch of tokens. Each (token, table) item is
+ * one ds4_engram_read_observed call, so output bytes and per-call observations
+ * match the synchronous loop. Tables and IDs are copied at start; out[i][t]
+ * must stay valid until finish. NULL (errno set) means read synchronously. */
+enum { DS4_ENGRAM_ASYNC_MAX_TOKENS = 8 };
+typedef struct ds4_engram_async ds4_engram_async;
+ds4_engram_async *ds4_engram_async_start(size_t tokens,
+    const ds4_engram_table *const tables[], const uint32_t ids[][2][DS4_ENGRAM_COLS],
+    float *const out[][2], const bool observe[]);
+/* Blocks until every token's read of `table` is done; false with errno set to
+ * the first failing token's error. */
+bool ds4_engram_async_wait(ds4_engram_async *reads, unsigned table);
+/* Joins all reads on every path, adds item observations into sums[i] for
+ * observed tokens, and frees. Returns whether every item succeeded. */
+bool ds4_engram_async_finish(ds4_engram_async *reads, ds4_engram_observation *const sums[]);
+
 #endif

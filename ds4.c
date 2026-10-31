@@ -43039,6 +43039,26 @@ static uint32_t ds41_short_prefill_count(const ds41_gpu_graph *g, const ds4_weig
     return remaining < DS4_TP_BATCH_MAX_ROWS ? remaining : DS4_TP_BATCH_MAX_ROWS;
 }
 
+/* DS4_V41_VERIFY_OVERLAP=0 restores serial Engram reads and the layer-13
+ * drain in batched steps; results are identical either way. Metal only:
+ * elsewhere ds4_gpu_flush_commands synchronizes the device. */
+static bool ds41_verify_overlap_enabled(void) {
+#ifdef __APPLE__
+    const char *v = getenv("DS4_V41_VERIFY_OVERLAP");
+    return !v || strcmp(v, "0") != 0;
+#else
+    return false;
+#endif
+}
+
+/* Layers per committed command buffer while overlapping (tuning knob).
+ * One layer measured 2-3 ms faster per verify than four or eight. */
+static uint32_t ds41_verify_flush_layers(void) {
+    const char *v = getenv("DS4_V41_VERIFY_FLUSH_LAYERS");
+    const long n = v ? strtol(v, NULL, 10) : 1;
+    return n < 1 ? 1u : n > 64 ? 64u : (uint32_t)n;
+}
+
 static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *tokens, int count,
                                    uint32_t prefill_rows,
                                    const ds4_model *model, const ds4_weights *weights) {
@@ -43078,40 +43098,76 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         ok = queries[i] && heads[i];
     }
     const float initial_pre[] = {1, 0, 0, 0};
+    /* Overlap keeps every byte, kernel and order: Engram reads move to
+     * background workers that each layer joins before its upload, table 1
+     * gets its own upload rows so layer 14 needs no drain, and finished layers
+     * are committed while later ones are encoded. */
+    const bool overlap = g->tp_world == 1 && ds41_verify_overlap_enabled();
+    const uint32_t width = DS4_ENGRAM_COLS * DS4_ENGRAM_DIM;
+    ds4_gpu_tensor *engram_rows1 = overlap && g->prefill_cap >= 2u * rows ?
+        ds4_gpu_tensor_view(g->batch.engram_rows, (uint64_t)rows * width * sizeof(float),
+                            (uint64_t)rows * width * sizeof(float)) : NULL;
+    ds41_prefill_row active1 = {0};
+    uint32_t ids[DS4_TP_BATCH_MAX_ROWS][2][DS4_ENGRAM_COLS];
+    float *disk_rows[DS4_TP_BATCH_MAX_ROWS][2];
+    ds4_engram_async *reads = NULL;
     ds41_stage("engram.io+embed");
     for (int i = 0; ok && i < count; i++) {
         ds41_gpu_graph *s = graphs[i];
-        uint32_t ids[2][DS4_ENGRAM_COLS];
         const bool continued = i > 0 && (uint32_t)i < prefill_rows;
         positions[i] = s->pos + (continued ? (uint32_t)i : 0u);
         history[i] = continued ? history[i - 1] : s->history;
-        ok = ds4_engram_hash(&s->engram, &history[i], &tokens[i], NULL, 1, &ids[0][0]);
-        float (*disk_rows)[DS4_ENGRAM_COLS * DS4_ENGRAM_DIM] =
-            engram && (uint32_t)i < prefill_rows ? engram[i] : s->rows;
-        for (unsigned table = 0; ok && table < 2; table++)
-            ok = ds41_engram_read_observe(&s->table[table], ids[table], DS4_ENGRAM_COLS,
-                                          disk_rows[table], &s->engram_io);
+        ok = ds4_engram_hash(&s->engram, &history[i], &tokens[i], NULL, 1, &ids[i][0][0]);
+        for (unsigned table = 0; table < 2; table++)
+            disk_rows[i][table] = engram && (uint32_t)i < prefill_rows ?
+                engram[i][table] : s->rows[table];
+    }
+    if (ok && overlap && (uint32_t)count <= DS4_ENGRAM_ASYNC_MAX_TOKENS) {
+        const ds4_engram_table *tables[DS4_TP_BATCH_MAX_ROWS];
+        bool observe[DS4_TP_BATCH_MAX_ROWS];
+        for (int i = 0; i < count; i++) {
+            tables[i] = graphs[i]->table;
+            observe[i] = graphs[i]->engram_io.enabled;
+        }
+        reads = ds4_engram_async_start((size_t)count, tables,
+            (const uint32_t (*)[2][DS4_ENGRAM_COLS])ids, disk_rows, observe);
+    }
+    for (int i = 0; ok && i < count; i++) {
+        ds41_gpu_graph *s = graphs[i];
+        for (unsigned table = 0; !reads && ok && table < 2; table++)
+            ok = ds41_engram_read_observe(&s->table[table], ids[i][table], DS4_ENGRAM_COLS,
+                                          disk_rows[i][table], &s->engram_io);
         if (ok) ok = ds4_gpu_tensor_write(g->rows_view[i].pre, 0, initial_pre, sizeof(initial_pre)) &&
             ds4_gpu_embed_token_hc_tensor(g->rows_view[i].residual, model->map, model->size,
                 weights->token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)tokens[i], DS4_N_EMBD, DS4_N_HC);
     }
     if (ok) ok = ds4_gpu_tensor_write(g->prefill_tokens, 0, tokens, rows * sizeof(int));
+    if (engram_rows1) {
+        active1 = active;
+        active1.engram_rows = engram_rows1;
+    }
+    const uint32_t flush_layers = overlap ? ds41_verify_flush_layers() : 0u;
     uint32_t il = 0;
     for (; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &weights->layer[il];
-        if (ds41_engram_layer(il)) {
-            const unsigned table = il == 1 ? 0 : 1;
-            for (int i = 0; ok && i < count; i++) {
-                ds41_gpu_graph *s = graphs[i];
-                ok = ds4_gpu_tensor_write(g->rows_view[i].engram_rows, 0,
-                    engram && (uint32_t)i < prefill_rows ? engram[i][table] : s->rows[table],
-                    sizeof(s->rows[table]));
-            }
+        const bool engram_layer = ds41_engram_layer(il);
+        const unsigned table = il == 1 ? 0 : 1;
+        if (engram_layer && reads) {
+            ds41_stage("engram.wait");
+            ok = ds4_engram_async_wait(reads, table);
         }
+        const bool split_upload = engram_layer && table == 1 && engram_rows1;
+        for (int i = 0; engram_layer && ok && i < count; i++)
+            ok = split_upload ?
+                ds4_gpu_tensor_write(engram_rows1, (uint64_t)i * width * sizeof(float),
+                                     disk_rows[i][table], width * sizeof(float)) :
+                ds4_gpu_tensor_write(g->rows_view[i].engram_rows, 0,
+                                     disk_rows[i][table], width * sizeof(float));
         for (int i = 0; ok && i < count; i++)
             ok = ds41_dspark_capture(graphs[i]->dspark, il, positions[i],
                 g->rows_view[i].residual, 1);
-        if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows) &&
+        if (ok) ok = ds41_before_attention_batch(g, split_upload ? &active1 : &active,
+                                                 model, l, il, rows) &&
             ds41_stage("attn.proj") && ds41_attention_project_batch(g, model, l, rows);
         bool batch_output = false;
 #ifndef DS4_ROCM_BUILD
@@ -43153,9 +43209,19 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
                 active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
             ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, rows, DS4_V41_BF16);
-        /* The second Engram upload reuses the first one's input storage. */
-        if (ok && il == 13) ok = ds41_stage("sync.layer13") &&
+        /* Without its own rows, the second Engram upload reuses the first
+         * one's input storage and must wait for layer 1 to consume it. */
+        if (ok && il == 13 && !engram_rows1) ok = ds41_stage("sync.layer13") &&
             ds4_gpu_end_commands() && ds4_gpu_begin_commands();
+        else if (ok && flush_layers && il + 1u < DS4_N_LAYER &&
+                 (il == 0 || (il + 1u) % flush_layers == 0))
+            ok = ds4_gpu_flush_commands() != 0;
+    }
+    /* Join on every path before the host rows are freed or reused. */
+    if (reads) {
+        ds4_engram_observation *sums[DS4_TP_BATCH_MAX_ROWS];
+        for (int i = 0; i < count; i++) sums[i] = &graphs[i]->engram_io;
+        if (!ds4_engram_async_finish(reads, sums)) ok = false;
     }
     const uint64_t logits_bytes = (uint64_t)DS4_N_VOCAB * sizeof(float) /
                                   (g->tp_logits_half ? 2u : 1u);
@@ -43193,6 +43259,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         if (ok) { s->history = history[i]; s->pos = positions[i] + 1u; }
     }
     ds4_gpu_tensor_free(batch_logits);
+    ds4_gpu_tensor_free(engram_rows1);
     if (!ok) fprintf(stderr, "ds4: V4.1 session batch failed at layer %u (%d rows)\n", il, count);
 #define DS41_SESSION_FREE(name, width) ds4_gpu_tensor_free(active.name);
     DS41_PREFILL_ROWS(DS41_SESSION_FREE)

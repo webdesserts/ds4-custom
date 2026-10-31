@@ -590,3 +590,136 @@ bool ds4_engram_read_batch_observed(const ds4_engram_table *t, const uint32_t *r
     o->failed_calls = !ok;
     return ok;
 }
+
+typedef struct {
+    ds4_engram_table table;
+    uint32_t ids[DS4_ENGRAM_COLS];
+    float *out;
+    bool observe, ok;
+    int error;
+    ds4_engram_observation observation;
+} engram_async_item;
+
+struct ds4_engram_async {
+    size_t tokens;
+    engram_async_item items[2][DS4_ENGRAM_ASYNC_MAX_TOKENS];
+    bool pending[2];
+#ifdef __APPLE__
+    dispatch_group_t group[2];
+#else
+    pthread_t thread[2];
+#endif
+};
+
+static void engram_async_item_run(void *context) {
+    engram_async_item *item = context;
+    errno = 0;
+    item->ok = ds4_engram_read_observed(&item->table, item->ids, DS4_ENGRAM_COLS,
+        item->out, item->observe ? &item->observation : NULL);
+    item->error = item->ok ? 0 : errno ? errno : EIO;
+}
+
+#ifndef __APPLE__
+typedef struct {
+    ds4_engram_async *reads;
+    unsigned table;
+} engram_async_table;
+
+static void *engram_async_table_run(void *context) {
+    ds4_engram_async *reads = ((engram_async_table *)context)->reads;
+    const unsigned table = ((engram_async_table *)context)->table;
+    free(context);
+    for (size_t i = 0; i < reads->tokens; i++) engram_async_item_run(&reads->items[table][i]);
+    return NULL;
+}
+#endif
+
+ds4_engram_async *ds4_engram_async_start(size_t tokens,
+    const ds4_engram_table *const tables[], const uint32_t ids[][2][DS4_ENGRAM_COLS],
+    float *const out[][2], const bool observe[]) {
+    if (!tokens || tokens > DS4_ENGRAM_ASYNC_MAX_TOKENS || !tables || !ids || !out) {
+        errno = EINVAL;
+        return NULL;
+    }
+    ds4_engram_async *reads = calloc(1, sizeof(*reads));
+    if (!reads) return NULL;
+    reads->tokens = tokens;
+    for (unsigned t = 0; t < 2; t++) {
+        for (size_t i = 0; i < tokens; i++) {
+            engram_async_item *item = &reads->items[t][i];
+            item->table = tables[i][t];
+            memcpy(item->ids, ids[i][t], sizeof(item->ids));
+            item->out = out[i][t];
+            item->observe = observe && observe[i];
+        }
+    }
+#ifdef __APPLE__
+    /* Table 0 is queued first: layer 1 needs it long before layer 14 needs 1. */
+    dispatch_queue_t queue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+    for (unsigned t = 0; t < 2; t++) {
+        reads->group[t] = dispatch_group_create();
+        if (!reads->group[t]) {
+            for (size_t i = 0; i < tokens; i++) engram_async_item_run(&reads->items[t][i]);
+            continue;
+        }
+        for (size_t i = 0; i < tokens; i++)
+            dispatch_group_async_f(reads->group[t], queue, &reads->items[t][i], engram_async_item_run);
+        reads->pending[t] = true;
+    }
+#else
+    for (unsigned t = 0; t < 2; t++) {
+        engram_async_table *context = malloc(sizeof(*context));
+        if (context) *context = (engram_async_table){reads, t};
+        if (context && !pthread_create(&reads->thread[t], NULL, engram_async_table_run, context)) {
+            reads->pending[t] = true;
+            continue;
+        }
+        /* Thread exhaustion only removes overlap, not correctness. */
+        free(context);
+        for (size_t i = 0; i < tokens; i++) engram_async_item_run(&reads->items[t][i]);
+    }
+#endif
+    return reads;
+}
+
+static void engram_async_join(ds4_engram_async *reads, unsigned table) {
+    if (!reads->pending[table]) return;
+#ifdef __APPLE__
+    dispatch_group_wait(reads->group[table], DISPATCH_TIME_FOREVER);
+#else
+    if (pthread_join(reads->thread[table], NULL)) abort();
+#endif
+    reads->pending[table] = false;
+}
+
+bool ds4_engram_async_wait(ds4_engram_async *reads, unsigned table) {
+    if (!reads || table >= 2) { errno = EINVAL; return false; }
+    engram_async_join(reads, table);
+    for (size_t i = 0; i < reads->tokens; i++) {
+        if (!reads->items[table][i].ok) {
+            errno = reads->items[table][i].error;
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ds4_engram_async_finish(ds4_engram_async *reads, ds4_engram_observation *const sums[]) {
+    if (!reads) return false;
+    bool ok = true;
+    for (unsigned t = 0; t < 2; t++) engram_async_join(reads, t);
+    for (size_t i = 0; i < reads->tokens; i++) {
+        for (unsigned t = 0; t < 2; t++) {
+            const engram_async_item *item = &reads->items[t][i];
+            ok = ok && item->ok;
+            if (item->observe && sums && sums[i])
+                ds4_engram_observation_add(sums[i], &item->observation);
+        }
+    }
+#ifdef __APPLE__
+    for (unsigned t = 0; t < 2; t++)
+        if (reads->group[t]) dispatch_release(reads->group[t]);
+#endif
+    free(reads);
+    return ok;
+}

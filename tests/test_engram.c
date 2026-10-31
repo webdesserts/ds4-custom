@@ -299,11 +299,84 @@ static void test_reader(void) {
     assert(close(fd) == 0);
 }
 
+/* Batch async reads must equal the synchronous per-(token, table) calls,
+ * including observations, and report the failing token's error. */
+static void test_async(void) {
+    char path[] = "/tmp/ds4-engram-async-XXXXXX";
+    const int fd = mkstemp(path);
+    assert(fd >= 0 && unlink(path) == 0);
+    enum { ROWS = 8, TOKENS = DS4_ENGRAM_ASYNC_MAX_TOKENS, N = DS4_ENGRAM_COLS * DS4_ENGRAM_DIM };
+    uint8_t raw[2 * ROWS][DS4_ENGRAM_ROW_BYTES];
+    for (unsigned r = 0; r < 2 * ROWS; r++) {
+        for (unsigned i = 0; i < DS4_ENGRAM_DIM; i++) raw[r][i] = (i * 3u + r * 11u) % 127u;
+        memset(raw[r] + DS4_ENGRAM_DIM, 120 + r % 8, 8);
+    }
+    assert(pwrite(fd, raw, sizeof(raw), 0) == sizeof(raw));
+    ds4_engram_table table[2], pair[TOKENS][2];
+    const ds4_engram_table *tables[TOKENS];
+    uint32_t ids[TOKENS][2][DS4_ENGRAM_COLS];
+    static float expected[TOKENS][2][N], got[TOKENS][2][N];
+    float *out[TOKENS][2];
+    bool observe[TOKENS];
+    ds4_engram_observation want[TOKENS] = {0}, have[TOKENS] = {0};
+    ds4_engram_observation *sums[TOKENS];
+    for (unsigned t = 0; t < 2; t++)
+        table[t] = (ds4_engram_table){.fd = fd, .offset = t * ROWS * sizeof(raw[0]), .rows = ROWS};
+    for (unsigned i = 0; i < TOKENS; i++) {
+        observe[i] = i % 3 != 1;
+        want[i].enabled = have[i].enabled = observe[i];
+        sums[i] = &have[i];
+        memcpy(pair[i], table, sizeof(table));
+        tables[i] = pair[i];
+        for (unsigned t = 0; t < 2; t++) {
+            for (unsigned c = 0; c < DS4_ENGRAM_COLS; c++) ids[i][t][c] = (c * 5u + i + t) % ROWS;
+            ds4_engram_observation part;
+            assert(ds4_engram_read_observed(&table[t], ids[i][t], DS4_ENGRAM_COLS, expected[i][t],
+                                            observe[i] ? &part : NULL));
+            if (observe[i]) ds4_engram_observation_add(&want[i], &part);
+            out[i][t] = got[i][t];
+        }
+    }
+    for (unsigned repeat = 0; repeat < 50; repeat++) {
+        memset(got, 0xff, sizeof(got));
+        ds4_engram_async *reads = ds4_engram_async_start(TOKENS, tables,
+            (const uint32_t (*)[2][DS4_ENGRAM_COLS])ids, out, observe);
+        assert(reads);
+        assert(ds4_engram_async_wait(reads, 0));
+        for (unsigned i = 0; i < TOKENS; i++) assert(!memcmp(got[i][0], expected[i][0], sizeof(got[i][0])));
+        assert(ds4_engram_async_wait(reads, 1) && ds4_engram_async_wait(reads, 1));
+        assert(!memcmp(got, expected, sizeof(got)));
+        assert(ds4_engram_async_finish(reads, repeat ? NULL : sums));
+    }
+    for (unsigned i = 0; i < TOKENS; i++) {
+        assert(have[i].calls == want[i].calls && have[i].pread_calls == want[i].pread_calls);
+        assert(have[i].read_bytes == want[i].read_bytes && have[i].rows_completed == want[i].rows_completed);
+        assert(have[i].failed_calls == 0 && have[i].enabled == observe[i]);
+    }
+    assert(!ds4_engram_async_start(0, tables, (const uint32_t (*)[2][DS4_ENGRAM_COLS])ids, out, NULL) &&
+           errno == EINVAL);
+    assert(!ds4_engram_async_start(TOKENS + 1, tables, (const uint32_t (*)[2][DS4_ENGRAM_COLS])ids, out, NULL) &&
+           errno == EINVAL);
+    /* An invalid row in token 5's table 1 fails only that table. */
+    ids[5][1][7] = ROWS;
+    ds4_engram_async *reads = ds4_engram_async_start(TOKENS, tables,
+        (const uint32_t (*)[2][DS4_ENGRAM_COLS])ids, out, NULL);
+    assert(reads && ds4_engram_async_wait(reads, 0));
+    assert(!ds4_engram_async_wait(reads, 1) && errno == EINVAL);
+    assert(!ds4_engram_async_finish(reads, NULL));
+    /* Finishing without waiting still joins every reader. */
+    reads = ds4_engram_async_start(TOKENS, tables, (const uint32_t (*)[2][DS4_ENGRAM_COLS])ids, out, NULL);
+    assert(reads && !ds4_engram_async_finish(reads, NULL));
+    assert(!ds4_engram_async_wait(NULL, 0) && errno == EINVAL);
+    assert(close(fd) == 0);
+}
+
 int main(void) {
     test_hash();
     test_rows();
     test_all_scaled_values();
     test_reader();
+    test_async();
     puts("Engram hashes, history and bounded disk rows: PASS");
     return 0;
 }
