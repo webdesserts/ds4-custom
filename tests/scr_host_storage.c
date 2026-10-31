@@ -84,6 +84,8 @@ int ds4_gpu_begin_commands(void) {
 int ds4_gpu_commands_active(void) { return active; }
 int ds4_gpu_end_commands(void) { if (!active) return 0; active = false; return 1; }
 int ds4_gpu_synchronize(void) { return !active; }
+/* Stage profiling labels are diagnostics only. */
+void ds4_gpu_profile_stage(const char *stage) { (void)stage; }
 uint64_t ds4_gpu_recommended_working_set_size(void) { return UINT64_C(32) << 30; }
 /* Streaming fixture has no resident expert cache, forcing its scalar route. */
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void) { return 0; }
