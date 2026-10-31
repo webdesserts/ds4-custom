@@ -37,7 +37,8 @@ endif
 CARGO ?= cargo
 CARGO_JOBS ?= 2
 CACHE_REUSE_LIB ?= $(abspath adapter/cache-reuse/target/release/libds4_cache_reuse.a)
-$(CACHE_REUSE_LIB): adapter/cache-reuse/Cargo.toml adapter/cache-reuse/Cargo.lock adapter/cache-reuse/src/lib.rs adapter/cache-reuse/src/slot_router.rs
+$(CACHE_REUSE_LIB): adapter/cache-reuse/Cargo.toml adapter/cache-reuse/Cargo.lock adapter/cache-reuse/src/lib.rs adapter/cache-reuse/src/slot_router.rs \
+		adapter/dspark-policy/Cargo.toml adapter/dspark-policy/src/lib.rs
 	$(CARGO) build -j $(CARGO_JOBS) --release --locked --manifest-path adapter/cache-reuse/Cargo.toml
 
 ifneq ($(UNAME_S),Darwin)
@@ -1005,6 +1006,13 @@ tests/test_ssd_cache: tests/test_ssd_cache.c ds4_ssd.c ds4_ssd.h
 .PHONY: test-ssd-cache
 test-ssd-cache: tests/test_ssd_cache
 	./tests/test_ssd_cache
+
+tests/test_dspark_policy: tests/test_dspark_policy.c adapter/include/dspark_policy.h $(CACHE_REUSE_LIB)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_dspark_policy.c $(CACHE_REUSE_LIB) $(LDLIBS)
+
+.PHONY: test-dspark-policy
+test-dspark-policy: tests/test_dspark_policy
+	./tests/test_dspark_policy
 
 tests/test_engram: tests/test_engram.c ds4_engram.c ds4_engram.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ tests/test_engram.c ds4_engram.c $(LDLIBS)

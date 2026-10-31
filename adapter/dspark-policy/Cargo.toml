@@ -1,0 +1,13 @@
+# The V4.1 DSpark draft-length rule as a pure function. ds4 links it through
+# adapter/cache-reuse (C ABI: adapter/include/dspark_policy.h) and
+# dspark-policy-sim depends on it directly, so the simulator replays the
+# decision the server makes.
+[package]
+name = "dspark-policy"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"

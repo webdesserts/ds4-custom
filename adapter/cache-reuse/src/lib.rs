@@ -1,6 +1,8 @@
 //! Link shell: keeps the pinned cache-reuse-utils and kv-archive-store C
-//! symbols in the static archive, plus the server's slot router.
+//! symbols in the static archive, plus the server's slot router and the
+//! DSpark draft-length policy.
 pub mod slot_router;
+pub use dspark_policy::{ds4_dspark_gain_continue, ds4_dspark_gain_model_default};
 pub use cache_reuse_utils_ffi::{
     cache_reuse_append_unpadded, cache_reuse_clip_ranges_to_archive,
     cache_reuse_collect_separator_boundaries, cache_reuse_common_prefix,

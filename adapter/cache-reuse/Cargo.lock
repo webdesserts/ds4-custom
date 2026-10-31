@@ -20,8 +20,13 @@ name = "ds4-cache-reuse"
 version = "0.1.0"
 dependencies = [
  "cache-reuse-utils-ffi",
+ "dspark-policy",
  "kv-archive-store-ffi",
 ]
+
+[[package]]
+name = "dspark-policy"
+version = "0.1.0"
 
 [[package]]
 name = "kv-archive-store"

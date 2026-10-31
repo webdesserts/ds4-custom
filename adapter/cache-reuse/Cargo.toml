@@ -1,5 +1,5 @@
 # Thin static-library shell around the pinned cache-reuse-utils and
-# kv-archive-store C ABIs. Cargo does not emit a stable staticlib path for a
+# kv-archive-store C ABIs, plus the DSpark draft-length policy. Cargo does not emit a stable staticlib path for a
 # dependency, so this crate re-exports both FFI families and produces
 # libds4_cache_reuse.a.
 [package]
@@ -18,6 +18,7 @@ path = "src/lib.rs"
 cache-reuse-utils-ffi = { git = "https://github.com/webdesserts/cache-reuse-utils.git", rev = "b5b6e6d07887a0fc7ad32a1de1f048dddc7b9360" }
 # Local checkout at 9e62ff39e455422ad21ebb3eb0324413ca1e3579; it has no remote.
 kv-archive-store-ffi = { path = "../../../kv-archive-store/ffi" }
+dspark-policy = { path = "../dspark-policy" }
 
 [profile.release]
 panic = "unwind"
