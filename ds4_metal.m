@@ -11594,7 +11594,20 @@ static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
     }
 }
 
+/* DS4_METAL_MEMORY_REPORT=1: sample the device's allocated bytes at each
+ * command batch and print the first, peak and final values at cleanup. */
+static int g_mem_report = -1;
+static uint64_t g_mem_first, g_mem_peak;
+static void ds4_gpu_mem_sample(void) {
+    if (g_mem_report < 0) g_mem_report = getenv("DS4_METAL_MEMORY_REPORT") != NULL;
+    if (!g_mem_report || !g_device) return;
+    const uint64_t a = (uint64_t)[g_device currentAllocatedSize];
+    if (!g_mem_first) g_mem_first = a;
+    if (a > g_mem_peak) g_mem_peak = a;
+}
+
 int ds4_gpu_end_commands(void) {
+    ds4_gpu_mem_sample();
     if (!g_batch_cb) {
         ds4_gpu_parallel_ffn_reset_state(YES);
         return 0;
@@ -11674,6 +11687,12 @@ static void qwen4_batch_release_scratch(void);
 
 void ds4_gpu_cleanup(void) {
     if (!g_initialized) return;
+    ds4_gpu_mem_sample();
+    if (g_mem_report > 0) {
+        fprintf(stderr, "ds4: Metal allocated first %.3f GiB peak %.3f GiB final %.3f GiB\n",
+                g_mem_first / 1073741824.0, g_mem_peak / 1073741824.0,
+                [g_device currentAllocatedSize] / 1073741824.0);
+    }
     ds4_gpu_queue_keepalive_stop_thread();
 
     @autoreleasepool {
