@@ -1109,6 +1109,57 @@ static int check_fused_ew(void) {
 }
 #endif
 
+#ifdef __APPLE__
+/* Sessions sharing one workspace inherit each other's batch block masks. The
+ * layer-20 candidate step (fill or top-k mask) must write every mask word the
+ * later candidate filter reads for that row and position, so stale words
+ * from another session (masked blocks of a longer prompt) cannot change the
+ * filtered scores. Mirrors ds41_attention_candidates at ratio 1. */
+static int check_stale_mask(void) {
+    const uint32_t ctx = 65536, stride = (ctx + 7u) / 8u;
+    const uint32_t positions[] = {0, 7, 100, 5000, 16382, 16383, 16500, 40000, 65535};
+    float *scores = malloc((size_t)ctx * 4), *clean = malloc((size_t)ctx * 4),
+          *dirty = malloc((size_t)ctx * 4), *fill = malloc((size_t)stride * 4);
+    CHECK(scores && clean && dirty && fill);
+    ds4_gpu_tensor *mask = upload(NULL, (uint64_t)stride * 4),
+        *block_scores = upload(NULL, (uint64_t)stride * 4),
+        *selected = upload(NULL, 2048u * 4u), *row = upload(NULL, (uint64_t)ctx * 4);
+    CHECK(mask && block_scores && selected && row);
+    for (size_t pi = 0; pi < sizeof(positions) / sizeof(*positions); pi++) {
+        const uint32_t pos = positions[pi], n_comp = pos + 1u;
+        const uint32_t blocks = (n_comp + 7u) / 8u, top = blocks < 2048u ? blocks : 2048u;
+        for (uint32_t i = 0; i < n_comp; i++) scores[i] = random_value();
+        /* Stale patterns: all blocks masked, and a mix of kept and masked. */
+        for (int stale = 0; stale < 3; stale++) {
+            for (uint32_t i = 0; i < stride; i++)
+                fill[i] = stale == 1 || (stale == 2 && i % 3u) ? -INFINITY : 0.0f;
+            CHECK(ds4_gpu_tensor_write(mask, 0, fill, (uint64_t)stride * 4));
+            CHECK(ds4_gpu_tensor_write(row, 0, scores, (uint64_t)n_comp * 4));
+            CHECK(ds4_gpu_begin_commands());
+            if (top == blocks) CHECK(ds4_gpu_tensor_fill_f32(mask, 0, blocks));
+            else CHECK(ds4_gpu_dsv41_candidate_blocks(block_scores, row, n_comp, 1, pos, 1) &&
+                       ds4_gpu_indexer_topk_tensor(selected, block_scores, blocks, 1, top) &&
+                       ds4_gpu_dsv4_topk_mask_tensor(mask, selected, blocks, 1, top));
+            CHECK(ds4_gpu_dsv41_candidate_filter(row, mask, n_comp, 1, pos, 1));
+            CHECK(ds4_gpu_end_commands());
+            CHECK(ds4_gpu_tensor_read(row, 0, stale ? dirty : clean, (uint64_t)n_comp * 4));
+            if (stale && memcmp(clean, dirty, (size_t)n_comp * 4))
+                fprintf(stderr, "stale block mask changed candidates at pos=%u pattern=%d\n", pos, stale);
+            CHECK(!stale || !memcmp(clean, dirty, (size_t)n_comp * 4));
+        }
+        uint32_t kept = 0;
+        for (uint32_t i = 0; i < n_comp; i++) kept += isfinite(clean[i]) != 0;
+        CHECK(top < blocks ? kept < n_comp : kept == n_comp);
+        fprintf(stderr, "V4.1 stale block mask pos=%u (%s, %u kept): PASS\n", pos,
+                top == blocks ? "fill" : "top-k", kept);
+    }
+    ds4_gpu_tensor_free(mask); ds4_gpu_tensor_free(block_scores);
+    ds4_gpu_tensor_free(selected); ds4_gpu_tensor_free(row);
+    free(scores); free(clean); free(dirty); free(fill);
+    return 1;
+}
+#endif
+
 static int check_attention_output(bool large) {
     enum { GROUP = 4096, RANK = 1024, GROUPS = 8, OUT = 5120 };
     const uint32_t ROWS = large ? 8192u : 513u;
@@ -2202,6 +2253,11 @@ int main(int argc, char **argv) {
         return ok ? 0 : 1;
     }
 #ifdef __APPLE__
+    if (argc == 2 && !strcmp(argv[1], "--stale-mask")) {
+        const int ok = ds4_gpu_init() && check_stale_mask();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--fused-ew")) {
         const int ok = ds4_gpu_init() && check_fused_ew();
         ds4_gpu_cleanup();

@@ -40941,7 +40941,11 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     return cap > chunk ? (uint32_t)cap : 0;
 }
 
-#define DS41_SCRATCH(X) \
+/* Call-local graph buffers. Session state never lives here: everything in
+ * DS41_SHARED_SCRATCH, the batch rows and the carry is rewritten before it is
+ * read within one engine call, so an engine may lend one copy to every
+ * session (ds41_workspace). The small vectors stay per session. */
+#define DS41_SESSION_SCRATCH(X) \
     X(image_text_mask, (g->prefill_cap + 3u) / 4u) \
     X(residual, DS4_N_HC * DS4_N_EMBD) \
     X(after_attn, DS4_N_HC * DS4_N_EMBD) \
@@ -40950,12 +40954,10 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     X(x, DS4_N_EMBD) X(norm, DS4_N_EMBD) X(block, DS4_N_EMBD) \
     X(qr, DS4_N_LORA_Q) X(q, DS4_N_HEAD * DS4_N_HEAD_DIM) \
     X(kv, DS4_N_HEAD_DIM) X(latent, DS4_N_HEAD_DIM) \
-    X(raw_prefill, (g->prefill_cap + 128u) * DS4_N_HEAD_DIM) \
     X(pool_kv, DS4_N_HEAD_DIM) X(pool_score, DS4_N_HEAD_DIM) \
     X(index_q, DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM) \
     X(index_k, DS4_N_INDEXER_HEAD_DIM) X(index_weights, DS4_N_INDEXER_HEAD) \
-    X(index_scores, DS41_INDEX_BATCH * g->ctx) X(selected_comp, DS4_N_INDEXER_TOP_K) \
-    X(index_packed, ds4_gpu_dsv41_indexer_packed_bytes(g->ctx, g->prefill_cap) / 4u) \
+    X(selected_comp, DS4_N_INDEXER_TOP_K) \
     X(selected_kv, DS4_N_INDEXER_TOP_K * DS4_N_HEAD_DIM) \
     X(block_scores, (g->ctx + 7u) / 8u) X(block_selected, 2048) \
     X(block_mask, (g->ctx + 7u) / 8u) \
@@ -40968,8 +40970,15 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     X(shared_gate, DS4_N_FF_EXP) X(shared_up, DS4_N_FF_EXP) \
     X(shared_mid, DS4_N_FF_EXP) X(shared, DS4_N_EMBD) \
     X(engram_rows, DS4_ENGRAM_COLS * DS4_ENGRAM_DIM) \
-    X(engram_prefetch, (g->carry_cap ? g->carry_cap : g->prefill_cap) * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM) \
     X(engram_kv, (DS4_N_HC + 1u) * DS4_N_EMBD) X(logits, DS4_N_VOCAB)
+#define DS41_SHARED_SCRATCH(X) \
+    X(raw_prefill, (g->prefill_cap + 128u) * DS4_N_HEAD_DIM) \
+    X(index_scores, DS41_INDEX_BATCH * g->ctx) \
+    X(index_packed, ds4_gpu_dsv41_indexer_packed_bytes(g->ctx, g->prefill_cap) / 4u) \
+    X(engram_prefetch, (g->carry_cap ? g->carry_cap : g->prefill_cap) * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM)
+#define DS41_SCRATCH(X) DS41_SESSION_SCRATCH(X) DS41_SHARED_SCRATCH(X)
+
+typedef struct ds41_workspace ds41_workspace;
 
 typedef struct {
     uint32_t ctx, pos, prefill_cap, carry_cap;
@@ -41004,10 +41013,27 @@ typedef struct {
     ds41_prefill_row carry;
     ds4_gpu_tensor *prefill_tokens;
     ds41_dspark *dspark;
+    /* Lender of batch, rows_view, carry and DS41_SHARED_SCRATCH (NULL when
+     * the graph owns them); row copies keep the session's identity. */
+    ds41_workspace *workspace;
+    const void *workspace_owner;
 #define DS41_FIELD(name, count) ds4_gpu_tensor *name;
     DS41_SCRATCH(DS41_FIELD)
 #undef DS41_FIELD
 } ds41_gpu_graph;
+
+/* One engine-owned copy of the call-local transients, lent to every session
+ * of the same shape. `shape` owns the tensors (only its shape fields and
+ * transient pointers are set). Session calls are serialized; the guard turns
+ * an overlapping use, or a use while another session's deferred decoder still
+ * needs the carry, into an error instead of silent reuse. */
+struct ds41_workspace {
+    ds41_gpu_graph shape;
+    uint64_t bytes;
+    uint32_t users, depth;
+    const void *owner;
+    bool carry_pending;
+};
 
 /* Keep upstream Engram scheduling/conversion authoritative. Readers measure
  * privately and the exclusive graph owner merges only completed call results. */
@@ -41041,6 +41067,111 @@ static bool ds41_read_array(const ds4_model *m, const char *key, uint32_t type,
     return cursor_read(&c, out, bytes);
 }
 
+/* Transients: batch rows (with aliases and per-row views), the carry and
+ * DS41_SHARED_SCRATCH. */
+static void ds41_graph_free_transients(ds41_gpu_graph *g) {
+    for (uint32_t i = 0; g->rows_view && i < g->prefill_cap; i++) {
+#define DS41_ROW_FREE(name, count) ds4_gpu_tensor_free(g->rows_view[i].name);
+        DS41_PREFILL_ROWS(DS41_ROW_FREE)
+#undef DS41_ROW_FREE
+    }
+    free(g->rows_view);
+    g->rows_view = NULL;
+#define DS41_BATCH_FREE(name, count) ds4_gpu_tensor_free(g->batch.name);
+    DS41_PREFILL_ROWS(DS41_BATCH_FREE)
+#undef DS41_BATCH_FREE
+#define DS41_CARRY_FREE(name, count, format) ds4_gpu_tensor_free(g->carry.name);
+    DS41_CARRY_ROWS(DS41_CARRY_FREE)
+#undef DS41_CARRY_FREE
+#define DS41_SHARED_FREE(name, count) ds4_gpu_tensor_free(g->name); g->name = NULL;
+    DS41_SHARED_SCRATCH(DS41_SHARED_FREE)
+#undef DS41_SHARED_FREE
+    memset(&g->batch, 0, sizeof(g->batch));
+    memset(&g->carry, 0, sizeof(g->carry));
+}
+
+/* Point `dst` at the transients of `src` (no ownership change). */
+static void ds41_graph_lend_transients(ds41_gpu_graph *dst, const ds41_gpu_graph *src) {
+    dst->batch = src->batch;
+    dst->carry = src->carry;
+    dst->rows_view = src->rows_view;
+#define DS41_SHARED_LEND(name, count) dst->name = src->name;
+    DS41_SHARED_SCRATCH(DS41_SHARED_LEND)
+#undef DS41_SHARED_LEND
+}
+
+static void ds41_graph_forget_transients(ds41_gpu_graph *g) {
+    ds41_gpu_graph none;
+    memset(&none, 0, sizeof(none));
+    ds41_graph_lend_transients(g, &none);
+}
+
+/* Drop a session's borrowed pointers; the workspace keeps the tensors. */
+static void ds41_workspace_detach(ds41_gpu_graph *g) {
+    ds41_workspace *ws = g->workspace;
+    ds41_graph_forget_transients(g);
+    g->workspace = NULL;
+    if (!ws) return;
+    if (ws->owner == g->workspace_owner) {
+        ws->carry_pending = false;
+        if (!ws->depth) ws->owner = NULL;
+    }
+    if (ws->users) ws->users--;
+}
+
+static void ds41_workspace_free(ds41_workspace *ws) {
+    if (!ws) return;
+    if (ws->users || ws->depth)
+        fprintf(stderr, "ds4: V4.1 shared workspace freed with %u users, depth %u\n",
+                ws->users, ws->depth);
+    ds41_graph_free_transients(&ws->shape);
+    free(ws);
+}
+
+/* The graph shape ds41_graph_alloc derives for `ctx` under the current
+ * environment: what a workspace must match to be lent. */
+static ds41_gpu_graph ds41_graph_shape(uint32_t ctx) {
+    return (ds41_gpu_graph){.ctx = ctx,
+        .prefill_cap = ds41_prefill_limit(ctx),
+        .carry_cap = ds41_carry_cap(ctx),
+        .prefill_alias = !getenv("DS4_METAL_DISABLE_V41_PREFILL_ALIAS"),
+        .compact_carry = !getenv("DS4_METAL_DISABLE_V41_COMPACT_CARRY")};
+}
+
+static bool ds41_workspace_fits(const ds41_workspace *ws, uint32_t ctx) {
+    const ds41_gpu_graph want = ds41_graph_shape(ctx);
+    return ws && ws->shape.ctx == want.ctx && ws->shape.prefill_cap == want.prefill_cap &&
+        ws->shape.carry_cap == want.carry_cap && ws->shape.prefill_alias == want.prefill_alias &&
+        ws->shape.compact_carry == want.compact_carry;
+}
+
+/* Enter/leave bracket every graph call that touches the transients. Entering
+ * for another session while the workspace is in use, or while a deferred
+ * decoder still owns the carry, fails with a diagnostic. */
+static bool ds41_workspace_enter(const ds41_gpu_graph *g, const char *what) {
+    ds41_workspace *ws = g ? g->workspace : NULL;
+    if (!ws) return true;
+    if ((ws->depth || ws->carry_pending) && ws->owner != g->workspace_owner) {
+        fprintf(stderr, "ds4: V4.1 shared workspace busy: %s for session %p while %s by %p\n",
+                what, g->workspace_owner, ws->depth ? "in use" : "carry pending", ws->owner);
+        return false;
+    }
+    ws->owner = g->workspace_owner;
+    ws->depth++;
+    return true;
+}
+
+static void ds41_workspace_leave(const ds41_gpu_graph *g) {
+    ds41_workspace *ws = g ? g->workspace : NULL;
+    if (ws && ws->depth) ws->depth--;
+}
+
+/* A session's prefix call ended: no deferred decoder can resume. */
+static void ds41_workspace_abandon(const ds41_gpu_graph *g) {
+    ds41_workspace *ws = g ? g->workspace : NULL;
+    if (ws && ws->owner == g->workspace_owner && !ws->depth) ws->carry_pending = false;
+}
+
 static void ds41_graph_free(ds41_gpu_graph *g) {
     if (!g) return;
     const ds41_scr_archive *owned_archives[] = {g->archive, g->archive_pending};
@@ -41063,17 +41194,8 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
     ds4_gpu_decode_graphs_invalidate();
 #endif
     ds4_gpu_tensor_free(g->tp_logits_half);
-    for (uint32_t i = 0; g->rows_view && i < g->prefill_cap; i++) {
-#define DS41_ROW_FREE(name, count) ds4_gpu_tensor_free(g->rows_view[i].name);
-        DS41_PREFILL_ROWS(DS41_ROW_FREE)
-#undef DS41_ROW_FREE
-    }
-#define DS41_BATCH_FREE(name, count) ds4_gpu_tensor_free(g->batch.name);
-    DS41_PREFILL_ROWS(DS41_BATCH_FREE)
-#undef DS41_BATCH_FREE
-#define DS41_CARRY_FREE(name, count, format) ds4_gpu_tensor_free(g->carry.name);
-    DS41_CARRY_ROWS(DS41_CARRY_FREE)
-#undef DS41_CARRY_FREE
+    if (g->workspace) ds41_workspace_detach(g);
+    else ds41_graph_free_transients(g);
     for (uint32_t i = 0; i < 2; i++) {
         ds4_engram_table_close(&g->table[i]);
         ds4_gpu_tensor_free(g->engram_q_norm[i]);
@@ -41087,28 +41209,38 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
         ds4_gpu_tensor_free(g->previous_score[i]);
     }
 #define DS41_FREE(name, count) ds4_gpu_tensor_free(g->name);
-    DS41_SCRATCH(DS41_FREE)
+    DS41_SESSION_SCRATCH(DS41_FREE)
 #undef DS41_FREE
     free(g->token_map);
     free(g->prefill_ids);
-    free(g->rows_view);
     ds4_gpu_tensor_free(g->prefill_tokens);
     memset(g, 0, sizeof(*g));
     g->table[0].fd = g->table[1].fd = -1;
 }
 
-static uint64_t ds41_graph_bytes(uint32_t ctx) {
-    const ds41_gpu_graph shape = {.ctx = ctx,
-        .prefill_cap = ds41_prefill_limit(ctx),
-        .carry_cap = ds41_carry_cap(ctx),
-        .prefill_alias = !getenv("DS4_METAL_DISABLE_V41_PREFILL_ALIAS"),
-        .compact_carry = !getenv("DS4_METAL_DISABLE_V41_COMPACT_CARRY")}, *g = &shape;
+/* Per-session part: KV state, the small scratch vectors and host tables. */
+static uint64_t ds41_graph_session_bytes(uint32_t ctx) {
+    const ds41_gpu_graph shape = ds41_graph_shape(ctx), *g = &shape;
     uint64_t floats = (uint64_t)40 * 128 * 512;
     for (uint32_t i = 0; i < 4; i++)
         floats += ((uint64_t)ctx / (i < 3 ? 2u : 1u) + 1u) * (512u + 128u) + 2u * 512u;
     floats += (uint64_t)2 * 2 * DS4_N_EMBD * DS4_N_HC;
 #define DS41_COUNT(name, count) floats += (count);
-    DS41_SCRATCH(DS41_COUNT)
+    DS41_SESSION_SCRATCH(DS41_COUNT)
+#undef DS41_COUNT
+    /* The bounded host hash-ID array beyond the prefill rows. */
+    if (g->carry_cap > g->prefill_cap)
+        floats += (uint64_t)(g->carry_cap - g->prefill_cap) * 2u * DS4_ENGRAM_COLS;
+    return floats * sizeof(float) + sizeof(*g) + (uint64_t)DS4_N_VOCAB * 4u;
+}
+
+/* Call-local part a shared workspace holds once: batch rows, carry,
+ * DS41_SHARED_SCRATCH and the process-wide MoE/sorter scratch. */
+static uint64_t ds41_graph_shared_bytes(uint32_t ctx) {
+    const ds41_gpu_graph shape = ds41_graph_shape(ctx), *g = &shape;
+    uint64_t floats = 0;
+#define DS41_COUNT(name, count) floats += (count);
+    DS41_SHARED_SCRATCH(DS41_COUNT)
 #undef DS41_COUNT
 #define DS41_BATCH_COUNT(name, count) floats += (uint64_t)(count) * g->prefill_cap;
     DS41_PREFILL_STORAGE(DS41_BATCH_COUNT)
@@ -41118,16 +41250,18 @@ static uint64_t ds41_graph_bytes(uint32_t ctx) {
     floats += (uint64_t)ds41_carry_words(count, format, g->compact_carry) * g->carry_cap;
     DS41_CARRY_ROWS(DS41_CARRY_COUNT)
 #undef DS41_CARRY_COUNT
-    /* Reserve view objects and the bounded host hash-ID array as well. */
+    /* Reserve the per-row view objects and the host hash-ID rows they cover. */
     floats += (uint64_t)g->prefill_cap * 512u;
-    if (g->carry_cap > g->prefill_cap)
-        floats += (uint64_t)(g->carry_cap - g->prefill_cap) * 2u * DS4_ENGRAM_COLS;
     /* Expert-major matrix kernels use one bounded packed activation buffer. */
     const uint64_t packed = g->prefill_cap >= 512 ?
         (g->prefill_cap > 4096u ? UINT64_C(512) : UINT64_C(256)) * 1024 * 1024 : 0;
     /* The index sorter owns two full-width merge buffers outside the graph. */
     const uint64_t sort = (uint64_t)DS41_INDEX_BATCH * ctx * 2u * sizeof(uint32_t);
-    return floats * sizeof(float) + sizeof(*g) + (uint64_t)DS4_N_VOCAB * 4u + packed + sort;
+    return floats * sizeof(float) + packed + sort;
+}
+
+static uint64_t ds41_graph_bytes(uint32_t ctx) {
+    return ds41_graph_session_bytes(ctx) + ds41_graph_shared_bytes(ctx);
 }
 
 static ds4_context_memory ds41_graph_memory(uint32_t ctx) {
@@ -41154,9 +41288,92 @@ static void ds41_graph_reset(ds41_gpu_graph *g) {
      * partial pair is overwritten by its even-position token before use. */
 }
 
+/* Allocate batch rows (aliases, per-row views), carry and
+ * DS41_SHARED_SCRATCH for the shape already set in `g`. */
+static bool ds41_graph_alloc_transients(ds41_gpu_graph *g) {
+#define DS41_ALLOC(name, count) \
+    if (!(g->name = (!strcmp(#name, "engram_prefetch") ? \
+            ds4_gpu_tensor_alloc_managed : ds4_gpu_tensor_alloc)( \
+                (uint64_t)((count) != 0 ? (count) : 1u) * sizeof(float)))) return false;
+    DS41_SHARED_SCRATCH(DS41_ALLOC)
+#undef DS41_ALLOC
+    g->rows_view = calloc(g->prefill_cap, sizeof(*g->rows_view));
+    if (!g->rows_view) return false;
+#define DS41_BATCH_ALLOC(name, count) \
+    if (!(g->batch.name = (!strcmp(#name, "engram_rows") || !strcmp(#name, "selected_comp") ? \
+            ds4_gpu_tensor_alloc_managed : ds4_gpu_tensor_alloc)( \
+                (uint64_t)(count) * g->prefill_cap * 4u))) return false;
+    DS41_PREFILL_STORAGE(DS41_BATCH_ALLOC)
+    /* Engram projection ends before HC normalization. HC normalization
+     * precedes Q projection or follows attention; routed expert outputs are
+     * produced only after attention has consumed Q. The attention output
+     * projection consumes heads/low before FFN; FFN normalization consumes x
+     * before shared-down, and the routed sum may replace the old block. */
+    if (g->prefill_alias) {
+#define DS41_BATCH_ALIAS(name, count, parent, offset) \
+        if (!(g->batch.name = ds4_gpu_tensor_view(g->batch.parent, \
+            (uint64_t)(offset) * g->prefill_cap * 4u, \
+            (uint64_t)(count) * g->prefill_cap * 4u))) return false;
+        DS41_BATCH_ALIAS(engram_kv, (DS4_N_HC + 1u) * DS4_N_EMBD, q, 0)
+        DS41_BATCH_ALIAS(flat_norm, DS4_N_HC * DS4_N_EMBD, q, 0)
+        DS41_BATCH_ALIAS(experts, DS4_N_EXPERT_USED * DS4_N_EMBD, q, 0)
+        DS41_BATCH_ALIAS(gate, DS4_N_EXPERT_USED * DS4_N_FF_EXP, heads, 0)
+        DS41_BATCH_ALIAS(up, DS4_N_EXPERT_USED * DS4_N_FF_EXP, heads,
+                         DS4_N_EXPERT_USED * DS4_N_FF_EXP)
+        DS41_BATCH_ALIAS(shared_gate, DS4_N_FF_EXP, low, 0)
+        DS41_BATCH_ALIAS(shared_up, DS4_N_FF_EXP, low, DS4_N_FF_EXP)
+        DS41_BATCH_ALIAS(shared_mid, DS4_N_FF_EXP, low, 2u * DS4_N_FF_EXP)
+        DS41_BATCH_ALIAS(shared, DS4_N_EMBD, x, 0)
+        DS41_BATCH_ALIAS(routed, DS4_N_EMBD, block, 0)
+#undef DS41_BATCH_ALIAS
+    } else { DS41_PREFILL_ALIASES(DS41_BATCH_ALLOC) }
+#undef DS41_BATCH_ALLOC
+#define DS41_BATCH_VIEW(name, count) \
+    for (uint32_t i = 0; i < g->prefill_cap; i++) \
+        if (!(g->rows_view[i].name = ds4_gpu_tensor_view(g->batch.name, \
+                (uint64_t)i * (count) * 4u, (uint64_t)(count) * 4u))) return false;
+    DS41_PREFILL_ROWS(DS41_BATCH_VIEW)
+#undef DS41_BATCH_VIEW
+    if (!ds4_gpu_tensor_fill_f32(g->batch.block_mask, 0,
+        (uint64_t)g->prefill_cap * ((g->ctx + 7u) / 8u))) return false;
+#define DS41_CARRY_ALLOC(name, count, format) \
+    if (g->carry_cap && !(g->carry.name = ds4_gpu_tensor_alloc( \
+            (uint64_t)ds41_carry_words(count, format, g->compact_carry) * g->carry_cap * sizeof(float)))) return false;
+    DS41_CARRY_ROWS(DS41_CARRY_ALLOC)
+#undef DS41_CARRY_ALLOC
+    return true;
+}
+
+static void ds41_workspace_lend(ds41_workspace *ws, ds41_gpu_graph *g) {
+    ds41_graph_lend_transients(g, &ws->shape);
+    g->workspace = ws;
+    ws->users++;
+}
+
+/* Move `g`'s transients into a new workspace that lends them back to `g`. */
+static ds41_workspace *ds41_workspace_adopt(ds41_gpu_graph *g) {
+    if (!g || g->workspace) return NULL;
+    ds41_workspace *ws = calloc(1, sizeof(*ws));
+    if (!ws) return NULL;
+    ws->shape.ctx = g->ctx;
+    ws->shape.prefill_cap = g->prefill_cap;
+    ws->shape.carry_cap = g->carry_cap;
+    ws->shape.prefill_alias = g->prefill_alias;
+    ws->shape.compact_carry = g->compact_carry;
+    ds41_graph_lend_transients(&ws->shape, g);
+    ws->bytes = ds41_graph_shared_bytes(g->ctx);
+    ws->users = 1;
+    g->workspace = ws;
+    g->allocation_bytes -= ws->bytes;
+    return ws;
+}
+
+/* `ws`, when given, must fit `ctx` (ds41_workspace_fits) and lends the
+ * transients; allocation_bytes then charges only the per-session part. */
 static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model *m,
                                               const ds4_weights *w, const char *path,
-                                              uint32_t ctx, bool streaming) {
+                                              uint32_t ctx, bool streaming,
+                                              ds41_workspace *ws) {
     memset(g, 0, sizeof(*g));
     g->table[0].fd = g->table[1].fd = -1;
     if (!ctx || ctx > 1048576 || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41) return false;
@@ -41168,15 +41385,16 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     g->carry_cap = ds41_carry_cap(ctx);
     g->compact_carry = !getenv("DS4_METAL_DISABLE_V41_COMPACT_CARRY");
     g->prefill_alias = !getenv("DS4_METAL_DISABLE_V41_PREFILL_ALIAS");
-    g->allocation_bytes = ds41_graph_bytes(ctx);
+    if (ws && !ds41_workspace_fits(ws, ctx)) return false;
+    g->allocation_bytes = ws ? ds41_graph_session_bytes(ctx) : ds41_graph_bytes(ctx);
+    g->workspace_owner = g;
     g->streaming = streaming;
     g->tp_world = 1;
     g->token_map = malloc((size_t)DS4_N_VOCAB * sizeof(uint32_t));
     g->prefill_ids = malloc((size_t)(g->carry_cap ? g->carry_cap : g->prefill_cap) *
                             sizeof(*g->prefill_ids));
-    g->rows_view = calloc(g->prefill_cap, sizeof(*g->rows_view));
     g->prefill_tokens = ds4_gpu_tensor_alloc((uint64_t)g->prefill_cap * sizeof(int32_t));
-    if (!g->token_map || !g->prefill_ids || !g->rows_view || !g->prefill_tokens) goto fail;
+    if (!g->token_map || !g->prefill_ids || !g->prefill_tokens) goto fail;
     g->engram.token_map = g->token_map;
     g->engram.vocab_size = DS4_N_VOCAB;
     g->engram.compressed_vocab_size = required_u32(m, "deepseek41.engram.compressed_vocab_size");
@@ -41218,65 +41436,27 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
         if (!g->compressed[i] || !g->index_cache[i] || !g->previous_kv[i] || !g->previous_score[i]) goto fail;
     }
 #define DS41_ALLOC(name, count) \
-    if (!(g->name = (!strcmp(#name, "engram_prefetch") || !strcmp(#name, "image_text_mask") ? \
+    if (!(g->name = (!strcmp(#name, "image_text_mask") ? \
             ds4_gpu_tensor_alloc_managed : ds4_gpu_tensor_alloc)( \
                 (uint64_t)((count) != 0 ? (count) : 1u) * sizeof(float)))) goto fail;
-    DS41_SCRATCH(DS41_ALLOC)
+    DS41_SESSION_SCRATCH(DS41_ALLOC)
 #undef DS41_ALLOC
-#define DS41_BATCH_ALLOC(name, count) \
-    if (!(g->batch.name = (!strcmp(#name, "engram_rows") || !strcmp(#name, "selected_comp") ? \
-            ds4_gpu_tensor_alloc_managed : ds4_gpu_tensor_alloc)( \
-                (uint64_t)(count) * g->prefill_cap * 4u))) goto fail;
-    DS41_PREFILL_STORAGE(DS41_BATCH_ALLOC)
-    /* Engram projection ends before HC normalization. HC normalization
-     * precedes Q projection or follows attention; routed expert outputs are
-     * produced only after attention has consumed Q. The attention output
-     * projection consumes heads/low before FFN; FFN normalization consumes x
-     * before shared-down, and the routed sum may replace the old block. */
-    if (g->prefill_alias) {
-#define DS41_BATCH_ALIAS(name, count, parent, offset) \
-        if (!(g->batch.name = ds4_gpu_tensor_view(g->batch.parent, \
-            (uint64_t)(offset) * g->prefill_cap * 4u, \
-            (uint64_t)(count) * g->prefill_cap * 4u))) goto fail;
-        DS41_BATCH_ALIAS(engram_kv, (DS4_N_HC + 1u) * DS4_N_EMBD, q, 0)
-        DS41_BATCH_ALIAS(flat_norm, DS4_N_HC * DS4_N_EMBD, q, 0)
-        DS41_BATCH_ALIAS(experts, DS4_N_EXPERT_USED * DS4_N_EMBD, q, 0)
-        DS41_BATCH_ALIAS(gate, DS4_N_EXPERT_USED * DS4_N_FF_EXP, heads, 0)
-        DS41_BATCH_ALIAS(up, DS4_N_EXPERT_USED * DS4_N_FF_EXP, heads,
-                         DS4_N_EXPERT_USED * DS4_N_FF_EXP)
-        DS41_BATCH_ALIAS(shared_gate, DS4_N_FF_EXP, low, 0)
-        DS41_BATCH_ALIAS(shared_up, DS4_N_FF_EXP, low, DS4_N_FF_EXP)
-        DS41_BATCH_ALIAS(shared_mid, DS4_N_FF_EXP, low, 2u * DS4_N_FF_EXP)
-        DS41_BATCH_ALIAS(shared, DS4_N_EMBD, x, 0)
-        DS41_BATCH_ALIAS(routed, DS4_N_EMBD, block, 0)
-#undef DS41_BATCH_ALIAS
-    } else { DS41_PREFILL_ALIASES(DS41_BATCH_ALLOC) }
-#undef DS41_BATCH_ALLOC
-#define DS41_BATCH_VIEW(name, count) \
-    for (uint32_t i = 0; i < g->prefill_cap; i++) \
-        if (!(g->rows_view[i].name = ds4_gpu_tensor_view(g->batch.name, \
-                (uint64_t)i * (count) * 4u, (uint64_t)(count) * 4u))) goto fail;
-    DS41_PREFILL_ROWS(DS41_BATCH_VIEW)
-#undef DS41_BATCH_VIEW
-    if (!ds4_gpu_tensor_fill_f32(g->batch.block_mask, 0,
-        (uint64_t)g->prefill_cap * ((g->ctx + 7u) / 8u))) goto fail;
-#define DS41_CARRY_ALLOC(name, count, format) \
-    if (g->carry_cap && !(g->carry.name = ds4_gpu_tensor_alloc( \
-            (uint64_t)ds41_carry_words(count, format, g->compact_carry) * g->carry_cap * sizeof(float)))) goto fail;
-    DS41_CARRY_ROWS(DS41_CARRY_ALLOC)
-#undef DS41_CARRY_ALLOC
+    if (ws) ds41_workspace_lend(ws, g);
+    else if (!ds41_graph_alloc_transients(g)) goto fail;
 #ifndef __APPLE__
     g->engram_reader = ds4_engram_reader_create();
 #endif
     ds41_graph_reset(g);
-    fprintf(stderr, "ds4: V4.1 static context buffers %.2f MiB (ctx=%u), Engram disk-only\n",
-            (double)ds41_graph_bytes(ctx) / 1048576.0, ctx);
+    fprintf(stderr, "ds4: V4.1 static context buffers %.2f MiB (ctx=%u%s), Engram disk-only\n",
+            (double)g->allocation_bytes / 1048576.0, ctx, ws ? ", shared workspace lent" : "");
     return true;
 fail:
     ds41_graph_free(g);
     return false;
 }
 #undef DS41_SCRATCH
+#undef DS41_SESSION_SCRATCH
+#undef DS41_SHARED_SCRATCH
 
 static bool ds41_bf16(ds4_gpu_tensor *x, uint32_t width) {
     return ds4_gpu_dsv41_quantize(x, width, 1, DS4_V41_BF16) != 0;
@@ -42403,8 +42583,8 @@ static bool ds41_decode_overlap_enabled(void) {
 #endif
 }
 
-static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
-                                             const ds4_weights *w, int token, float *logits) {
+static bool ds41_graph_step_body(ds41_gpu_graph *g, const ds4_model *m,
+                                 const ds4_weights *w, int token, float *logits) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
     uint32_t ids[2][DS4_ENGRAM_COLS];
     ds4_engram_history next_history = g->history;
@@ -42497,6 +42677,17 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     g->history = next_history;
     g->pos++;
     return true;
+}
+
+static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
+                                             const ds4_weights *w, int token, float *logits) {
+    if (!ds41_workspace_enter(g, "decode step")) {
+        if (g) g->valid = false;
+        return false;
+    }
+    const bool ok = ds41_graph_step_body(g, m, w, token, logits);
+    ds41_workspace_leave(g);
+    return ok;
 }
 
 /* Seed from the current mapped layer, avoiding a second disk pass. Recent
@@ -43180,13 +43371,24 @@ static bool ds41_graph_prefill_sweep_body(ds41_gpu_graph *g, const ds4_model *m,
 #define DS41_PREFILL_BODY_RUN ds41_graph_prefill_sweep_body
 #endif
 /* Ordinary callers use the surviving batch prefill body. */
+/* An encoder-only sweep leaves the carry live for the resuming sweep of the
+ * same prefix call; the workspace keeps it reserved until then. */
 static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                               const ds4_weights *w, const int *tokens, uint32_t count,
                               ds4_session_progress_fn progress, void *progress_ud,
                               int total, ds4_session_cancel_fn cancel, void *cancel_ud,
                               bool encoder_only, bool resume_encoder) {
-    return DS41_PREFILL_BODY_RUN(g, m, w, tokens, count, progress, progress_ud,
+    ds41_workspace *ws = g ? g->workspace : NULL;
+    if (resume_encoder && ws && !(ws->carry_pending && ws->owner == g->workspace_owner)) {
+        fprintf(stderr, "ds4: V4.1 shared workspace lost the deferred decoder carry\n");
+        return false;
+    }
+    if (!ds41_workspace_enter(g, "prefill sweep")) return false;
+    const bool ok = DS41_PREFILL_BODY_RUN(g, m, w, tokens, count, progress, progress_ud,
         total, cancel, cancel_ud, encoder_only, resume_encoder);
+    if (ws) ws->carry_pending = ok && encoder_only;
+    ds41_workspace_leave(g);
+    return ok;
 }
 static bool ds41_graph_prefill(ds41_gpu_graph *g, const ds4_model *m,
                               const ds4_weights *w, const int *tokens, uint32_t count,
@@ -43264,6 +43466,10 @@ static uint32_t ds41_verify_flush_layers(void) {
     return n < 1 ? 1u : n > 64 ? 64u : (uint32_t)n;
 }
 
+static bool ds41_graph_step_batch_body(ds41_gpu_graph *const *graphs, const int *tokens, int count,
+                                       uint32_t prefill_rows,
+                                       const ds4_model *model, const ds4_weights *weights,
+                                       ds41_gpu_graph *g);
 static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *tokens, int count,
                                    uint32_t prefill_rows,
                                    const ds4_model *model, const ds4_weights *weights) {
@@ -43277,6 +43483,17 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
      * Attention and Engram history remain private to each session. */
     ds41_gpu_graph *g = ds41_batch_workspace(graphs, count);
     if (!g) return false;
+    if (!ds41_workspace_enter(g, "batched step")) return false;
+    const bool ok = ds41_graph_step_batch_body(graphs, tokens, count, prefill_rows,
+        model, weights, g);
+    ds41_workspace_leave(g);
+    return ok;
+}
+
+static bool ds41_graph_step_batch_body(ds41_gpu_graph *const *graphs, const int *tokens, int count,
+                                       uint32_t prefill_rows,
+                                       const ds4_model *model, const ds4_weights *weights,
+                                       ds41_gpu_graph *g) {
     const uint32_t rows = (uint32_t)count;
     const bool prefill_only = prefill_rows == rows && !g->verify_prefix;
     const bool shared_owner = g->tp_world == 2 &&
@@ -43578,7 +43795,10 @@ typedef enum {
 
 struct ds4_engine {
     char *model_path;
-    uint64_t ds41_session_bytes;
+    uint64_t ds41_session_bytes;  /* includes ds41_workspace->bytes once */
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    ds41_workspace *ds41_workspace;
+#endif
     ds4_model model;
     ds4_model mtp_model;
     ds4_model vision_model;
@@ -43726,6 +43946,26 @@ static uint64_t ds4_engine_streaming_transient_guard_bytes(
     return total;
 }
 
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+/* Sessions share one ds41_workspace when the engine shares session prefill
+ * workspaces (batched server, TP excluded) on Metal.
+ * DS4_V41_SHARED_WORKSPACE=0 keeps private transients per session; =1 shares
+ * them without the server flag (single-session checks). */
+static bool ds41_shared_workspace_enabled(const ds4_engine *e) {
+    const char *v = getenv("DS4_V41_SHARED_WORKSPACE");
+    const bool want = v && !strcmp(v, "1") ? true :
+        v && !strcmp(v, "0") ? false : e->share_session_prefill_workspace;
+    return want && e->backend == DS4_BACKEND_METAL && !e->tp.active;
+}
+
+/* Graph bytes planned for `sessions` sessions of `ctx` positions. */
+static uint64_t ds41_planned_graph_bytes(const ds4_engine *e, uint32_t ctx, uint32_t sessions) {
+    if (!ds41_shared_workspace_enabled(e)) return ds4_mul_sat_u64(ds41_graph_bytes(ctx), sessions);
+    return ds4_add_sat_u64(ds4_mul_sat_u64(ds41_graph_session_bytes(ctx), sessions),
+                           ds41_graph_shared_bytes(ctx));
+}
+#endif
+
 static void ds4_engine_print_startup_memory(
         const ds4_engine *e,
         int               ctx_size) {
@@ -43833,6 +44073,26 @@ static void ds4_engine_print_startup_memory(
             bright_green,
             ds4_bytes_to_gib(total),
             reset);
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && ds4_backend_uses_graph(e->backend)) {
+        const uint32_t ctx = (uint32_t)ctx_size;
+        const uint32_t sessions = e->placement_session_count_hint > 0 ?
+            (uint32_t)e->placement_session_count_hint : 1u;
+        fprintf(stderr,
+                "%sds4: V4.1 graph: per session %.2f GiB + call transients %.2f GiB (%s); "
+                "%u session(s) plan %.2f GiB of graph (unshared %.2f); "
+                "recommended working set %.2f GiB%s\n",
+                green,
+                ds4_bytes_to_gib(ds41_graph_session_bytes(ctx)),
+                ds4_bytes_to_gib(ds41_graph_shared_bytes(ctx)),
+                ds41_shared_workspace_enabled(e) ? "shared once" : "per session",
+                sessions,
+                ds4_bytes_to_gib(ds41_planned_graph_bytes(e, ctx, sessions)),
+                ds4_bytes_to_gib(ds4_mul_sat_u64(ds41_graph_bytes(ctx), sessions)),
+                ds4_bytes_to_gib(ds4_gpu_recommended_working_set_size()),
+                reset);
+    }
+#endif
 
     fprintf(stderr,
             "%sds4: memory detail: ctx=%d prefill_cap=%u raw_kv_rows=%u "
@@ -65632,7 +65892,7 @@ static int ds4_engine_collect_sequential_imatrix(
             !ds41_memory_admit(e, ds4_add_sat_u64(e->ds41_session_bytes,
                 ds41_graph_bytes((uint32_t)ctx_size)), false) ||
             !ds41_graph_alloc(&d, &e->model, &e->weights, e->model_path,
-                              (uint32_t)ctx_size, e->ssd_streaming)) return 1;
+                              (uint32_t)ctx_size, e->ssd_streaming, NULL)) return 1;
     } else
 #endif
     if (!glm_graph_alloc(&g, &e->model, &e->weights, ctx_size,
@@ -72200,6 +72460,15 @@ static bool engine_warm_full_model(const ds4_engine_options *opt) {
 }
 
 #ifdef DS4_HAS_DEEPSEEK41_GPU
+/* Resident weights V4.1 admission charges besides the graphs. */
+static bool ds41_memory_weights(const ds4_engine *e, uint64_t *out) {
+    uint64_t weights = g_tp_shard_model_bytes ? g_tp_shard_model_bytes : e->model.size;
+    if (e->ssd_streaming && !weights_streaming_non_routed_bytes(&e->weights, &weights)) return false;
+    weights = ds4_add_sat_u64(weights, e->vision_model.size);
+    *out = ds4_add_sat_u64(weights, e->mtp_model.size);
+    return true;
+}
+
 static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
                                       bool fit_cache, uint64_t host,
                                       uint64_t recommended) {
@@ -72210,10 +72479,8 @@ static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
         return false;
     }
     if (budget > recommended) budget = recommended;
-    uint64_t weights = g_tp_shard_model_bytes ? g_tp_shard_model_bytes : e->model.size;
-    if (e->ssd_streaming && !weights_streaming_non_routed_bytes(&e->weights, &weights)) return false;
-    weights = ds4_add_sat_u64(weights, e->vision_model.size);
-    weights = ds4_add_sat_u64(weights, e->mtp_model.size);
+    uint64_t weights = 0;
+    if (!ds41_memory_weights(e, &weights)) return false;
     if (e->dspark) graph_bytes = ds4_add_sat_u64(graph_bytes,
         ds4_mul_sat_u64(UINT64_C(64) << 20, engine_placement_session_count(e)));
     const uint64_t fixed = ds4_add_sat_u64(weights,
@@ -72938,11 +73205,20 @@ static int ds4_engine_open_internal(ds4_engine **out,
         const uint32_t ctx = opt->context_size > 0 ? (uint32_t)opt->context_size : 4096;
         const uint32_t sessions = e->placement_session_count_hint > 0 ?
             (uint32_t)e->placement_session_count_hint : 1;
-        if (!ds41_memory_admit(e, ds4_mul_sat_u64(ds41_graph_bytes(ctx), sessions), true)) {
+        if (!ds41_memory_admit(e, ds41_planned_graph_bytes(e, ctx, sessions), true)) {
             ds4_engine_close(e);
             *out = NULL;
             return 1;
         }
+        uint64_t weights = 0;
+        if (ds41_memory_weights(e, &weights))
+            fprintf(stderr, "ds4: V4.1 admission plan: %u session(s) at ctx=%u: weights %.2f GiB + "
+                    "graph %.2f GiB (%s) = %.2f GiB before runtime headroom; working set %.2f GiB\n",
+                    sessions, ctx, ds4_bytes_to_gib(weights),
+                    ds4_bytes_to_gib(ds41_planned_graph_bytes(e, ctx, sessions)),
+                    ds41_shared_workspace_enabled(e) ? "shared transients" : "private transients",
+                    ds4_bytes_to_gib(ds4_add_sat_u64(weights, ds41_planned_graph_bytes(e, ctx, sessions))),
+                    ds4_bytes_to_gib(ds4_gpu_recommended_working_set_size()));
         if (engine_warm_full_model(opt)) model_warm_weights(&e->model);
     }
 #endif
@@ -73429,7 +73705,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             const uint32_t ctx = opt->context_size > 0 ? (uint32_t)opt->context_size : 4096;
             const uint32_t sessions = e->placement_session_count_hint > 0 ?
                 (uint32_t)e->placement_session_count_hint : 1;
-            if (!ds41_memory_admit(e, ds4_mul_sat_u64(ds41_graph_bytes(ctx), sessions), true)) {
+            if (!ds41_memory_admit(e, ds41_planned_graph_bytes(e, ctx, sessions), true)) {
                 ds4_engine_close(e);
                 *out = NULL;
                 return 1;
@@ -74903,6 +75179,13 @@ void ds4_engine_close(ds4_engine *e) {
     if (e->vision_model.map) model_close(&e->vision_model);
     model_close(&e->model);
 #ifndef DS4_NO_GPU
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    if (e->ds41_workspace) {
+        e->ds41_session_bytes -= e->ds41_workspace->bytes;
+        ds41_workspace_free(e->ds41_workspace);
+        e->ds41_workspace = NULL;
+    }
+#endif
 #ifdef DS4_HAS_QWEN4_GPU
     qwen4_state_pool_free(e);
     if (e->qwen4_shared_workspace) {
@@ -75104,13 +75387,30 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->scr_planner_budget_ms = 5000u;
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        /* Sessions of one shape borrow the engine workspace; the first one
+         * allocates it and hands it over. A differently shaped session
+         * replaces an idle workspace and stays private otherwise. */
+        const bool share = ds41_shared_workspace_enabled(e);
+        if (share && e->ds41_workspace && !e->ds41_workspace->users &&
+            !ds41_workspace_fits(e->ds41_workspace, (uint32_t)ctx_size)) {
+            e->ds41_session_bytes -= e->ds41_workspace->bytes;
+            ds41_workspace_free(e->ds41_workspace);
+            e->ds41_workspace = NULL;
+        }
+        ds41_workspace *lend = share && ds41_workspace_fits(e->ds41_workspace, (uint32_t)ctx_size) ?
+            e->ds41_workspace : NULL;
         if (ctx_size > 1048576 ||
-            !ds41_memory_admit(e, ds4_add_sat_u64(e->ds41_session_bytes,
+            !ds41_memory_admit(e, ds4_add_sat_u64(e->ds41_session_bytes, lend ?
+                ds41_graph_session_bytes((uint32_t)ctx_size) :
                 ds41_graph_bytes((uint32_t)ctx_size)), false) ||
             !ds41_graph_alloc(&s->ds41_graph, &e->model, &e->weights,
-                              e->model_path, (uint32_t)ctx_size, e->ssd_streaming)) {
+                              e->model_path, (uint32_t)ctx_size, e->ssd_streaming, lend)) {
             free(s);
             return 1;
+        }
+        if (share && !lend && !e->ds41_workspace) {
+            e->ds41_workspace = ds41_workspace_adopt(&s->ds41_graph);
+            if (e->ds41_workspace) e->ds41_session_bytes += e->ds41_workspace->bytes;
         }
         s->ds41_graph_ready = true;
         s->ds41_graph.quality = e->quality;

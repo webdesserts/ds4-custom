@@ -42,7 +42,7 @@ done
 # Engine ownership fixtures: ds4.c is included textually, GPU calls hit host storage.
 for name in test_scr_append test_scr_rebase_owned test_scr_rebase_failures test_scr_dispose \
             test_capture_chunks test_scr_actual_planner test_scr_upstream_fences test_scr_public_batch_admission \
-            test_scr_encoder_residency test_scr_checkpoint_pool; do
+            test_scr_encoder_residency test_scr_checkpoint_pool test_v41_shared_workspace; do
     run "$name" "tests/$name.c" $HOST $ENGINE_AUX "$PLANNER_LIB"
 done
 # Serving: CLI, HTTP worker behaviour and ds4.reuse.v1 telemetry.

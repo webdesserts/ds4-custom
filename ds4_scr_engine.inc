@@ -2492,6 +2492,8 @@ static int ds41_session_prefix(ds4_session *s, const ds4_tokens *prompt,
         prompt = &owned;
     }
     int rc = ds41_session_prefix_impl(s, prompt, private_fresh, frontier, err, errlen);
+    /* A deferred decoder never outlives its prefix call. */
+    ds41_workspace_abandon(&s->ds41_graph);
     free(copy);
     return rc;
 }
