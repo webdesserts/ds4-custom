@@ -108,6 +108,41 @@ static void same_session_edit(const int *a1, int *a2) {
     harness_session_close(&s);
 }
 
+/* A follow-up diverging within 128 tokens of the live transcript's end (an
+ * edited last turn) is not a continuation. With a sealed archive the planner
+ * covers the shared prefix; DS4_SCR_SHORT_FOLLOWUP_FULL=1 keeps the old
+ * fresh route, which recomputes the prompt from token 0. */
+static void short_followup(const int *a1, bool full) {
+    static ds4_engine e; static ds4_session s;
+    harness_session_open(&e, &s, CTX, 512u);
+    static int f[BASE];
+    const uint32_t keep = BASE - 60u, n = keep + 40u;
+    memcpy(f, a1, keep * sizeof(int));
+    for (uint32_t i = 0; i < 40u; ++i) f[keep + i] = 97000 + (int)i;
+    ds4_tokens first = {.v = (int *)a1, .len = (int)BASE, .cap = (int)BASE};
+    ds4_tokens follow = {.v = f, .len = (int)n, .cap = (int)n};
+    ds4_scr_logical_receipt r; char err[256] = {0};
+    controls(a1);
+    CHECK(!ds4_session_scr_logical_policy(&s, &first, CAP, 32u, 201, &r, err, sizeof(err)));
+    CHECK(r.execution.route == DS4_SCR_DENSE_REFRESH);
+    if (full) setenv("DS4_SCR_SHORT_FOLLOWUP_FULL", "1", 1);
+    controls(f);
+    int rc = ds4_session_scr_logical_policy(&s, &follow, CAP, 32u, 201, &r, err, sizeof(err));
+    unsetenv("DS4_SCR_SHORT_FOLLOWUP_FULL");
+    if (rc) fprintf(stderr, "short follow-up: %s\n", err);
+    CHECK(!rc && r.published && s.checkpoint.len == (int)n && !memcmp(s.checkpoint.v, f, (size_t)n * sizeof(int)));
+    if (full) {
+        CHECK(r.execution.route == DS4_SCR_DENSE_FRESH && r.execution.reason == DS4_SCR_DENSE_CUTOFF &&
+              !r.execution.multi.committed_tokens && r.execution.multi.fresh_completed == n);
+    } else {
+        CHECK(r.execution.route == DS4_SCR_DENSE_REUSE && r.execution.multi.committed_tokens >= 1200u &&
+              r.execution.multi.fresh_completed + r.execution.multi.committed_tokens <= n + 8u);
+        printf("short follow-up: %u of %u tokens from the archive, %u fresh\n",
+               r.execution.multi.committed_tokens, n, r.execution.multi.fresh_completed);
+    }
+    harness_session_close(&s);
+}
+
 /* Two live sessions share one pool. Saving B must not make A's own saved
  * state look cold to A: A's edit is scored against its live archive, its own
  * entry is no candidate and nothing is restored or rewritten. */
@@ -235,7 +270,9 @@ int main(void) {
     harness_session_close(&sb);
     same_session_edit(a1, a2);
     two_sessions(a1, a2, b1);
+    short_followup(a1, false);
+    short_followup(a1, true);
     ds4_gpu_tensor_free(rows); ds4_gpu_tensor_free(indices);
-    puts("SCR checkpoint pool: cross-restart reuse, branch fan-out, roundtrip, budget, same-session shared prefix, two sessions (host storage, simulated rows)");
+    puts("SCR checkpoint pool: cross-restart reuse, branch fan-out, roundtrip, budget, same-session shared prefix, two sessions, short follow-up (host storage, simulated rows)");
     return 0;
 }
