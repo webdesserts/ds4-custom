@@ -86862,6 +86862,46 @@ static void ds41_spec_trace_write(FILE *f, uint32_t pos, int first_token, const 
     fflush(f);
 }
 
+/* V4.1 drafting on Metal stops by an expected-gain rule unless a confidence
+ * threshold was set explicitly: keep drafting while P(every draft so far is accepted)
+ * exceeds the marginal verify cost of one more row valued at
+ * DS4_DSPARK_GAIN tok/s (default 65; 0 restores the threshold). The
+ * probability table (sigmoid confidence decile -> acceptance given the
+ * earlier rows were accepted) and the marginal costs were fitted with
+ * dspark-policy-sim on M-series Metal traces of six prompts at 384 tokens.
+ * Only the verify width changes, so greedy output is unchanged. Returns the
+ * value in tokens/ms, or 0 for the threshold rule. */
+static float ds41_spec_gain_value(const ds4_engine *e) {
+    static bool read;
+    static float env = -1; /* < 0: unset */
+    if (!read) {
+        read = true;
+        const char *v = getenv("DS4_DSPARK_GAIN");
+        if (v && v[0]) {
+            env = strtof(v, NULL);
+            if (!(env > 0)) env = 0;
+        }
+    }
+    if (env >= 0) return env / 1000.0f;
+    return e->backend != DS4_BACKEND_METAL || e->dspark_confidence_threshold_set ?
+        0.0f : 65.0f / 1000.0f;
+}
+
+static bool ds41_spec_gain_continue(float value, uint32_t row, float confidence, float *survive) {
+    static const float accept[10] = {
+        0.0500f, 0.0605f, 0.3206f, 0.3053f, 0.4847f,
+        0.5770f, 0.6446f, 0.7688f, 0.9096f, 0.9937f,
+    };
+    /* ms added by verifying draft row+1 instead of row drafts (row 0: the
+     * 2-row verify instead of a single-token decode). */
+    static const float marginal_ms[DS41_DRAFT_ROWS] = {8.28f, 6.84f, 7.18f, 8.83f, 10.48f};
+    int bucket = (int)(confidence * 10.0f);
+    if (!(bucket >= 0)) bucket = 0;
+    if (bucket > 9) bucket = 9;
+    *survive *= accept[bucket];
+    return *survive > value * marginal_ms[row < DS41_DRAFT_ROWS ? row : DS41_DRAFT_ROWS - 1];
+}
+
 static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int eos,
         bool ignore_eos, ds4_think_mode think_mode, float temperature, int top_k,
         float top_p, float min_p, uint64_t *rng, int *accepted, char *err, size_t errlen) {
@@ -86895,6 +86935,9 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
     FILE *const trace = ds41_spec_trace_file();
     const bool trace_full = trace && ds41_spec_trace_full();
     ds41_spec_trace tr = {0};
+    /* The acceptance table is for argmax drafts; exact sampling keeps the threshold. */
+    const float gain_value = exact ? 0.0f : ds41_spec_gain_value(e);
+    float gain_survive = 1.0f;
     const double started = now_sec();
     if (!ds41_session_draft(s, first_token))
         goto fail;
@@ -86911,8 +86954,11 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
             tr.markov_ms[row] = (now_sec() - markov0) * 1000;
             tr.confidence[row] = sigmoid_stable(confidence);
         }
-        if (e->dspark_confidence_threshold > 0 && !trace_full &&
-            sigmoid_stable(confidence) < e->dspark_confidence_threshold) break;
+        const float p = sigmoid_stable(confidence);
+        const bool stop = gain_value > 0 ?
+            !ds41_spec_gain_continue(gain_value, row, p, &gain_survive) :
+            e->dspark_confidence_threshold > 0 && p < e->dspark_confidence_threshold;
+        if (stop && !trace_full) break;
         const float *qlogits = d->host_logits + (uint64_t)row * DS4_N_VOCAB;
         if (exact) {
             float *q = d->draft_probs + (uint64_t)row * DS4_N_VOCAB;
