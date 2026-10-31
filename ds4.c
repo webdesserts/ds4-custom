@@ -86817,6 +86817,51 @@ int ds4_test_ds41_verify_tokens(ds4_session *s, const int *tokens, int count,
     return 0;
 }
 #endif
+/* DS4_DSPARK_TRACE=FILE appends one JSON line per V4.1 DSpark cycle for
+ * offline policy work: drafted tokens with sigmoid confidence and Markov
+ * time, draft/verify/decode times and the target argmax of every verified
+ * row. DS4_DSPARK_TRACE_FULL=1 also ignores the confidence threshold so each
+ * cycle drafts and verifies the full cap (greedy output is unchanged). */
+typedef struct {
+    double markov_ms[DS41_VERIFY_ROWS];
+    float confidence[DS41_VERIFY_ROWS];
+} ds41_spec_trace;
+
+static FILE *ds41_spec_trace_file(void) {
+    static FILE *f;
+    static bool opened;
+    if (!opened) {
+        opened = true;
+        const char *path = getenv("DS4_DSPARK_TRACE");
+        if (path && path[0]) f = fopen(path, "a");
+    }
+    return f;
+}
+
+static bool ds41_spec_trace_full(void) {
+    const char *v = getenv("DS4_DSPARK_TRACE_FULL");
+    return v && strcmp(v, "0") != 0;
+}
+
+static void ds41_spec_trace_write(FILE *f, uint32_t pos, int first_token, const int *tokens,
+        uint32_t count, const ds41_spec_trace *t, double draft_ms, double verify_ms,
+        double verify_gpu_ms, double decode_ms, const float *verified, uint32_t keep, int correction) {
+    fprintf(f, "{\"pos\":%u,\"first\":%d,\"draft_ms\":%.4f,\"rows\":[", pos, first_token, draft_ms);
+    for (uint32_t i = 1; i < count; i++)
+        fprintf(f, "%s{\"tok\":%d,\"conf\":%.6f,\"markov_ms\":%.4f}", i > 1 ? "," : "",
+                tokens[i], t->confidence[i - 1], t->markov_ms[i - 1]);
+    /* The row that stopped drafting (tok -1) still costs its Markov step. */
+    if (count < DS41_VERIFY_ROWS && t->markov_ms[count - 1] > 0)
+        fprintf(f, "%s{\"tok\":-1,\"conf\":%.6f,\"markov_ms\":%.4f}", count > 1 ? "," : "",
+                t->confidence[count - 1], t->markov_ms[count - 1]);
+    fprintf(f, "],\"width\":%u,\"verify_ms\":%.4f,\"verify_gpu_ms\":%.4f,\"decode_ms\":%.4f,\"target\":[",
+            count > 1 ? count : 0, verify_ms, verify_gpu_ms, decode_ms);
+    for (uint32_t i = 0; verified && i < count; i++)
+        fprintf(f, "%s%d", i ? "," : "", sample_argmax(verified + (uint64_t)i * DS4_N_VOCAB, DS4_N_VOCAB));
+    fprintf(f, "],\"accepted\":%u,\"correction\":%d}\n", keep, correction);
+    fflush(f);
+}
+
 static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int eos,
         bool ignore_eos, ds4_think_mode think_mode, float temperature, int top_k,
         float top_p, float min_p, uint64_t *rng, int *accepted, char *err, size_t errlen) {
@@ -86847,17 +86892,26 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         return 1;
     }
     const bool exact = temperature > 0 && e->dspark_exact_sampling;
+    FILE *const trace = ds41_spec_trace_file();
+    const bool trace_full = trace && ds41_spec_trace_full();
+    ds41_spec_trace tr = {0};
     const double started = now_sec();
     if (!ds41_session_draft(s, first_token))
         goto fail;
+    const double drafted = now_sec();
     int tokens[DS41_VERIFY_ROWS] = {first_token};
     uint32_t count = 1;
     ds41_stage("draft.markov");
     for (; count < (uint32_t)cap; count++) {
         const uint32_t row = count - 1u;
         float confidence;
+        const double markov0 = trace ? now_sec() : 0;
         if (!ds41_dspark_markov(d, &e->mtp_model, row, tokens[row], &confidence)) goto fail;
-        if (e->dspark_confidence_threshold > 0 &&
+        if (trace) {
+            tr.markov_ms[row] = (now_sec() - markov0) * 1000;
+            tr.confidence[row] = sigmoid_stable(confidence);
+        }
+        if (e->dspark_confidence_threshold > 0 && !trace_full &&
             sigmoid_stable(confidence) < e->dspark_confidence_threshold) break;
         const float *qlogits = d->host_logits + (uint64_t)row * DS4_N_VOCAB;
         if (exact) {
@@ -86870,17 +86924,21 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         if (tokens[count] == eos) { count++; break; }
     }
     if (count == 1) {
-        const double drafted = now_sec();
+        const double proposed1 = now_sec();
         if (stats) {
             s->dspark_stats.no_draft++;
-            s->dspark_stats.propose_ms += (drafted - started) * 1000;
+            s->dspark_stats.propose_ms += (proposed1 - started) * 1000;
         }
+        const uint32_t pos1 = g->pos;
         ds41_stage("decode1");
         if (ds4_session_eval(s, first_token, err, errlen)) return -1;
         accepted[0] = first_token;
+        const double decoded = now_sec();
         if (getenv("DS4_DSPARK_SPEC_LOG")) fprintf(stderr,
             "ds4: V4.1 DSpark single draft=%.3f ms decode=%.3f ms\n",
-            (drafted - started) * 1000, (now_sec() - drafted) * 1000);
+            (proposed1 - started) * 1000, (decoded - proposed1) * 1000);
+        if (trace) ds41_spec_trace_write(trace, pos1, first_token, tokens, 1, &tr,
+            (drafted - started) * 1000, 0, 0, (decoded - proposed1) * 1000, NULL, 1, -1);
         return 1;
     }
     if (ds4_session_cancelled(s)) {
@@ -86893,7 +86951,9 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         s->dspark_stats.proposed_tokens += count - 1u;
         ds4_dspark_stats_note_len(s->dspark_stats.draft_len_hist, count - 1u);
     }
+    const uint32_t pos0 = g->pos;
     if (!ds41_session_verify(s, tokens, count)) goto fail;
+    const double verified_at = now_sec();
     uint32_t keep = 1;
     int correction = -1;
     for (; keep < count; keep++) {
@@ -86935,6 +86995,9 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
          * are already saved. Earlier verified prefixes remain rewindable. */
         d->rewind_end = g->pos;
     }
+    if (trace) ds41_spec_trace_write(trace, pos0, first_token, tokens, count, &tr,
+        (drafted - started) * 1000, (now_sec() - proposed) * 1000,
+        (verified_at - proposed) * 1000, 0, d->host_verified, accepted_drafts + 1u, correction);
     if (getenv("DS4_DSPARK_SPEC_LOG")) fprintf(stderr,
         "ds4: V4.1 DSpark proposed=%u accepted=%u draft=%.3f ms verify=%.3f ms\n",
         count - 1u, accepted_drafts, (proposed - started) * 1000, (now_sec() - proposed) * 1000);
