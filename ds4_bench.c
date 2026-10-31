@@ -993,6 +993,11 @@ int main(int argc, char **argv) {
                 }
             }
             fprintf(stderr, "\"\n");
+            /* Token IDs make run-to-run parity checks exact. */
+            fprintf(stderr, "ds4-bench: gen[ctx=%d] token ids:", frontier);
+            for (int i = 0; i < gen_token_count; i++)
+                fprintf(stderr, " %d", gen_token_buf[i]);
+            fprintf(stderr, "\n");
             fflush(stderr);
         }
         free(gen_token_buf);
