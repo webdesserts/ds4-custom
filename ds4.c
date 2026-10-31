@@ -41604,32 +41604,57 @@ static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
         ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm);
 }
 
-static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
-                           const ds4_layer_weights *l, uint32_t il, bool projected) {
+/* The position-dependent middle of decode attention: publish the roped,
+ * quantized KV row into the window, select compressed rows and attend. The
+ * window write must stay in row order: a later row's write at pos % 128
+ * replaces the oldest entry, which every earlier row still attends to. */
+static bool ds41_attention_window(ds41_gpu_graph *g, const ds4_model *m,
+                                  const ds4_layer_weights *l, uint32_t il) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
     const uint32_t heads = DS4_N_HEAD / g->tp_world;
     const uint32_t head0 = g->tp_rank * heads;
-    if (!projected && !ds41_attention_project(g, m, l)) return false;
-    if (!ds41_archive_capture_window(ds41_graph_capture_archive(g), il, pos, 1, g->kv)) return false;
-    if (!ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false) ||
-        !ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, pos, false) ||
-        !ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0) ||
-        !ds4_gpu_tensor_copy(g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
+    if (!ds4_gpu_tensor_copy(g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
                              g->kv, 0, 512u * 4u) ||
         !ds41_attention_select(g, m, l, il)) return false;
     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
     if (n_comp && !ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
                                          g->selected_comp, n_comp, attended)) return false;
     const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
-    if (!ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size,
+    return ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size,
             l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float),
             g->q, g->window[il], n_raw, 128, (pos + 1u - n_raw) % 128u,
             g->selected_kv, 0, attended, NULL, 0,
-            heads, DS4_N_HEAD_DIM) ||
-        !ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) ||
-        !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)) return false;
+            heads, DS4_N_HEAD_DIM) != 0;
+}
+
+/* Row-local attention prologue (RoPE of q and KV, FP8 KV) and epilogue
+ * (BF16 and inverse RoPE of the heads) for `rows` consecutive positions from
+ * g->pos, laid out contiguously from g->q, g->kv and g->heads. Each kernel
+ * is elementwise per (row, head) with position start + row, so one dispatch
+ * computes exactly what one dispatch per row does. */
+static bool ds41_attention_prologue(ds41_gpu_graph *g, uint32_t il, uint32_t rows) {
+    const uint32_t heads = DS4_N_HEAD / g->tp_world;
+    const bool compressed = ds4_layer_compress_ratio(il) != 0;
+    return ds4_gpu_dsv41_rope(g->q, DS4_N_HEAD_DIM, heads, rows, g->pos, compressed, false) &&
+        ds4_gpu_dsv41_rope(g->kv, DS4_N_HEAD_DIM, 1, rows, g->pos, compressed, false) &&
+        ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, rows, DS4_V41_FP8_E8M0);
+}
+
+static bool ds41_attention_epilogue(ds41_gpu_graph *g, uint32_t il, uint32_t rows) {
+    const uint32_t heads = DS4_N_HEAD / g->tp_world;
+    return ds4_gpu_dsv41_quantize(g->heads, heads * DS4_N_HEAD_DIM, rows, DS4_V41_BF16) &&
+        ds4_gpu_dsv41_rope(g->heads, DS4_N_HEAD_DIM, heads, rows, g->pos,
+                           ds4_layer_compress_ratio(il) != 0, true);
+}
+
+static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
+                           const ds4_layer_weights *l, uint32_t il, bool projected) {
+    if (!projected && !ds41_attention_project(g, m, l)) return false;
+    if (!ds41_archive_capture_window(ds41_graph_capture_archive(g), il, g->pos, 1, g->kv) ||
+        !ds41_attention_prologue(g, il, 1) || !ds41_attention_window(g, m, l, il) ||
+        !ds41_attention_epilogue(g, il, 1)) return false;
     if (projected) return true;
     return ds41_attention_output(g, m, l) &&
            ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
@@ -43071,6 +43096,13 @@ static uint32_t ds41_short_prefill_count(const ds41_gpu_graph *g, const ds4_weig
 /* DS4_V41_VERIFY_OVERLAP=0 restores serial Engram reads and the layer-13
  * drain in batched steps; results are identical either way. Metal only:
  * elsewhere ds4_gpu_flush_commands synchronizes the device. */
+/* DS4_V41_VERIFY_MERGE_ROWS=0 restores one RoPE/quantize dispatch per row
+ * in batched verify attention; results are identical either way. */
+static bool ds41_verify_merge_rows_enabled(void) {
+    const char *v = getenv("DS4_V41_VERIFY_MERGE_ROWS");
+    return !v || strcmp(v, "0") != 0;
+}
+
 static bool ds41_verify_overlap_enabled(void) {
 #ifdef __APPLE__
     const char *v = getenv("DS4_V41_VERIFY_OVERLAP");
@@ -43176,6 +43208,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         active1.engram_rows = engram_rows1;
     }
     const uint32_t flush_layers = overlap ? ds41_verify_flush_layers() : 0u;
+    bool consecutive = true;
+    for (int i = 1; i < count; i++)
+        consecutive = consecutive && positions[i] == positions[0] + (uint32_t)i;
     uint32_t il = 0;
     for (; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &weights->layer[il];
@@ -43206,6 +43241,19 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             !getenv("DS4_DISABLE_V41_BATCH_OUTPUT");
 #endif
         ds41_stage("attn.rows");
+        /* With consecutive positions, the row-local prologue and epilogue run
+         * once over all rows; only the window, selection and attention stay
+         * per row and in row order. */
+        const bool merged = batch_output && consecutive && ds41_verify_merge_rows_enabled();
+        ds41_gpu_graph all = *g;
+        all.pos = positions[0];
+        all.q = active.q;
+        all.kv = active.kv;
+        all.heads = active.heads;
+        for (int i = 0; merged && ok && i < count; i++)
+            ok = ds41_archive_capture_window(ds41_graph_capture_archive(graphs[i]), il,
+                positions[i], 1, g->rows_view[i].kv);
+        if (merged && ok) ok = ds41_attention_prologue(&all, il, rows);
         for (int i = 0; ok && i < count; i++) {
             ds41_gpu_graph row = *graphs[i];
             row.pos = positions[i];
@@ -43214,9 +43262,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
 #undef DS41_SESSION_ROW
             row.q = queries[i];
             row.heads = heads[i];
-            ok = ds41_attention(&row, model, l, il, true) &&
+            ok = merged ? ds41_attention_window(&row, model, l, il) :
+                ds41_attention(&row, model, l, il, true) &&
                 (batch_output || ds41_attention_output(&row, model, l));
         }
+        if (merged && ok) ok = ds41_attention_epilogue(&all, il, rows);
         if (ok && batch_output && ds41_stage("attn.out"))
             ok = g->tp_world == 2 ?
                 ds4_gpu_dsv41_attention_output_tp_batch(active.block, active.low,

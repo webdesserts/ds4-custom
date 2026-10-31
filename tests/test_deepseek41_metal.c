@@ -1339,6 +1339,127 @@ static int check_compact_carry(void) {
 
 /* Exercise the full-head and compact TP layouts with the same causal keys.
  * Selected rows are shuffled; include masked future rows at odd frontiers. */
+/* Batched verify runs RoPE/FP8 before and BF16/inverse RoPE after the rows'
+ * window writes and attention, one dispatch over all rows. Mirror both
+ * orders and require identical bits, with the window write and attention
+ * still per row: at a full window, row r's write replaces the entry every
+ * earlier row attends to, which the hoisted-write control must expose. */
+typedef struct {
+    ds4_gpu_tensor *q, *kv, *heads, *window, *comp;
+} merge_rows_state;
+
+static int merge_rows_attend(merge_rows_state *t, const float *sinks, uint32_t row,
+                             uint32_t pos, uint32_t attended, bool write) {
+    enum { D = 512, H = 64 };
+    const uint64_t head_bytes = (uint64_t)H * D * 4;
+    ds4_gpu_tensor *q = ds4_gpu_tensor_view(t->q, row * head_bytes, head_bytes);
+    ds4_gpu_tensor *kv = ds4_gpu_tensor_view(t->kv, (uint64_t)row * D * 4, D * 4);
+    ds4_gpu_tensor *heads = ds4_gpu_tensor_view(t->heads, row * head_bytes, head_bytes);
+    const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
+    const int ok = q && kv && heads &&
+        (!write || ds4_gpu_tensor_copy(t->window, (uint64_t)(pos % 128u) * D * 4, kv, 0, D * 4)) &&
+        ds4_gpu_attention_decode_heads_tensor(heads, sinks, getpagesize(), 0, q, t->window,
+            n_raw, 128, (pos + 1u - n_raw) % 128u, t->comp, 0, attended, NULL, 0, H, D);
+    ds4_gpu_tensor_free(q);
+    ds4_gpu_tensor_free(kv);
+    ds4_gpu_tensor_free(heads);
+    return ok;
+}
+
+static int check_merge_rows(void) {
+    enum { D = 512, H = 64, W = 128, C = 64, MAX_ROWS = 7 };
+    float *sinks = NULL;
+    CHECK(posix_memalign((void **)&sinks, getpagesize(), getpagesize()) == 0);
+    for (int h = 0; h < H; h++) sinks[h] = random_value();
+    CHECK(ds4_gpu_set_model_map(sinks, getpagesize()));
+    const size_t nq = (size_t)MAX_ROWS * H * D;
+    float *q = malloc(nq * 4), *kv = malloc(MAX_ROWS * D * 4);
+    float *window = malloc(W * D * 4), *comp = malloc(C * D * 4);
+    float *expected = malloc(nq * 4), *expected_window = malloc(W * D * 4);
+    CHECK(q && kv && window && comp && expected && expected_window);
+    /* Partial window, wrap while filling, and a full ring at long context. */
+    static const uint32_t starts[] = {5, 124, 1000, 4093};
+    for (unsigned si = 0; si < sizeof(starts) / sizeof(*starts); si++) {
+        for (uint32_t rows = 1; rows <= MAX_ROWS; rows++) {
+            const uint32_t pos0 = starts[si], attended = si % 2 ? C : 0;
+            const bool compressed = (rows + si) % 2 != 0;
+            for (size_t i = 0; i < nq; i++) q[i] = bf16(random_value() / 4);
+            for (uint32_t i = 0; i < MAX_ROWS * D; i++) kv[i] = bf16(random_value() / 4);
+            for (uint32_t i = 0; i < W * D; i++) window[i] = bf16(random_value() / 4);
+            for (uint32_t i = 0; i < C * D; i++) comp[i] = bf16(random_value() / 4);
+            for (int variant = 0; variant < 3; variant++) {
+                merge_rows_state t = {upload(q, nq * 4), upload(kv, MAX_ROWS * D * 4),
+                    upload(NULL, nq * 4), upload(window, W * D * 4), upload(comp, C * D * 4)};
+                CHECK(t.q && t.kv && t.heads && t.window && t.comp);
+                /* Tensor copies encode only into an open batch, as in decode. */
+                CHECK(ds4_gpu_begin_commands());
+                if (variant == 0) {
+                    /* Today's per-row order. */
+                    for (uint32_t r = 0; r < rows; r++) {
+                        const uint64_t hb = (uint64_t)H * D * 4;
+                        ds4_gpu_tensor *qr = ds4_gpu_tensor_view(t.q, r * hb, hb);
+                        ds4_gpu_tensor *kr = ds4_gpu_tensor_view(t.kv, (uint64_t)r * D * 4, D * 4);
+                        ds4_gpu_tensor *hr = ds4_gpu_tensor_view(t.heads, r * hb, hb);
+                        CHECK(qr && kr && hr);
+                        CHECK(ds4_gpu_dsv41_rope(qr, D, H, 1, pos0 + r, compressed, false));
+                        CHECK(ds4_gpu_dsv41_rope(kr, D, 1, 1, pos0 + r, compressed, false));
+                        CHECK(ds4_gpu_dsv41_quantize(kr, D, 1, DS4_V41_FP8_E8M0));
+                        CHECK(merge_rows_attend(&t, sinks, r, pos0 + r, attended, true));
+                        CHECK(ds4_gpu_dsv41_quantize(hr, H * D, 1, DS4_V41_BF16));
+                        CHECK(ds4_gpu_dsv41_rope(hr, D, H, 1, pos0 + r, compressed, true));
+                        ds4_gpu_tensor_free(qr);
+                        ds4_gpu_tensor_free(kr);
+                        ds4_gpu_tensor_free(hr);
+                    }
+                } else {
+                    /* Merged prologue/epilogue; variant 2 also hoists the
+                     * window writes, which must break causality. */
+                    CHECK(ds4_gpu_dsv41_rope(t.q, D, H, rows, pos0, compressed, false));
+                    CHECK(ds4_gpu_dsv41_rope(t.kv, D, 1, rows, pos0, compressed, false));
+                    CHECK(ds4_gpu_dsv41_quantize(t.kv, D, rows, DS4_V41_FP8_E8M0));
+                    for (uint32_t r = 0; variant == 2 && r < rows; r++) {
+                        ds4_gpu_tensor *kr = ds4_gpu_tensor_view(t.kv, (uint64_t)r * D * 4, D * 4);
+                        CHECK(kr && ds4_gpu_tensor_copy(t.window,
+                            (uint64_t)((pos0 + r) % W) * D * 4, kr, 0, D * 4));
+                        ds4_gpu_tensor_free(kr);
+                    }
+                    for (uint32_t r = 0; r < rows; r++)
+                        CHECK(merge_rows_attend(&t, sinks, r, pos0 + r, attended, variant == 1));
+                    CHECK(ds4_gpu_dsv41_quantize(t.heads, H * D, rows, DS4_V41_BF16));
+                    CHECK(ds4_gpu_dsv41_rope(t.heads, D, H, rows, pos0, compressed, true));
+                }
+                CHECK(ds4_gpu_end_commands());
+                const size_t bytes = (size_t)rows * H * D * 4;
+                if (variant == 0) {
+                    CHECK(ds4_gpu_tensor_read(t.heads, 0, expected, bytes));
+                    CHECK(ds4_gpu_tensor_read(t.window, 0, expected_window, W * D * 4));
+                } else {
+                    const float *heads = ds4_gpu_tensor_contents(t.heads);
+                    const int same = !memcmp(expected, heads, bytes) &&
+                        !memcmp(expected_window, ds4_gpu_tensor_contents(t.window), W * D * 4);
+                    if (variant == 1) {
+                        if (!same) fprintf(stderr, "merge-rows mismatch pos=%u rows=%u\n", pos0, rows);
+                        CHECK(same);
+                    } else if (pos0 + 1u >= W && rows > 1) {
+                        /* Control: a hoisted write is visible to earlier rows. */
+                        CHECK(memcmp(expected, heads, bytes) != 0);
+                    }
+                }
+                ds4_gpu_tensor_free(t.q);
+                ds4_gpu_tensor_free(t.kv);
+                ds4_gpu_tensor_free(t.heads);
+                ds4_gpu_tensor_free(t.window);
+                ds4_gpu_tensor_free(t.comp);
+            }
+            fprintf(stderr, "merge-rows pos=%u rows=%u compressed=%d comp=%u: PASS\n",
+                    pos0, rows, compressed, attended);
+        }
+    }
+    free(q); free(kv); free(window); free(comp); free(expected); free(expected_window);
+    free(sinks);
+    return 1;
+}
+
 static int check_tp_attention(void) {
     enum { D = 512, H = 64, K = 512, C = 2048 };
     const struct { uint32_t rows, selected; } cases[] = {
@@ -1519,6 +1640,11 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--merge-rows")) {
+        const int ok = ds4_gpu_init() && check_merge_rows();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--index-projection")) {
         const int ok = ds4_gpu_init() && check_index_projection();
         ds4_gpu_cleanup();
@@ -1528,7 +1654,7 @@ int main(int argc, char **argv) {
     int ok = ds4_gpu_init() && check_router() && check_quantization() && check_engram() && check_rope_stride() && check_pool() &&
              check_candidates() && check_sparse_gather() && check_indexer_batch() &&
              check_embedding() && check_index_projection() && check_decode_rows(0) && check_general_topk() && check_causal_topk() && check_compact_carry() && check_attention_output(false) &&
-             check_tp_attention();
+             check_tp_attention() && check_merge_rows();
     ds4_gpu_cleanup();
     return ok ? 0 : 1;
 }
