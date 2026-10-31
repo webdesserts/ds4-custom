@@ -37,7 +37,7 @@ endif
 CARGO ?= cargo
 CARGO_JOBS ?= 2
 CACHE_REUSE_LIB ?= $(abspath adapter/cache-reuse/target/release/libds4_cache_reuse.a)
-$(CACHE_REUSE_LIB): adapter/cache-reuse/Cargo.toml adapter/cache-reuse/Cargo.lock adapter/cache-reuse/src/lib.rs
+$(CACHE_REUSE_LIB): adapter/cache-reuse/Cargo.toml adapter/cache-reuse/Cargo.lock adapter/cache-reuse/src/lib.rs adapter/cache-reuse/src/slot_router.rs
 	$(CARGO) build -j $(CARGO_JOBS) --release --locked --manifest-path adapter/cache-reuse/Cargo.toml
 
 ifneq ($(UNAME_S),Darwin)

@@ -1,5 +1,6 @@
 //! Link shell: keeps the pinned cache-reuse-utils and kv-archive-store C
-//! symbols in the static archive.
+//! symbols in the static archive, plus the server's slot router.
+pub mod slot_router;
 pub use cache_reuse_utils_ffi::{
     cache_reuse_append_unpadded, cache_reuse_clip_ranges_to_archive,
     cache_reuse_collect_separator_boundaries, cache_reuse_common_prefix,

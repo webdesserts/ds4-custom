@@ -15056,6 +15056,80 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
     return SLOT_PROTECTED_SCORE_BASE - live;
 }
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+#define SERVER_SLOT_ROUTER 1
+#include "adapter/include/slot_router.h"
+#define SERVER_ROUTE_MAX_SLOTS 64
+#define SERVER_ROUTE_MIN_MATCH 128u
+
+/* Tokens a different conversation can share with this request: everything
+ * through the first assistant marker (system prompt and first user turn). A
+ * prompt without one shares nothing by convention. */
+static uint32_t server_route_conversation_floor(server *s, const ds4_tokens *prompt) {
+    const int assistant = ds4_token_assistant(s->engine);
+    for (int i = 0; prompt && i < prompt->len; i++)
+        if (prompt->v[i] == assistant) return (uint32_t)i + 1u;
+    return 0;
+}
+
+/* Live tokens of an idle SCR slot that the request repeats, in logical
+ * coordinates (recorded pads excluded), falling back to the physical prefix. */
+static int server_route_common_prefix(server_slot *slot, const ds4_tokens *prompt) {
+    ds4_logical_comparison cmp;
+    char err[96];
+    if (!ds4_session_compare_logical(slot->session, prompt, NULL, 0, &cmp, err, sizeof(err)))
+        return cmp.common_tokens;
+    return ds4_session_common_prefix(slot->session, prompt);
+}
+
+static const char *server_route_reason(uint32_t reason) {
+    switch (reason) {
+    case DS4_SLOT_ROUTE_OWNER: return "owner";
+    case DS4_SLOT_ROUTE_EMPTY: return "empty";
+    case DS4_SLOT_ROUTE_STALE: return "stale";
+    case DS4_SLOT_ROUTE_CHEAPEST: return "cheapest";
+    default: return "queue";
+    }
+}
+
+/* SCR servers route by the reusable prefix each idle slot holds (live KV and,
+ * through it, the slot's archive), keeping warm conversations on their slots;
+ * see adapter/cache-reuse/src/slot_router.rs. Requires s->mu and tool_mu. */
+static server_slot *job_route_scr_locked(server *s, const job *j, time_t now,
+                                         ds4_slot_route_decision *d) {
+    ds4_slot_route_input in[SERVER_ROUTE_MAX_SLOTS];
+    memset(in, 0, sizeof(in));
+    for (int i = 0; i < s->slot_count; i++) {
+        server_slot *slot = &s->slots[i];
+        ds4_slot_route_input *x = &in[i];
+        x->available = !slot->busy && !slot->assigned;
+        if (!x->available || !slot->session || !ds4_session_checkpoint_valid(slot->session))
+            continue;
+        x->live_tokens = (uint32_t)ds4_session_pos(slot->session);
+        const slot_reuse pr = slot_probe_reuse_locked(s, slot, &j->req);
+        x->bound = pr.kind == REUSE_RESPONSES_VISIBLE || pr.kind == REUSE_RESPONSES_TOOL_OUTPUT ||
+                   pr.kind == REUSE_ANTHROPIC_TOOL_OUTPUT || pr.kind == REUSE_THINKING_VISIBLE;
+        const int common = server_route_common_prefix(slot, &j->req.prompt);
+        const int reuse = common > pr.reuse_tokens ? common : pr.reuse_tokens;
+        x->reuse_tokens = reuse > 0 ? (uint32_t)reuse : 0u;
+        x->idle_seconds = now > slot->last_used ? (uint64_t)(now - slot->last_used) : 0u;
+    }
+    const ds4_slot_route_request req = {
+        .request_tokens = j->req.prompt.len > 0 ? (uint32_t)j->req.prompt.len : 0u,
+        .conversation_floor = server_route_conversation_floor(s, &j->req.prompt),
+        .min_match = SERVER_ROUTE_MIN_MATCH,
+        .stale_after_seconds = (uint64_t)SLOT_STALE_AFTER_SEC,
+    };
+    const int32_t chosen = ds4_slot_route(&req, in, (uint32_t)s->slot_count, d);
+    if (chosen >= 0)
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: slot route slot=%d reason=%s reuse=%u floor=%u live=%u evicted=%u prompt=%u",
+                   chosen, server_route_reason(d->reason), d->reuse_tokens, req.conversation_floor,
+                   in[chosen].live_tokens, d->evicted_tokens, req.request_tokens);
+    return chosen >= 0 && chosen < s->slot_count ? &s->slots[chosen] : NULL;
+}
+#endif
+
 static void dispatch_jobs_locked(server *s) {
     if (!s || !s->batched_mode) return;
     const time_t now = time(NULL);
@@ -15073,6 +15147,24 @@ static void dispatch_jobs_locked(server *s) {
             int required = job_required_slot_locked(s, j);
             server_slot *best = NULL;
             int best_score = INT_MIN;
+#ifdef SERVER_SLOT_ROUTER
+            if (required < 0 && server_scr_enabled(s) && s->slot_count <= SERVER_ROUTE_MAX_SLOTS &&
+                !getenv("DS4_SERVER_LEGACY_ROUTE")) {
+                ds4_slot_route_decision d;
+                best = job_route_scr_locked(s, j, now, &d);
+                /* Owner and empty slots evict nothing; others log an eviction. */
+                best_score = !best ? INT_MIN : d.reason == DS4_SLOT_ROUTE_OWNER ? (int)d.reuse_tokens :
+                             d.reason == DS4_SLOT_ROUTE_EMPTY ? 0 : -1;
+                if (best) {
+                    chosen = j;
+                    chosen_prev = prev;
+                    chosen_slot = best;
+                    chosen_score = best_score;
+                    break;
+                }
+                continue;
+            }
+#endif
             for (int i = 0; i < s->slot_count; i++) {
                 int score = job_slot_score(s, &s->slots[i], j, required, now);
                 if (score > best_score) {
