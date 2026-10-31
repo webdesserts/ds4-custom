@@ -164,6 +164,9 @@ int ds4_gpu_kv_norm_task_pending(void);
 int ds4_gpu_kv_norm_task_flush(void);
 int ds4_gpu_kv_norm_task_begin_concurrent(void);
 void ds4_gpu_kv_norm_task_end_concurrent(void);
+/* Encoder-timeline stage label (static string): tags later dispatch groups
+ * and logs a host timestamp. No-op unless DS4_METAL_ENCODER_TIMELINE is set. */
+void ds4_gpu_profile_stage(const char *stage);
 #endif
 int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);
 int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label);

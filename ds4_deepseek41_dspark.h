@@ -373,6 +373,7 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *
         gates != 2)) return false;
     const uint64_t kv = DS4_N_HEAD_DIM * 4u, feature = DS4_N_EMBD * 4u;
     ds41_gpu_graph *graphs[DS41_VERIFY_ROWS];
+    ds41_stage("verify.save");
     bool ok = ds4_gpu_begin_commands();
     d->verify_start = g->pos;
     d->verify_count = 0;
@@ -431,11 +432,13 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *
         }
     }
     if (ok) ok = ds41_graph_step_batch(graphs, tokens, (int)count, count, m, w);
+    ds41_stage("verify.wait");
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     if (tp_block && (!ok || !ds4_tp_batch_block_end(g_tp_block_ctx))) {
         ds4_tp_mark_failed(g_tp_block_ctx);
         ok = false;
     }
+    ds41_stage("verify.readback");
     if (ok) ok = ds4_gpu_tensor_read(d->verify_logits, 0, d->host_verified,
         (uint64_t)count * DS4_N_VOCAB * 4u) &&
         ds4_gpu_tensor_read(d->verify_logits, (uint64_t)DS41_VERIFY_ROWS * DS4_N_VOCAB * 4u,

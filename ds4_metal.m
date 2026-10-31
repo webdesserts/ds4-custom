@@ -72,6 +72,7 @@ typedef struct {
     uint32_t n_dispatch;
     uint32_t tg[3];
     uint32_t tpt[3];
+    const char *stage;
     char kernel[DS4_TIMELINE_NAME_MAX];
 } ds4_timeline_rec;
 
@@ -96,6 +97,7 @@ static uint64_t g_timeline_seq;
 static NSMutableDictionary<NSNumber *, NSString *> *g_timeline_pso_names;
 static id<MTLCounterSet> g_timeline_counter_set;
 static BOOL g_timeline_encoder_hooked;
+static const char *g_timeline_stage;
 
 static void ds4_gpu_timeline_note_pso_name(id pso, NSString *name) {
     if (!g_timeline_enabled || !pso || !name) return;
@@ -232,7 +234,8 @@ static void ds4_gpu_timeline_probe(id<MTLDevice> device) {
     fprintf(g_timeline_file, "# ds4 encoder timeline; slide=0x%llx pid=%d\n",
             (unsigned long long)_dyld_get_image_vmaddr_slide(0), (int)getpid());
     fprintf(g_timeline_file, "# B <seq> <n_encoders> <gpu_start_ns> <gpu_end_ns>\n");
-    fprintf(g_timeline_file, "# E <seq> <idx> <start_ns> <end_ns> <dur_us> <gap_us> <caller_unslid> <n_dispatch> <tg> <tpt> <kernel>\n");
+    fprintf(g_timeline_file, "# E <seq> <idx> <start_ns> <end_ns> <dur_us> <gap_us> <caller_unslid> <n_dispatch> <tg> <tpt> <stage> <kernel>\n");
+    fprintf(g_timeline_file, "# S <host_ns> <open_seq> <stage>   (host_ns shares the B line time base)\n");
     fflush(g_timeline_file);
     fprintf(stderr, "ds4: encoder timeline -> %s\n", path);
 }
@@ -270,15 +273,26 @@ static void ds4_gpu_timeline_resolve(DS4TimelineBatch *b, id<MTLCommandBuffer> c
         const ds4_timeline_rec *r = &b->recs[i];
         const double dur_us = (end >= start) ? (double)(end - start) / 1000.0 : -1.0;
         const double gap_us = (prev_end && start >= prev_end) ? (double)(start - prev_end) / 1000.0 : 0.0;
-        fprintf(g_timeline_file, "E %llu %u %llu %llu %.2f %.2f 0x%llx %u %ux%ux%u %ux%ux%u %s\n",
+        fprintf(g_timeline_file, "E %llu %u %llu %llu %.2f %.2f 0x%llx %u %ux%ux%u %ux%ux%u %s %s\n",
                 (unsigned long long)b->seq, i,
                 (unsigned long long)start, (unsigned long long)end, dur_us, gap_us,
                 (unsigned long long)(r->caller - (uintptr_t)_dyld_get_image_vmaddr_slide(0)),
                 r->n_dispatch, r->tg[0], r->tg[1], r->tg[2], r->tpt[0], r->tpt[1], r->tpt[2],
-                r->kernel[0] ? r->kernel : "?");
+                r->stage ? r->stage : "-", r->kernel[0] ? r->kernel : "?");
         if (end) prev_end = end;
     }
     fflush(g_timeline_file);
+    pthread_mutex_unlock(&g_timeline_mutex);
+}
+
+void ds4_gpu_profile_stage(const char *stage) {
+    if (!g_timeline_enabled) return;
+    g_timeline_stage = stage;
+    pthread_mutex_lock(&g_timeline_mutex);
+    fprintf(g_timeline_file, "S %llu %llu %s\n",
+            (unsigned long long)clock_gettime_nsec_np(CLOCK_UPTIME_RAW),
+            (unsigned long long)(g_timeline_batch ? g_timeline_batch->seq : 0),
+            stage ? stage : "-");
     pthread_mutex_unlock(&g_timeline_mutex);
 }
 
@@ -333,6 +347,7 @@ static id<MTLComputeCommandEncoder> ds4_gpu_timeline_new_encoder(
     ds4_timeline_rec *rec = &b->recs[b->count++];
     memset(rec, 0, sizeof(*rec));
     rec->caller = caller;
+    rec->stage = g_timeline_stage;
     ds4_gpu_timeline_hook_encoder(enc);
     return enc;
 }
@@ -370,6 +385,7 @@ static id<MTLBlitCommandEncoder> ds4_gpu_blit_encoder(id<MTLCommandBuffer> cb, c
     memset(rec, 0, sizeof(*rec));
     rec->caller = (uintptr_t)__builtin_return_address(0);
     rec->n_dispatch = n_ops;
+    rec->stage = g_timeline_stage;
     snprintf(rec->kernel, sizeof(rec->kernel), "blit:%s", label ? label : "?");
     return enc;
 }
