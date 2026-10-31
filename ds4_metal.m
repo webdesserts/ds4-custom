@@ -21106,15 +21106,23 @@ static int ds4_gpu_matmul_f16_tensor_impl(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok,
-        bool                    exact_rows) {
+        bool                    exact_rows,
+        uint64_t                x_stride,
+        uint64_t                out_stride) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) return 0;
+    /* Row strides in floats; 0 means packed rows. Only exact-row calls
+     * take strides. */
+    if (!x_stride) x_stride = in_dim;
+    if (!out_stride) out_stride = out_dim;
+    if (x_stride < in_dim || out_stride < out_dim || out_stride > INT32_MAX ||
+        ((x_stride != in_dim || out_stride != out_dim) && !exact_rows)) return 0;
 
     @autoreleasepool {
         id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
         id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
-        const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
-        const uint64_t out_bytes = n_tok * out_dim * sizeof(float);
+        const uint64_t x_bytes = ((n_tok - 1u) * x_stride + in_dim) * sizeof(float);
+        const uint64_t out_bytes = ((n_tok - 1u) * out_stride + out_dim) * sizeof(float);
         if (!xbuf || !outbuf ||
             ds4_gpu_tensor_bytes(x) < x_bytes ||
             ds4_gpu_tensor_bytes(out) < out_bytes) {
@@ -21145,7 +21153,9 @@ static int ds4_gpu_matmul_f16_tensor_impl(
         if (n_tok == 1 || exact_rows) {
             ds4_gpu_f16_matvec_args mv_args = ds4_gpu_make_f16_mv_args(in_dim, out_dim);
             mv_args.ne11 = mv_args.ne1 = (int32_t)n_tok;
-            mv_args.nb12 = mv_args.nb13 = n_tok * in_dim * sizeof(float);
+            mv_args.nb11 = x_stride * sizeof(float);
+            mv_args.nb12 = mv_args.nb13 = n_tok * x_stride * sizeof(float);
+            mv_args.ne0 = (int32_t)out_stride;
             ds4_gpu_mv_dispatch mv_dispatch =
                 ds4_gpu_make_plain_mv_dispatch(in_dim, 0);
             if (!g_quality_mode && (out_dim == 512u || out_dim == 1024u) && in_dim >= 4096u) {
@@ -21303,7 +21313,7 @@ int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out,
                             uint64_t out_dim, const ds4_gpu_tensor *x,
                             uint64_t n_tok) {
     return ds4_gpu_matmul_f16_tensor_impl(out, model_map, model_size,
-        weight_offset, in_dim, out_dim, x, n_tok, false);
+        weight_offset, in_dim, out_dim, x, n_tok, false, 0, 0);
 }
 
 int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out,
@@ -21313,7 +21323,18 @@ int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out,
                                  const ds4_gpu_tensor *in) {
     if (!width || !outputs || !rows || rows > 8192u || !model_map) return 0;
     return ds4_gpu_matmul_f16_tensor_impl(out, model_map, model_size,
-        weight_offset, width, outputs, in, rows, true);
+        weight_offset, width, outputs, in, rows, true, 0, 0);
+}
+
+int ds4_gpu_dsv41_projection_rows_strided(ds4_gpu_tensor *out,
+                                 const void *model_map, uint64_t model_size,
+                                 uint64_t weight_offset, uint32_t width,
+                                 uint32_t outputs, uint32_t rows,
+                                 const ds4_gpu_tensor *in,
+                                 uint64_t in_stride, uint64_t out_stride) {
+    if (!width || !outputs || !rows || rows > 8192u || !model_map) return 0;
+    return ds4_gpu_matmul_f16_tensor_impl(out, model_map, model_size,
+        weight_offset, width, outputs, in, rows, true, in_stride, out_stride);
 }
 
 int ds4_gpu_matmul_f16_pair_tensor(

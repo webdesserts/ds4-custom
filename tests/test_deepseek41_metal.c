@@ -613,6 +613,86 @@ static int check_low_rows(void) {
     return 1;
 }
 
+#ifdef __APPLE__
+/* The DSpark draft attention-output low projection runs one strided
+ * multi-row F16 dispatch per group instead of a matvec per (row, group).
+ * Random F16 weights and inputs expose any change in the K walk or
+ * reduction, so compare bits with per-row ds4_gpu_matmul_f16_tensor calls
+ * for every row count, tiled (auto) and one-row (off) plans. Untouched
+ * output (other groups' slots, rows past the count) must stay NaN. */
+static int check_draft_low_rows(void) {
+    enum { GROUP = 4096, RANK = 1024, GROUPS = 8, ROWS = 6 };
+    const uint64_t wb = (uint64_t)GROUPS * RANK * GROUP * 2;
+    const uint64_t xb = (uint64_t)ROWS * GROUPS * GROUP * 4, lb = (uint64_t)ROWS * GROUPS * RANK * 4;
+    void *model = NULL;
+    CHECK(posix_memalign(&model, getpagesize(), wb) == 0);
+    uint16_t *w = model;
+    for (uint64_t i = 0; i < wb / 2; i++) {
+        /* Finite halves with varied exponents: sign, exponent 1..29, mantissa. */
+        const uint32_t v = (uint32_t)(random_value() * 8192) * 2654435761u + (uint32_t)i;
+        w[i] = (uint16_t)((v & 0x8000u) | ((1u + (v >> 3) % 29u) << 10) | (v & 0x3ffu));
+    }
+    float *x = malloc(xb), *reference = malloc(lb), *got = malloc(lb);
+    CHECK(x && reference && got);
+    for (uint64_t i = 0; i < xb / 4; i++) x[i] = random_value();
+    ds4_gpu_tensor *xt = upload(x, xb), *low = upload(NULL, lb);
+    CHECK(xt && low && ds4_gpu_set_model_map(model, wb));
+    CHECK(ds4_gpu_begin_commands());
+    for (uint32_t r = 0; r < ROWS; r++) for (uint32_t g = 0; g < GROUPS; g++) {
+        ds4_gpu_tensor *xr = ds4_gpu_tensor_view(xt, ((uint64_t)r * GROUPS + g) * GROUP * 4, GROUP * 4);
+        ds4_gpu_tensor *lr = ds4_gpu_tensor_view(low, ((uint64_t)r * GROUPS + g) * RANK * 4, RANK * 4);
+        CHECK(xr && lr && ds4_gpu_matmul_f16_tensor(lr, model, wb,
+            (uint64_t)g * RANK * GROUP * 2, GROUP, RANK, xr, 1));
+        ds4_gpu_tensor_free(xr); ds4_gpu_tensor_free(lr);
+    }
+    CHECK(ds4_gpu_end_commands());
+    CHECK(ds4_gpu_tensor_read(low, 0, reference, lb));
+    const char *modes[] = {"auto", "off"};
+    for (int mode = 0; mode < 2; mode++) {
+        setenv("DS4_METAL_DECODE_ROWS_MODE", modes[mode], 1);
+        for (uint32_t rows = 1; rows <= ROWS; rows++) for (uint32_t only = 0; only <= GROUPS; only++) {
+            /* only < GROUPS: just that group, checking the strides leave the
+             * other groups alone; only == GROUPS: all groups. */
+            CHECK(ds4_gpu_tensor_fill_f32(low, NAN, lb / 4));
+            CHECK(ds4_gpu_begin_commands());
+            for (uint32_t g = 0; g < GROUPS; g++) {
+                if (only < GROUPS && g != only) continue;
+                ds4_gpu_tensor *xg = ds4_gpu_tensor_view(xt, (uint64_t)g * GROUP * 4,
+                    ((uint64_t)(rows - 1) * GROUPS * GROUP + GROUP) * 4);
+                ds4_gpu_tensor *lg = ds4_gpu_tensor_view(low, (uint64_t)g * RANK * 4,
+                    ((uint64_t)(rows - 1) * GROUPS * RANK + RANK) * 4);
+                CHECK(xg && lg && ds4_gpu_dsv41_projection_rows_strided(lg, model, wb,
+                    (uint64_t)g * RANK * GROUP * 2, GROUP, RANK, rows, xg,
+                    (uint64_t)GROUPS * GROUP, (uint64_t)GROUPS * RANK));
+                ds4_gpu_tensor_free(xg); ds4_gpu_tensor_free(lg);
+            }
+            CHECK(ds4_gpu_end_commands());
+            CHECK(ds4_gpu_tensor_read(low, 0, got, lb));
+            for (uint32_t r = 0; r < ROWS; r++) for (uint32_t g = 0; g < GROUPS; g++) {
+                const uint64_t at = ((uint64_t)r * GROUPS + g) * RANK;
+                const bool written = r < rows && (only == GROUPS || g == only);
+                if (written) {
+                    if (memcmp(got + at, reference + at, RANK * 4))
+                        fprintf(stderr, "draft low rows mismatch mode=%s rows=%u only=%u r=%u g=%u\n",
+                                modes[mode], rows, only, r, g);
+                    CHECK(!memcmp(got + at, reference + at, RANK * 4));
+                } else {
+                    for (uint32_t i = 0; i < RANK; i++) CHECK(isnan(got[at + i]));
+                }
+            }
+        }
+        fprintf(stderr, "V4.1 draft strided F16 low projection mode=%s rows 1..%u: PASS\n", modes[mode], ROWS);
+    }
+    unsetenv("DS4_METAL_DECODE_ROWS_MODE");
+    /* Strides narrower than a row, or strides on the non-exact path, refuse. */
+    CHECK(!ds4_gpu_dsv41_projection_rows_strided(low, model, wb, 0, GROUP, RANK, 2, xt, GROUP - 1, 0));
+    CHECK(!ds4_gpu_dsv41_projection_rows_strided(low, model, wb, 0, GROUP, RANK, 2, xt, 0, RANK - 1));
+    ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(low);
+    free(x); free(reference); free(got); free(model);
+    return 1;
+}
+#endif
+
 static int check_attention_output(bool large) {
     enum { GROUP = 4096, RANK = 1024, GROUPS = 8, OUT = 5120 };
     const uint32_t ROWS = large ? 8192u : 513u;
@@ -1705,6 +1785,13 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+#ifdef __APPLE__
+    if (argc == 2 && !strcmp(argv[1], "--draft-low-rows")) {
+        const int ok = ds4_gpu_init() && check_draft_low_rows();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+#endif
     if (argc == 2 && !strcmp(argv[1], "--merge-rows")) {
         const int ok = ds4_gpu_init() && check_merge_rows();
         ds4_gpu_cleanup();

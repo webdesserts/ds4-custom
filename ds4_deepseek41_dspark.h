@@ -202,6 +202,27 @@ static bool ds41_dspark_attention_output(ds41_prefill_row *b, const ds4_model *m
     const uint32_t groups = DS4_N_OUT_GROUP, width = DS4_N_HEAD * DS4_N_HEAD_DIM / groups;
     uint64_t weight_row;
     if (!tensor_nbytes(l->attn_output_a->type, width, &weight_row)) return false;
+    /* One dispatch per group streams its F16 slab once for all draft rows;
+     * each row keeps the single-row reduction, so the result is bitwise
+     * identical to the per-row loop below (DS4_V41_DRAFT_LOW_ROWS=0). */
+    const char *rows_env = getenv("DS4_V41_DRAFT_LOW_ROWS");
+    if (l->attn_output_a->type == DS4_TENSOR_F16 && !(rows_env && !strcmp(rows_env, "0"))) {
+        bool ok = true;
+        for (uint32_t group = 0; ok && group < groups; group++) {
+            ds4_gpu_tensor *x = ds4_gpu_tensor_view(b->heads, (uint64_t)group * width * 4u,
+                ((uint64_t)(DS41_DRAFT_ROWS - 1u) * groups * width + width) * 4u);
+            ds4_gpu_tensor *y = ds4_gpu_tensor_view(b->low, (uint64_t)group * DS4_N_LORA_O * 4u,
+                ((uint64_t)(DS41_DRAFT_ROWS - 1u) * groups * DS4_N_LORA_O + DS4_N_LORA_O) * 4u);
+            ok = x && y && ds4_gpu_dsv41_projection_rows_strided(y, m->map, m->size,
+                l->attn_output_a->abs_offset + (uint64_t)group * DS4_N_LORA_O * weight_row,
+                width, DS4_N_LORA_O, DS41_DRAFT_ROWS, x,
+                (uint64_t)groups * width, (uint64_t)groups * DS4_N_LORA_O);
+            ds4_gpu_tensor_free(y); ds4_gpu_tensor_free(x);
+        }
+        if (!ok || !ds4_gpu_dsv41_quantize(b->low, groups * DS4_N_LORA_O, DS41_DRAFT_ROWS, DS4_V41_BF16))
+            return false;
+        return ds41_dspark_matmul_batch(b->block, m, l->attn_output_b, b->low, DS41_DRAFT_ROWS, true);
+    }
     for (uint32_t row = 0; row < DS41_DRAFT_ROWS; row++) {
         for (uint32_t group = 0; group < groups; group++) {
             ds4_tensor slice = *l->attn_output_a;
