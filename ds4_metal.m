@@ -2814,6 +2814,19 @@ int ds4_gpu_device_is_m5_apple_silicon(void) {
             g_metal_device_name[8] == ' ');
 }
 
+/* V4.1 routed MoE for 1..8 verify/decode rows (IQ2_XXS gate/up, Q2_K
+ * down): compile-time geometry variants of the generic pair and sum6 kernels.
+ * Every output row keeps its lane partial sums, expert order and simd_sum, so
+ * the results are bitwise those of the generic kernels; only the work per
+ * simdgroup changes. The down sum uses one row per simdgroup for a single
+ * token (more threadgroups in flight) and two from two tokens.
+ * DS4_METAL_V41_MOE_GEOMETRY=0 keeps the generic kernels; it is read per
+ * call so tests can compare both in one process. */
+static bool ds4_gpu_v41_moe_geometry_enabled(void) {
+    const char *v = getenv("DS4_METAL_V41_MOE_GEOMETRY");
+    return !v || strcmp(v, "0") != 0;
+}
+
 static bool ds4_gpu_ported_m5_decode_feature_enabled(
         const char *pre_m5_disable_env,
         const char *m5_disable_env) {
@@ -41231,6 +41244,18 @@ int ds4_gpu_routed_moe_one_tensor(
                 g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pack2_pipeline;
             pair_swiglu_nsg = 4;
         }
+        const bool v41_geometry = n_tokens == 1 && n_expert == 6 && n_total_expert == 384 &&
+            expert_in_dim == 5120 && expert_mid_dim == 2304 && out_dim == 5120 &&
+            gate_type == DS4_METAL_TENSOR_IQ2_XXS && down_type == DS4_METAL_TENSOR_Q2_K &&
+            ds4_gpu_v41_moe_geometry_enabled();
+        id<MTLComputePipelineState> v41_pair_pipeline = v41_geometry ?
+            ds4_gpu_get_pipeline("kernel_mul_mv_id_iq2_xxs_pair_swiglu_v41_2x4") : nil;
+        id<MTLComputePipelineState> v41_sum_pipeline = v41_geometry ?
+            ds4_gpu_get_pipeline("kernel_mul_mv_id_q2_K_sum6_v41_2x1") : nil;
+        if (v41_pair_pipeline) {
+            pair_swiglu_pipeline = v41_pair_pipeline;
+            pair_swiglu_nsg = 2;
+        }
         const bool fuse_pair_swiglu =
             !g_quality_mode &&
             !write_clamped_moe &&
@@ -43493,9 +43518,12 @@ int ds4_gpu_routed_moe_one_tensor(
                                                        2);
             }
         } else if (ok && direct_down_sum) {
+            ds4_gpu_mul_mv_id_args sum_args = down_args;
+            if (v41_sum_pipeline) sum_args.nr0 = 1;
             ok = ds4_gpu_encode_mul_mv_id_sum6(cb,
-                                                 down_sum6_pipeline,
-                                                 &down_args,
+                                                 v41_sum_pipeline ? v41_sum_pipeline :
+                                                     down_sum6_pipeline,
+                                                 &sum_args,
                                                  down_buf,
                                                  (NSUInteger)down_inner,
                                                  midbuf,
@@ -43507,7 +43535,7 @@ int ds4_gpu_routed_moe_one_tensor(
                                                  add_in ? ds4_gpu_tensor_buffer(add_in) : nil,
                                                  add_in ? ds4_gpu_tensor_offset(add_in) : 0,
                                                  down_smem,
-                                                 down_sum6_nsg);
+                                                 v41_sum_pipeline ? 2 : down_sum6_nsg);
         } else if (ok) {
             ok = ds4_gpu_encode_mul_mv_id(cb,
                                                  down_mv_pipeline,
@@ -43958,7 +43986,17 @@ int ds4_gpu_routed_moe_batch_tensor(
             getenv("DS4_METAL_DISABLE_M5_TP_MXFP4_STATIC") == NULL &&
             g_moe_mul_mv_id_mxfp4_pair_swiglu_tp_static_pipeline_nsg1 != nil &&
             g_moe_mul_mv_id_mxfp4_sum6_tp_full_rows_static_pipeline_nsg1 != nil;
-        if (gate_type == DS4_METAL_TENSOR_IQ2_XXS) {
+        const bool v41_geometry = v41_decode_batch &&
+            gate_type == DS4_METAL_TENSOR_IQ2_XXS && down_type == DS4_METAL_TENSOR_Q2_K &&
+            ds4_gpu_v41_moe_geometry_enabled();
+        id<MTLComputePipelineState> v41_pair_pipeline = v41_geometry ?
+            ds4_gpu_get_pipeline("kernel_mul_mv_id_iq2_xxs_pair_swiglu_v41_2x4") : nil;
+        id<MTLComputePipelineState> v41_sum_pipeline = v41_geometry ?
+            ds4_gpu_get_pipeline(n_tokens == 1u ? "kernel_mul_mv_id_q2_K_sum6_v41_2x1" :
+                                 "kernel_mul_mv_id_q2_K_sum6_v41_2x2") : nil;
+        if (v41_pair_pipeline) {
+            tiny_pair_swiglu_pipeline = v41_pair_pipeline;
+        } else if (gate_type == DS4_METAL_TENSOR_IQ2_XXS) {
             tiny_pair_swiglu_pipeline = g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pipeline;
         } else if (gate_type == DS4_METAL_TENSOR_Q4_K) {
             tiny_pair_swiglu_pipeline = g_moe_mul_mv_id_q4_k_pair_swiglu_pipeline;
@@ -44934,9 +44972,12 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                          2,
                                                          q4_batch_table_queue_residency);
             } else if (direct_down_sum) {
+                ds4_gpu_mul_mv_id_args sum_args = down_args;
+                if (v41_sum_pipeline) sum_args.nr0 = n_tokens == 1u ? 1 : 2;
                 ok = ds4_gpu_encode_mul_mv_id_sum6(cb,
-                                                     down_sum6_pipeline,
-                                                     &down_args,
+                                                     v41_sum_pipeline ? v41_sum_pipeline :
+                                                         down_sum6_pipeline,
+                                                     &sum_args,
                                                      down_buf,
                                                      (NSUInteger)down_inner,
                                                      midbuf,

@@ -1,5 +1,12 @@
-/* Timing for the V4.1 routed-MoE verify path (IQ2_XXS gate/up, Q2_K down,
- * 6 of 384 experts) at 1-6 rows, on synthetic weights:
+/* Timing and exactness for the V4.1 routed-MoE verify path (IQ2_XXS gate/up,
+ * Q2_K down, 6 of 384 experts) at 1-8 rows, on synthetic weights:
+ *
+ *   --check            the geometry kernels (DS4_METAL_V41_MOE_GEOMETRY) are
+ *                      bitwise equal to the generic kernels for mid and the
+ *                      summed output, batched (1-8 rows) and single. The
+ *                      fused kernels' gate/up stores are diagnostic only: all
+ *                      six experts of a row write the same span, so the last
+ *                      writer varies run to run and they are not compared.
  *
  *   --bench [sel.bin]  real router selections (see load_selections) beside
  *                      two controls: no-share (6 * rows distinct experts) and
@@ -203,7 +210,88 @@ static int bench(const char *path) {
     return 1;
 }
 
+static int read_all(ds4_gpu_tensor *t, void *dst, size_t bytes) {
+    return ds4_gpu_tensor_read(t, 0, dst, bytes) != 0;
+}
+
+/* One call with the geometry kernels on or off; outputs copied to host. */
+static int run_geometry(const moe_model *m, const moe_io *io, ds4_gpu_tensor *sel,
+                        uint32_t rows, uint32_t layer, bool single, bool geometry,
+                        float *out, float *gate, float *up, float *mid) {
+    setenv("DS4_METAL_V41_MOE_GEOMETRY", geometry ? "1" : "0", 1);
+    const size_t pair = (size_t)rows * N_USED * MID * 4;
+    /* Distinct fills per run, so an unwritten element cannot match. */
+    const float fill = geometry ? -2.0f : -1.0f;
+    CHECK(ds4_gpu_tensor_fill_f32(io->out, fill, (uint64_t)rows * IN) &&
+          ds4_gpu_tensor_fill_f32(io->gate, fill, pair / 4) &&
+          ds4_gpu_tensor_fill_f32(io->up, fill, pair / 4) &&
+          ds4_gpu_tensor_fill_f32(io->mid, fill, pair / 4));
+    CHECK(ds4_gpu_begin_commands());
+    if (single) {
+        CHECK(ds4_gpu_routed_moe_one_tensor(io->out, io->gate, io->up, io->mid, io->experts,
+            m->map, m->size, m->gate_off, m->up_off, m->down_off, TYPE_IQ2_XXS, TYPE_Q2_K,
+            GATE_EXPERT, GATE_ROW, DOWN_EXPERT, DOWN_ROW, IN, MID, IN, sel, io->w,
+            N_EXPERT, N_USED, 10.0f, io->x, NULL, layer, true));
+    } else {
+        CHECK(moe_call(m, io, sel, rows, layer));
+    }
+    CHECK(ds4_gpu_end_commands() && ds4_gpu_synchronize());
+    return read_all(io->out, out, (size_t)rows * IN * 4) && read_all(io->gate, gate, pair) &&
+        read_all(io->up, up, pair) && read_all(io->mid, mid, pair);
+}
+
+static int check(void) {
+    moe_model m;
+    moe_io io;
+    CHECK(model_init(&m) && io_init(&io));
+    const size_t pair = (size_t)MAX_ROWS * N_USED * MID;
+    float *buf[8];
+    for (int i = 0; i < 8; i++) {
+        buf[i] = malloc((i % 4 ? pair : (size_t)MAX_ROWS * IN) * 4);
+        CHECK(buf[i]);
+    }
+    ds4_gpu_tensor *sel = ds4_gpu_tensor_alloc((size_t)MAX_ROWS * N_USED * 4);
+    CHECK(sel);
+    int passed = 0, failed = 0;
+    for (int single = 0; single < 2; single++) {
+        for (uint32_t rows = 1; rows <= (single ? 1u : MAX_ROWS); rows++) {
+            /* 0 distinct, 1 all rows equal, 2 drawn from 9 experts (shared). */
+            for (int kind = 0; kind < 3; kind++) {
+                int32_t ids[MAX_ROWS * N_USED];
+                if (kind < 2) synth(ids, rows, 1, kind);
+                else for (uint32_t r = 0; r < rows; r++) {
+                    int32_t pool[9];
+                    pick_distinct(pool, 9);
+                    for (int k = 0; k < N_USED; k++) ids[r * N_USED + k] = pool[k];
+                }
+                CHECK(ds4_gpu_tensor_write(sel, 0, ids, (size_t)rows * N_USED * 4));
+                const uint32_t layer = (uint32_t)(kind * 7 + rows) % 40u;
+                CHECK(run_geometry(&m, &io, sel, rows, layer, single, false,
+                                   buf[0], buf[1], buf[2], buf[3]));
+                CHECK(run_geometry(&m, &io, sel, rows, layer, single, true,
+                                   buf[4], buf[5], buf[6], buf[7]));
+                const size_t pb = (size_t)rows * N_USED * MID * 4;
+                const bool same = !memcmp(buf[0], buf[4], (size_t)rows * IN * 4) &&
+                    !memcmp(buf[3], buf[7], pb);
+                fprintf(stderr, "%s %s rows=%u kind=%d\n", same ? "PASS" : "FAIL",
+                        single ? "single" : "batch", rows, kind);
+                if (same) passed++; else failed++;
+            }
+        }
+    }
+    unsetenv("DS4_METAL_V41_MOE_GEOMETRY");
+    fprintf(stderr, "geometry check: %d passed, %d failed\n", passed, failed);
+    ds4_gpu_tensor_free(sel);
+    for (int i = 0; i < 8; i++) free(buf[i]);
+    return failed == 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc >= 2 && !strcmp(argv[1], "--check")) {
+        const int ok = ds4_gpu_init() && check();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc >= 2 && !strcmp(argv[1], "--bench")) {
         const int ok = ds4_gpu_init() &&
             bench(argc >= 3 ? argv[2] : "/tmp/ds4_ab/route-sel.bin");
