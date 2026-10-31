@@ -825,6 +825,68 @@ static int check_fused_bf16(void) {
 }
 #endif
 
+#ifdef __APPLE__
+/* Weighted RMS norm with fused BF16 rounding against the norm plus the
+ * separate BF16 pass: random weights and rows, widths of the V4.1 norms,
+ * rows 1..6, a NaN row and a row of huge values (overflow to inf). */
+static uint32_t as_bits(float x) {
+    uint32_t bits;
+    memcpy(&bits, &x, sizeof(bits));
+    return bits;
+}
+
+static int check_fused_norm(void) {
+    enum { ROWS = 6 };
+    const uint32_t widths[] = {5120, 1280, 512, 4096, 128};
+    for (size_t wi = 0; wi < sizeof(widths) / sizeof(*widths); wi++) {
+        const uint32_t n = widths[wi];
+        const uint64_t xb = (uint64_t)ROWS * n * 4;
+        /* Whole pages: the model map rejects a sub-page mapping. */
+        const uint64_t wb = ((uint64_t)n * 4 + 16383u) & ~(uint64_t)16383u;
+        void *model = NULL;
+        CHECK(posix_memalign(&model, getpagesize(), wb) == 0);
+        float *w = model;
+        for (uint32_t i = 0; i < n; i++) w[i] = random_value() * 4.0f;
+        w[0] = 3.0e38f;
+        float *x = malloc(xb), *plain = malloc(xb), *fused = malloc(xb);
+        CHECK(x && plain && fused);
+        for (uint64_t i = 0; i < xb / 4; i++) x[i] = random_value();
+        x[(uint64_t)2 * n + 5] = NAN;
+        x[0] = 50.0f; /* times w[0] = 3e38 overflows */
+        ds4_gpu_tensor *xt = upload(x, xb), *ot = upload(NULL, xb);
+        CHECK(xt && ot && ds4_gpu_set_model_map(model, wb));
+        for (uint32_t rows = 1; rows <= ROWS; rows++) {
+            CHECK(ds4_gpu_tensor_fill_f32(ot, NAN, xb / 4));
+            CHECK(ds4_gpu_begin_commands());
+            CHECK(ds4_gpu_rms_norm_weight_rows_tensor(ot, xt, model, wb, 0, n, rows, 1e-6f));
+            CHECK(ds4_gpu_dsv41_quantize(ot, n, rows, DS4_V41_BF16));
+            CHECK(ds4_gpu_end_commands());
+            CHECK(ds4_gpu_tensor_read(ot, 0, plain, xb));
+            CHECK(ds4_gpu_tensor_fill_f32(ot, NAN, xb / 4));
+            CHECK(ds4_gpu_begin_commands());
+            CHECK(ds4_gpu_rms_norm_weight_rows_bf16_tensor(ot, xt, model, wb, 0, n, rows, 1e-6f));
+            CHECK(ds4_gpu_end_commands());
+            CHECK(ds4_gpu_tensor_read(ot, 0, fused, xb));
+            if (memcmp(fused, plain, (uint64_t)rows * n * 4))
+                fprintf(stderr, "fused norm mismatch n=%u rows=%u\n", n, rows);
+            CHECK(!memcmp(fused, plain, (uint64_t)rows * n * 4));
+            for (uint64_t i = (uint64_t)rows * n; i < xb / 4; i++) CHECK(isnan(fused[i]));
+            /* Rounding happened, and the special rows stay non-finite. */
+            bool changed = false;
+            for (uint64_t i = 0; i < (uint64_t)rows * n; i++)
+                changed |= isfinite(fused[i]) && (as_bits(fused[i]) & 0xffffu) != 0;
+            CHECK(!changed);
+            if (rows > 2) CHECK(isnan(fused[(uint64_t)2 * n]));
+            CHECK(isinf(fused[0]));
+        }
+        fprintf(stderr, "V4.1 fused BF16 weighted RMS norm n=%u rows 1..%u: PASS\n", n, ROWS);
+        ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(ot);
+        free(x); free(plain); free(fused); free(model);
+    }
+    return 1;
+}
+#endif
+
 static int check_attention_output(bool large) {
     enum { GROUP = 4096, RANK = 1024, GROUPS = 8, OUT = 5120 };
     const uint32_t ROWS = large ? 8192u : 513u;
@@ -1918,6 +1980,11 @@ int main(int argc, char **argv) {
         return ok ? 0 : 1;
     }
 #ifdef __APPLE__
+    if (argc == 2 && !strcmp(argv[1], "--fused-norm")) {
+        const int ok = ds4_gpu_init() && check_fused_norm();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--fused-bf16")) {
         const int ok = ds4_gpu_init() && check_fused_bf16();
         ds4_gpu_cleanup();

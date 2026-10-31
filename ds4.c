@@ -41311,6 +41311,17 @@ static bool ds41_fused_bf16_enabled(void) {
     return enabled;
 }
 
+/* Weighted RMS norms likewise round in the norm kernel;
+ * DS4_METAL_V41_FUSED_NORM=0 keeps the separate pass. */
+static bool ds41_fused_norm_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *v = getenv("DS4_METAL_V41_FUSED_NORM");
+        enabled = !(v && !strcmp(v, "0"));
+    }
+    return enabled;
+}
+
 static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
                               const ds4_tensor *weight, const ds4_gpu_tensor *in,
                               uint32_t count, bool round) {
@@ -41445,6 +41456,9 @@ static bool ds41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
         return ds4_gpu_dsv41_norm(out, in, m->map, m->size, weight->abs_offset,
             (uint32_t)weight->dim[0], 1, DS4_RMS_EPS);
 #endif
+    if (ds41_fused_norm_enabled())
+        return ds4_gpu_rms_norm_weight_rows_bf16_tensor(out, in, m->map, m->size,
+            weight->abs_offset, (uint32_t)weight->dim[0], 1, DS4_RMS_EPS);
     return ds4_gpu_rms_norm_weight_tensor(out, in, m->map, m->size,
         weight->abs_offset, (uint32_t)weight->dim[0], DS4_RMS_EPS) &&
         ds41_bf16(out, (uint32_t)weight->dim[0]);
@@ -41859,6 +41873,9 @@ static bool ds41_norm_batch(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
         return ds4_gpu_dsv41_norm(out, in, m->map, m->size, weight->abs_offset,
             (uint32_t)weight->dim[0], count, DS4_RMS_EPS);
 #endif
+    if (ds41_fused_norm_enabled())
+        return ds4_gpu_rms_norm_weight_rows_bf16_tensor(out, in, m->map, m->size,
+            weight->abs_offset, (uint32_t)weight->dim[0], count, DS4_RMS_EPS);
     return ds4_gpu_rms_norm_weight_rows_tensor(out, in, m->map, m->size,
         weight->abs_offset, (uint32_t)weight->dim[0], count, DS4_RMS_EPS) &&
         ds4_gpu_dsv41_quantize(out, (uint32_t)weight->dim[0], count, DS4_V41_BF16);

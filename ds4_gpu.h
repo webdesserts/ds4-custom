@@ -1208,6 +1208,16 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
         uint32_t                n,
         uint32_t                rows,
         float                   eps);
+/* As above with the V4.1 BF16 rounding of the output fused in. */
+int ds4_gpu_rms_norm_weight_rows_bf16_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n,
+        uint32_t                rows,
+        float                   eps);
 
 int ds4_gpu_add_rms_norm_weight_tensor(
         ds4_gpu_tensor       *norm_out,
