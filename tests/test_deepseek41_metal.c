@@ -553,6 +553,66 @@ static int check_sparse_gather(void) {
     return 1;
 }
 
+/* The decode-row low projection streams each group's weights once per token
+ * tile. With random scales and inputs, any change to the per-token K walk or
+ * reduction order shows up in the bits, so compare against the single-token
+ * kernel for every tile size and the per-token (DS4_METAL_V41_LOW_ROWS=0)
+ * grid. */
+static int check_low_rows(void) {
+    enum { GROUP = 4096, RANK = 1024, GROUPS = 8, OUT = 5120, ROWS = 8 };
+    typedef struct { uint16_t d; int8_t qs[32]; } q8_block;
+    const uint64_t a_bytes = (uint64_t)GROUPS * RANK * GROUP / 32 * sizeof(q8_block);
+    const uint64_t b_bytes = (uint64_t)OUT * GROUPS * RANK / 32 * sizeof(q8_block);
+    const uint64_t xb = (uint64_t)ROWS * GROUPS * GROUP * 4;
+    const uint64_t lb = (uint64_t)ROWS * GROUPS * RANK * 4, ob = (uint64_t)ROWS * OUT * 4;
+    void *model = NULL;
+    CHECK(posix_memalign(&model, getpagesize(), a_bytes + b_bytes) == 0);
+    q8_block *w = model;
+    for (uint64_t i = 0; i < (a_bytes + b_bytes) / sizeof(*w); i++) {
+        const int value = (int)(random_value() * 8192);
+        w[i].d = (uint16_t)(0x2000u | ((unsigned)abs(value) % 1024u));
+        for (int j = 0; j < 32; j++) w[i].qs[j] = (int8_t)((int)(random_value() * 8192) % 128);
+    }
+    float *x = malloc(xb), *reference = malloc(lb);
+    CHECK(x && reference);
+    for (uint64_t i = 0; i < xb / 4; i++) x[i] = random_value();
+    ds4_gpu_tensor *xt = upload(x, xb), *low = upload(NULL, lb), *out = upload(NULL, ob);
+    CHECK(xt && low && out && ds4_gpu_set_model_map(model, a_bytes + b_bytes));
+    CHECK(ds4_gpu_begin_commands());
+    for (uint32_t r = 0; r < ROWS; r++) {
+        ds4_gpu_tensor *xr = ds4_gpu_tensor_view(xt, (uint64_t)r * GROUPS * GROUP * 4,
+                                                GROUPS * GROUP * 4);
+        ds4_gpu_tensor *lr = ds4_gpu_tensor_view(low, (uint64_t)r * GROUPS * RANK * 4,
+                                                GROUPS * RANK * 4);
+        CHECK(xr && lr);
+        CHECK(ds4_gpu_attention_output_low_q8_tensor(lr, model, a_bytes + b_bytes,
+            0, GROUP, RANK, GROUPS, xr));
+        CHECK(ds4_gpu_dsv41_quantize(lr, GROUPS * RANK, 1, DS4_V41_BF16));
+        ds4_gpu_tensor_free(xr); ds4_gpu_tensor_free(lr);
+    }
+    CHECK(ds4_gpu_end_commands());
+    CHECK(ds4_gpu_tensor_read(low, 0, reference, lb));
+    for (int tiled = 1; tiled >= 0; tiled--) {
+        if (tiled) unsetenv("DS4_METAL_V41_LOW_ROWS");
+        else setenv("DS4_METAL_V41_LOW_ROWS", "0", 1);
+        for (uint32_t rows = 1; rows <= ROWS; rows++) {
+            CHECK(ds4_gpu_tensor_fill_f32(low, NAN, lb / 4));
+            CHECK(ds4_gpu_dsv41_attention_output_batch(out, low, model, a_bytes + b_bytes,
+                0, a_bytes, xt, rows));
+            const float *got = ds4_gpu_tensor_contents(low);
+            if (memcmp(got, reference, (uint64_t)rows * GROUPS * RANK * 4))
+                fprintf(stderr, "low rows mismatch tiled=%d rows=%u\n", tiled, rows);
+            CHECK(!memcmp(got, reference, (uint64_t)rows * GROUPS * RANK * 4));
+            if (rows < ROWS) CHECK(isnan(got[(uint64_t)rows * GROUPS * RANK]));
+            fprintf(stderr, "V4.1 decode-row low projection tiled=%d rows=%u: PASS\n", tiled, rows);
+        }
+    }
+    unsetenv("DS4_METAL_V41_LOW_ROWS");
+    ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(low); ds4_gpu_tensor_free(out);
+    free(x); free(reference); free(model);
+    return 1;
+}
+
 static int check_attention_output(bool large) {
     enum { GROUP = 4096, RANK = 1024, GROUPS = 8, OUT = 5120 };
     const uint32_t ROWS = large ? 8192u : 513u;
@@ -1640,6 +1700,11 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--low-rows")) {
+        const int ok = ds4_gpu_init() && check_low_rows();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--merge-rows")) {
         const int ok = ds4_gpu_init() && check_merge_rows();
         ds4_gpu_cleanup();
@@ -1654,7 +1719,7 @@ int main(int argc, char **argv) {
     int ok = ds4_gpu_init() && check_router() && check_quantization() && check_engram() && check_rope_stride() && check_pool() &&
              check_candidates() && check_sparse_gather() && check_indexer_batch() &&
              check_embedding() && check_index_projection() && check_decode_rows(0) && check_general_topk() && check_causal_topk() && check_compact_carry() && check_attention_output(false) &&
-             check_tp_attention() && check_merge_rows();
+             check_tp_attention() && check_merge_rows() && check_low_rows();
     ds4_gpu_cleanup();
     return ok ? 0 : 1;
 }

@@ -5961,6 +5961,19 @@ static int ds4_gpu_encode_attn_out_low_q8_direct(
         NSUInteger                  nsg,
         bool                        rows_per_group_is_nr0);
 
+static uint32_t ds4_gpu_attn_out_low_rows(uint32_t n_tokens);
+static int ds4_gpu_encode_attn_out_low_q8_rows(
+        id<MTLCommandBuffer>        cb,
+        id<MTLComputePipelineState> pipeline,
+        const ds4_gpu_mul_mv_id_args *args,
+        uint32_t                    rows,
+        id<MTLBuffer>               src0,
+        NSUInteger                  src0_off,
+        id<MTLBuffer>               src1,
+        NSUInteger                  src1_off,
+        id<MTLBuffer>               dst,
+        NSUInteger                  dst_off);
+
 static int ds4_gpu_encode_attn_out_low_mpp(
         id<MTLCommandBuffer>           cb,
         id<MTLComputePipelineState>    pipeline,
@@ -26230,6 +26243,16 @@ static int ds4_gpu_attention_output_q8_batch_impl(
                     .nb1 = (uint64_t)rank * sizeof(float),
                     .nr0 = 2,
                 };
+                const uint32_t low_rows = ds4_gpu_attn_out_low_rows(n_tokens);
+                if (low_rows) {
+                    char name[64];
+                    snprintf(name, sizeof(name), "kernel_dsv4_attn_out_low_q8_0_f32_rows%u", low_rows);
+                    ok = ds4_gpu_encode_attn_out_low_q8_rows(cb,
+                            ds4_gpu_get_mul_mv_pipeline(name, 4), &args, low_rows,
+                            out_a_buf, (NSUInteger)out_a_inner,
+                            ds4_gpu_tensor_buffer(heads), ds4_gpu_tensor_offset(heads),
+                            ds4_gpu_tensor_buffer(low), ds4_gpu_tensor_offset(low)) != 0;
+                } else {
                 id<MTLComputePipelineState> pipeline =
                     ds4_gpu_get_mul_mv_pipeline("kernel_dsv4_attn_out_low_q8_0_f32", 4);
                 ok = ds4_gpu_encode_attn_out_low_q8_direct(cb,
@@ -26244,6 +26267,7 @@ static int ds4_gpu_attention_output_q8_batch_impl(
                                                              32u * 2u * sizeof(float),
                                                              4,
                                                              true) != 0;
+                }
             } else {
                 ds4_gpu_mul_mv_id_args args = {
                     .nei0 = (int32_t)n_groups,
@@ -31972,6 +31996,49 @@ static int ds4_gpu_encode_attn_out_low_q8_direct(
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
     [enc dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
+         threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
+/* Token tile for the decode-row attention-output low projection: 0 keeps
+ * one token per grid slice (single token, or DS4_METAL_V41_LOW_ROWS=0). */
+static uint32_t ds4_gpu_attn_out_low_rows(uint32_t n_tokens) {
+    static const uint8_t tiles[] = {0, 0, 2, 3, 4, 5, 6, 4, 4};
+    if (n_tokens >= sizeof(tiles)) return 0;
+    const char *v = getenv("DS4_METAL_V41_LOW_ROWS");
+    return v && !strcmp(v, "0") ? 0 : tiles[n_tokens];
+}
+
+/* Q8_0 low projection with the token tile in grid.y: each group's weights
+ * are read once per tile rather than once per token. */
+static int ds4_gpu_encode_attn_out_low_q8_rows(
+        id<MTLCommandBuffer>        cb,
+        id<MTLComputePipelineState> pipeline,
+        const ds4_gpu_mul_mv_id_args *args,
+        uint32_t                    rows,
+        id<MTLBuffer>               src0,
+        NSUInteger                  src0_off,
+        id<MTLBuffer>               src1,
+        NSUInteger                  src1_off,
+        id<MTLBuffer>               dst,
+        NSUInteger                  dst_off) {
+    const NSUInteger nsg = 4;
+    if (!cb || !pipeline || !args || !src0 || !src1 || !dst || !rows ||
+        args->ne00 <= 0 || args->ne01 <= 0 || args->nei0 <= 0 || args->nei1 <= 0 ||
+        pipeline.maxTotalThreadsPerThreadgroup < 32u * nsg) {
+        return 0;
+    }
+    const NSUInteger row_groups = ((NSUInteger)args->ne01 + args->nr0 - 1u) / args->nr0;
+    const NSUInteger token_tiles = ((NSUInteger)args->nei1 + rows - 1u) / rows;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:args length:sizeof(*args) atIndex:0];
+    [enc setBuffer:src0 offset:src0_off atIndex:1];
+    [enc setBuffer:src1 offset:src1_off atIndex:2];
+    [enc setBuffer:dst  offset:dst_off  atIndex:3];
+    [enc setThreadgroupMemoryLength:32u * (NSUInteger)args->nr0 * rows * sizeof(float) atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(row_groups, token_tiles, (NSUInteger)args->nei0)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;

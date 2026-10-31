@@ -265,9 +265,9 @@ static inline void helper_mv_rows_reduce_and_write(
 // kernel serves one weight matrix (ne12 == ne13 == 1, grid.z == 1), so the
 // nb02/nb03 and nb12/nb13 batch offsets of the single-row kernel are zero and
 // omitted.
-template<short NR0, short NR1>
+template<short NR0, short NR1, typename args_t = constant ds4_metal_args_mul_mv &>
 void kernel_mul_mv_q8_0_f32_rows_impl(
-        constant ds4_metal_args_mul_mv & args,
+        args_t args,
         device const char * src0,
         device const char * src1,
         device       char * dst,
