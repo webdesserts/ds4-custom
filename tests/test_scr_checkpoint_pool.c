@@ -6,7 +6,10 @@
  *      edit of the first branch selects and restores that branch's entry;
  *   3. same-session edit: tokens shared with the live transcript are covered
  *      from the archive (planned and pool-scored), not recomputed, because a
- *      planned request resets the live graph at token 0.
+ *      planned request resets the live graph at token 0;
+ *   4. two sessions on one pool (batched server slots): each live archive
+ *      keeps its own saved-state record, so another session's save neither
+ *      makes it a restore candidate of its own nor forces a rewrite.
  * Strict host: tests/scr_host_storage.c replaces GPU buffers and model rows
  * are simulated. Restored owner rows and raw records are checked against the
  * values the fixture captured; this is ownership evidence, not inference. */
@@ -25,6 +28,7 @@ static void check_restored(ds4_session *s, uint32_t count);
 static void policy(ds4_session *s, ds4_scr_pool *p, int *v, uint32_t n,
                    ds4_scr_pool_receipt *pr, ds4_scr_logical_receipt *r, uint32_t check) {
     ds4_tokens full = {.v = v, .len = (int)n, .cap = (int)n};
+    session = s; /* the harness model rows check the active session */
     controls(v);
     CHECK(!ds4_session_scr_pool_select(s, p, &full, 32u, 201, pr));
     if (check) check_restored(s, check);
@@ -102,6 +106,38 @@ static void same_session_edit(const int *a1, int *a2) {
            tail->destination_start, tail->destination_start + tail->count,
            r.execution.multi.committed_tokens, BASE + EDIT);
     harness_session_close(&s);
+}
+
+/* Two live sessions share one pool. Saving B must not make A's own saved
+ * state look cold to A: A's edit is scored against its live archive, its own
+ * entry is no candidate and nothing is restored or rewritten. */
+static void two_sessions(const int *a1, int *a2, int *b1) {
+    char dir[PATH_MAX + 16], err[256];
+    snprintf(dir, sizeof(dir), "%s-two", pool_dir);
+    CHECK(!mkdir(dir, 0700) || errno == EEXIST);
+    static ds4_engine ea, eb; static ds4_session sa, sb;
+    harness_session_open(&ea, &sa, CTX, 512u);
+    harness_session_open(&eb, &sb, CTX, 512u);
+    ds4_scr_pool *pool = NULL;
+    CHECK(!ds4_scr_pool_open(&pool, dir, CTX, CAP, 0, err, sizeof(err)) && !ds4_scr_pool_entries(pool));
+    ds4_scr_pool_receipt pr; ds4_scr_logical_receipt r;
+    policy(&sa, pool, (int *)a1, BASE, &pr, &r, 0);
+    CHECK(pr.saved && pr.entries == 1u);
+    policy(&sb, pool, b1, BASE, &pr, &r, 0);
+    CHECK(pr.saved && pr.entries == 2u);
+    session = &sa;
+    ds4_tokens edited = {.v = a2, .len = (int)(BASE + EDIT), .cap = (int)(BASE + EDIT)};
+    controls(a2);
+    CHECK(!ds4_session_scr_pool_select(&sa, pool, &edited, 32u, 201, &pr));
+    CHECK(pr.selected && !pr.restored && pr.candidates == 1u && pr.hot_covered >= 1200u);
+    /* A's unchanged archive is already held: a shutdown save, which skips
+     * nothing by owner, finds it saved and writes nothing. */
+    CHECK(!ds4_session_scr_pool_save(&sa, pool, true, &pr) && !pr.saved && pr.entries == 2u);
+    CHECK(sa.ds41_graph.archive->tokens[0] == a1[0] && sb.ds41_graph.archive->tokens[0] == b1[0]);
+    ds4_scr_pool_close(pool);
+    harness_session_close(&sb);
+    harness_session_close(&sa);
+    printf("two sessions: each live archive keeps its saved state on a shared pool\n");
 }
 
 int main(void) {
@@ -198,7 +234,8 @@ int main(void) {
 
     harness_session_close(&sb);
     same_session_edit(a1, a2);
+    two_sessions(a1, a2, b1);
     ds4_gpu_tensor_free(rows); ds4_gpu_tensor_free(indices);
-    puts("SCR checkpoint pool: cross-restart reuse, branch fan-out, roundtrip, budget, same-session shared prefix (host storage, simulated rows)");
+    puts("SCR checkpoint pool: cross-restart reuse, branch fan-out, roundtrip, budget, same-session shared prefix, two sessions (host storage, simulated rows)");
     return 0;
 }

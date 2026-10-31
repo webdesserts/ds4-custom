@@ -4663,15 +4663,24 @@ typedef struct {
     uint64_t bytes;
 } ds41_pool_entry;
 
+#define DS41_POOL_HOT_RECORDS 16u
 struct ds4_scr_pool {
     char directory[PATH_MAX];
     uint32_t context, capacity, count;
     uint64_t budget, bytes;
     ds41_pool_entry entry[DS4_SCR_POOL_MAX_ENTRIES];
-    /* The hot archive state an entry already holds: owner, generation, end. */
-    uint64_t hot_owner, hot_generation;
-    uint32_t hot_end;
-    char hot_name[17];
+    /* Per live archive (one per session of a batched server): the archive
+     * state an entry already holds, as owner, generation and end. Most recent
+     * last; a full table drops its oldest record, which only costs a
+     * redundant save. */
+    struct ds41_pool_hot_record {
+        uint64_t owner, generation;
+        uint32_t end;
+        char name[17];
+    } hot[DS41_POOL_HOT_RECORDS];
+    uint32_t hot_count;
+    /* Sessions of one engine share the pool; public calls serialize here. */
+    pthread_mutex_t mu;
 };
 
 static uint64_t ds41_pool_now(void) {
@@ -4742,10 +4751,15 @@ static void ds41_pool_unlink(const ds4_scr_pool *p, const char *name) {
     for (unsigned i = 0; i < 3; ++i)
         if (ds41_pool_path(p, name, parts[i], false, path)) (void)unlink(path);
 }
+static void ds41_pool_hot_drop(ds4_scr_pool *p, uint32_t i) {
+    memmove(&p->hot[i], &p->hot[i + 1], (size_t)(p->hot_count - i - 1u) * sizeof(p->hot[0]));
+    memset(&p->hot[--p->hot_count], 0, sizeof(p->hot[0]));
+}
 static void ds41_pool_remove(ds4_scr_pool *p, uint32_t index) {
     ds41_pool_entry *e = &p->entry[index];
     ds41_pool_unlink(p, e->name);
-    if (!strcmp(e->name, p->hot_name)) { p->hot_name[0] = '\0'; p->hot_owner = 0; }
+    for (uint32_t i = 0; i < p->hot_count;)
+        if (!strcmp(e->name, p->hot[i].name)) ds41_pool_hot_drop(p, i); else ++i;
     p->bytes -= e->bytes;
     free(e->tokens); free(e->pads);
     memmove(e, e + 1, (size_t)(p->count - index - 1u) * sizeof(*e));
@@ -4838,11 +4852,17 @@ int ds4_scr_pool_open(ds4_scr_pool **out, const char *directory, uint32_t contex
     }
     ds4_scr_pool *p = calloc(1, sizeof(*p));
     if (!p) { if (errlen) snprintf(err, errlen, "SCR pool: allocation failed"); return 1; }
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    const int mu_rc = pthread_mutex_init(&p->mu, &attr);
+    pthread_mutexattr_destroy(&attr);
+    if (mu_rc) { if (errlen) snprintf(err, errlen, "SCR pool: mutex init failed"); free(p); return 1; }
     int n = snprintf(p->directory, sizeof(p->directory), "%s", directory);
     DIR *dir = n > 0 && (size_t)n < sizeof(p->directory) ? opendir(directory) : NULL;
     if (!dir) {
         if (errlen) snprintf(err, errlen, "SCR pool: cannot open %s: %s", directory, strerror(errno));
-        free(p); return 1;
+        pthread_mutex_destroy(&p->mu); free(p); return 1;
     }
     p->context = context; p->capacity = capacity;
     p->budget = budget_bytes ? budget_bytes : DS4_SCR_POOL_DEFAULT_BYTES;
@@ -4899,10 +4919,16 @@ int ds4_scr_pool_open(ds4_scr_pool **out, const char *directory, uint32_t contex
 void ds4_scr_pool_close(ds4_scr_pool *p) {
     if (!p) return;
     for (uint32_t i = 0; i < p->count; ++i) { free(p->entry[i].tokens); free(p->entry[i].pads); }
+    pthread_mutex_destroy(&p->mu);
     free(p);
 }
 uint32_t ds4_scr_pool_entries(const ds4_scr_pool *p) {
-    return p ? p->count : 0;
+    if (!p) return 0;
+    ds4_scr_pool *m = (ds4_scr_pool *)p;
+    pthread_mutex_lock(&m->mu);
+    const uint32_t count = p->count;
+    pthread_mutex_unlock(&m->mu);
+    return count;
 }
 
 #if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
@@ -4955,13 +4981,24 @@ static bool ds41_pool_save_raw(ds41_scr_archive *a, const char *path, uint32_t c
     if (!ok) (void)unlink(path);
     return ok;
 }
-static bool ds41_pool_hot(const ds4_scr_pool *p, const ds41_scr_archive *a) {
-    return a && p->hot_name[0] && a->observation_id == p->hot_owner &&
-        a->source_generation == p->hot_generation && a->end == p->hot_end;
+static int ds41_pool_hot_find(const ds4_scr_pool *p, uint64_t owner) {
+    for (uint32_t i = 0; i < p->hot_count; ++i)
+        if (p->hot[i].owner == owner) return (int)i;
+    return -1;
+}
+/* The entry name this live archive's current state is saved as, or NULL. */
+static const char *ds41_pool_hot(const ds4_scr_pool *p, const ds41_scr_archive *a) {
+    const int i = a ? ds41_pool_hot_find(p, a->observation_id) : -1;
+    return i >= 0 && a->source_generation == p->hot[i].generation &&
+        a->end == p->hot[i].end ? p->hot[i].name : NULL;
 }
 static void ds41_pool_mark_hot(ds4_scr_pool *p, const ds41_scr_archive *a, const char *name) {
-    p->hot_owner = a->observation_id; p->hot_generation = a->source_generation;
-    p->hot_end = a->end; memcpy(p->hot_name, name, 17);
+    const int found = ds41_pool_hot_find(p, a->observation_id);
+    if (found >= 0) ds41_pool_hot_drop(p, (uint32_t)found);
+    else if (p->hot_count == DS41_POOL_HOT_RECORDS) ds41_pool_hot_drop(p, 0);
+    struct ds41_pool_hot_record *h = &p->hot[p->hot_count++];
+    h->owner = a->observation_id; h->generation = a->source_generation;
+    h->end = a->end; memcpy(h->name, name, 17);
 }
 /* Persist one published archive; the entry named `keep`, if any, is neither
  * superseded nor evicted. Returns 0 when the pool holds the archive. */
@@ -5132,8 +5169,8 @@ static bool ds41_pool_session_idle(const ds4_session *s) {
 }
 #endif
 
-int ds4_session_scr_pool_select(ds4_session *s, ds4_scr_pool *p, const ds4_tokens *request,
-                                uint32_t max_ranges, int pad_token, ds4_scr_pool_receipt *receipt) {
+static int ds41_pool_select_locked(ds4_session *s, ds4_scr_pool *p, const ds4_tokens *request,
+                                   uint32_t max_ranges, int pad_token, ds4_scr_pool_receipt *receipt) {
     ds4_scr_pool_receipt local = {0}, *r = receipt ? receipt : &local;
     memset(r, 0, sizeof(*r));
     r->entries = ds4_scr_pool_entries(p);
@@ -5179,7 +5216,8 @@ int ds4_session_scr_pool_select(ds4_session *s, ds4_scr_pool *p, const ds4_token
     }
     for (uint32_t i = 0; i < p->count && i < DS4_SCR_POOL_MAX_ENTRIES; ++i) {
         const ds41_pool_entry *e = &p->entry[i];
-        if (hot && ds41_pool_hot(p, a) && !strcmp(e->name, p->hot_name)) continue;
+        const char *held = hot ? ds41_pool_hot(p, a) : NULL;
+        if (held && !strcmp(e->name, held)) continue;
         if (ds4_session_cancelled(s)) break;
         const uint32_t count = e->h.end - e->h.start;
         pool_entry[r->candidates] = i;
@@ -5217,16 +5255,16 @@ int ds4_session_scr_pool_select(ds4_session *s, ds4_scr_pool *p, const ds4_token
 #endif
 }
 
-int ds4_session_scr_pool_save(ds4_session *s, ds4_scr_pool *p, bool include_appends,
-                              ds4_scr_pool_receipt *receipt) {
+static int ds41_pool_save_locked(ds4_session *s, ds4_scr_pool *p, bool include_appends,
+                                 ds4_scr_pool_receipt *receipt) {
     ds4_scr_pool_receipt local = {0}, *r = receipt ? receipt : &local;
     r->saved = false;
     r->entries = ds4_scr_pool_entries(p);
 #if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
     if (!s || !p || !ds41_pool_session_idle(s) || !s->ds41_graph.archive) return 0;
     /* Appends keep the owner; refresh and rebase seal a new one. */
-    if (!include_appends && p->hot_name[0] &&
-        s->ds41_graph.archive->observation_id == p->hot_owner) return 0;
+    if (!include_appends && ds41_pool_hot_find(p, s->ds41_graph.archive->observation_id) >= 0)
+        return 0;
     const double began = now_sec();
     int rc = ds41_pool_save_archive(s, p, s->ds41_graph.archive, NULL, r);
     r->entries = p->count;
@@ -5236,6 +5274,22 @@ int ds4_session_scr_pool_save(ds4_session *s, ds4_scr_pool *p, bool include_appe
     (void)s; (void)include_appends;
     return 0;
 #endif
+}
+
+/* Sessions of a batched server share one pool. */
+int ds4_session_scr_pool_select(ds4_session *s, ds4_scr_pool *p, const ds4_tokens *request,
+                                uint32_t max_ranges, int pad_token, ds4_scr_pool_receipt *receipt) {
+    if (p) pthread_mutex_lock(&p->mu);
+    const int rc = ds41_pool_select_locked(s, p, request, max_ranges, pad_token, receipt);
+    if (p) pthread_mutex_unlock(&p->mu);
+    return rc;
+}
+int ds4_session_scr_pool_save(ds4_session *s, ds4_scr_pool *p, bool include_appends,
+                              ds4_scr_pool_receipt *receipt) {
+    if (p) pthread_mutex_lock(&p->mu);
+    const int rc = ds41_pool_save_locked(s, p, include_appends, receipt);
+    if (p) pthread_mutex_unlock(&p->mu);
+    return rc;
 }
 #endif
 
