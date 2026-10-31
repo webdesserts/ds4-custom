@@ -41311,6 +41311,35 @@ static bool ds41_fused_bf16_enabled(void) {
     return enabled;
 }
 
+/* HC weighted sums and HC=4 expands likewise round in their kernels;
+ * DS4_METAL_V41_FUSED_HC=0 keeps the separate pass. `rows` token rows. */
+static bool ds41_fused_hc_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *v = getenv("DS4_METAL_V41_FUSED_HC");
+        enabled = !(v && !strcmp(v, "0"));
+    }
+    return enabled;
+}
+
+static bool ds41_hc_sum_rounded(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
+                                const ds4_gpu_tensor *weights, bool split, uint32_t rows) {
+    if (ds41_fused_hc_enabled())
+        return ds4_gpu_hc_weighted_sum_bf16_tensor(out, in, weights, DS4_N_EMBD, DS4_N_HC, split);
+    return (split ? ds4_gpu_hc_weighted_sum_split_tensor(out, in, weights, DS4_N_EMBD, DS4_N_HC) :
+        ds4_gpu_hc_weighted_sum_tensor(out, in, weights, DS4_N_EMBD, DS4_N_HC)) &&
+        ds4_gpu_dsv41_quantize(out, DS4_N_EMBD, rows, DS4_V41_BF16);
+}
+
+static bool ds41_hc_expand_rounded(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
+                                   const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split,
+                                   uint32_t rows) {
+    if (ds41_fused_hc_enabled())
+        return ds4_gpu_hc_expand_split_bf16_tensor(out, block, residual, split, DS4_N_EMBD, DS4_N_HC);
+    return ds4_gpu_hc_expand_split_tensor(out, block, residual, split, DS4_N_EMBD, DS4_N_HC) &&
+        ds4_gpu_dsv41_quantize(out, DS4_N_EMBD * DS4_N_HC, rows, DS4_V41_BF16);
+}
+
 /* Weighted RMS norms likewise round in the norm kernel;
  * DS4_METAL_V41_FUSED_NORM=0 keeps the separate pass. */
 static bool ds41_fused_norm_enabled(void) {
@@ -41470,9 +41499,7 @@ static bool ds41_hc_sum(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
     if (!getenv("DS4_CUDA_DISABLE_V41_POINTWISE_FUSION"))
         return ds4_gpu_dsv41_hc_sum(out, in, weights, DS4_N_EMBD, 1, split ? 24u : 4u);
 #endif
-    return (split ? ds4_gpu_hc_weighted_sum_split_tensor(out, in, weights, DS4_N_EMBD, DS4_N_HC) :
-        ds4_gpu_hc_weighted_sum_tensor(out, in, weights, DS4_N_EMBD, DS4_N_HC)) &&
-        ds41_bf16(out, DS4_N_EMBD);
+    return ds41_hc_sum_rounded(out, in, weights, split, 1);
 }
 
 static bool ds41_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
@@ -41481,8 +41508,7 @@ static bool ds41_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
     if (!getenv("DS4_CUDA_DISABLE_V41_POINTWISE_FUSION"))
         return ds4_gpu_dsv41_hc_expand(out, block, residual, split, DS4_N_EMBD, 1);
 #endif
-    return ds4_gpu_hc_expand_split_tensor(out, block, residual, split, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(out, DS4_N_EMBD * DS4_N_HC);
+    return ds41_hc_expand_rounded(out, block, residual, split, 1);
 }
 
 static bool ds41_sum_partial_batch(ds41_gpu_graph *g, ds4_gpu_tensor *x,
@@ -41927,21 +41953,15 @@ static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
     }
     if (!ds41_stage("hc.pre_attn") || !ds41_hc_mix_batch(b, m, l, false, count)) return false;
     /* V4.1 consumes the preceding sublayer's mixer, not the newly computed one. */
-    const bool mixed = il ?
-        ds4_gpu_hc_weighted_sum_split_tensor(b->x, b->residual, b->ffn_split, DS4_N_EMBD, DS4_N_HC) :
-        ds4_gpu_hc_weighted_sum_tensor(b->x, b->residual, b->pre, DS4_N_EMBD, DS4_N_HC);
-    return mixed && ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, count, DS4_V41_BF16) &&
+    return ds41_hc_sum_rounded(b->x, b->residual, il ? b->ffn_split : b->pre, il != 0, count) &&
         ds41_norm_batch(b->norm, b->x, m, l->attn_norm, count);
 }
 
 static bool ds41_after_attention_batch(ds41_prefill_row *b, const ds4_model *m,
                                         const ds4_layer_weights *l, uint32_t count) {
-    return ds4_gpu_hc_expand_split_tensor(b->after_attn, b->block, b->residual,
-        b->attn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds4_gpu_dsv41_quantize(b->after_attn, DS4_N_EMBD * DS4_N_HC, count, DS4_V41_BF16) &&
+    return ds41_hc_expand_rounded(b->after_attn, b->block, b->residual, b->attn_split, count) &&
         ds41_hc_mix_batch(b, m, l, true, count) &&
-        ds4_gpu_hc_weighted_sum_split_tensor(b->x, b->after_attn, b->attn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, count, DS4_V41_BF16) &&
+        ds41_hc_sum_rounded(b->x, b->after_attn, b->attn_split, true, count) &&
         ds41_norm_batch(b->norm, b->x, m, l->ffn_norm, count);
 }
 
@@ -42622,12 +42642,10 @@ static bool ds41_decoder_prepare(ds41_gpu_graph *g, const ds4_model *m,
 #undef DS41_DECODER_VIEW
         if (ok) ok = ds4_gpu_begin_commands() != 0;
         if (ok) ok = ds41_carry_copy(g, off, count, false);
-        if (ok && batch_attention) ok = split_pre ?
-            ds4_gpu_hc_weighted_sum_split_tensor(active.x, active.residual, active.ffn_split,
-                                                DS4_N_EMBD, DS4_N_HC) :
-            ds4_gpu_hc_weighted_sum_tensor(active.x, active.residual, active.pre, DS4_N_EMBD, DS4_N_HC);
-        if (ok && batch_attention) ok = ds4_gpu_dsv41_quantize(active.x, DS4_N_EMBD, count, DS4_V41_BF16) &&
-            ds41_norm_batch(active.norm, active.x, m, l->attn_norm, count);
+        if (ok && batch_attention)
+            ok = ds41_hc_sum_rounded(active.x, active.residual,
+                    split_pre ? active.ffn_split : active.pre, split_pre, count) &&
+                ds41_norm_batch(active.norm, active.x, m, l->attn_norm, count);
         if (ok && batch_publish)
             ok = ds41_attention_publish_batch(g, &active, m, l, il, initial_start + off, count);
         if (ok && !publish && batch_attention)
@@ -43011,9 +43029,8 @@ static bool ds41_graph_prefill_sweep_body(ds41_gpu_graph *g, const ds4_model *m,
                 if (ok && batch_hc) {
                     ok = ds4_gpu_add_tensor(active.block, active.routed, active.shared, count * DS4_N_EMBD) &&
                         ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, count, DS4_V41_BF16) &&
-                        ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
-                            active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
-                        ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, count, DS4_V41_BF16);
+                        ds41_hc_expand_rounded(active.residual, active.block, active.after_attn,
+                            active.ffn_split, count);
                 }
                 for (uint32_t t = 0; ok && !batch_hc && t < count; t++) {
 #define DS41_USE_MOE_ROW(name, width) row.name = g->rows_view[t].name;
@@ -43332,9 +43349,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                 (uint64_t)rows * DS4_N_EMBD * sizeof(float)) :
                 ds4_gpu_add_tensor(active.block, active.routed, active.shared, rows * DS4_N_EMBD)) &&
             ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
-            ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
-                active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
-            ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, rows, DS4_V41_BF16);
+            ds41_hc_expand_rounded(active.residual, active.block, active.after_attn,
+                active.ffn_split, rows);
         /* Without its own rows, the second Engram upload reuses the first
          * one's input storage and must wait for layer 1 to consume it. */
         if (ok && il == 13 && !engram_rows1) ok = ds41_stage("sync.layer13") &&

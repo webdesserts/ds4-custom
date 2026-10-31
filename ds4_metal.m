@@ -44946,6 +44946,10 @@ int ds4_gpu_hc_split_sinkhorn_tensor(
     return 1;
 }
 
+/* Set only by the *_bf16 HC wrappers below: the HC weighted-sum and HC=4
+ * expand dispatches then use their BF16-rounding kernels. */
+static bool g_hc_round_bf16;
+
 static int ds4_gpu_hc_weighted_sum_strided(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *residual_hc,
@@ -45018,7 +45022,10 @@ static int ds4_gpu_hc_weighted_sum_strided(
         if (!cb) return 0;
 
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:g_hc_weighted_sum_pipeline];
+        id<MTLComputePipelineState> sum_pipeline = g_hc_round_bf16 ?
+            ds4_gpu_get_pipeline("kernel_dsv4_hc_weighted_sum_bf16") : g_hc_weighted_sum_pipeline;
+        if (!sum_pipeline) return 0;
+        [enc setComputePipelineState:sum_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(residual_hc) atIndex:1];
         [enc setBuffer:wbuf offset:ds4_gpu_tensor_offset(weights) + (NSUInteger)weight_offset atIndex:2];
@@ -46235,6 +46242,27 @@ int ds4_gpu_hc_expand_add_tensor(
     return 1;
 }
 
+int ds4_gpu_hc_weighted_sum_bf16_tensor(ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *weights,
+        uint32_t n_embd, uint32_t n_hc, bool split) {
+    g_hc_round_bf16 = true;
+    const int ok = split ?
+        ds4_gpu_hc_weighted_sum_split_tensor(out, residual_hc, weights, n_embd, n_hc) :
+        ds4_gpu_hc_weighted_sum_tensor(out, residual_hc, weights, n_embd, n_hc);
+    g_hc_round_bf16 = false;
+    return ok;
+}
+
+int ds4_gpu_hc_expand_split_bf16_tensor(ds4_gpu_tensor *out_hc,
+        const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
+    if (n_hc != 4) return 0;
+    g_hc_round_bf16 = true;
+    const int ok = ds4_gpu_hc_expand_split_tensor(out_hc, block_out, residual_hc, split, n_embd, n_hc);
+    g_hc_round_bf16 = false;
+    return ok;
+}
+
 int ds4_gpu_hc_expand_split_tensor(
         ds4_gpu_tensor       *out_hc,
         const ds4_gpu_tensor *block_out,
@@ -46317,9 +46345,12 @@ int ds4_gpu_hc_expand_split_tensor(
         id<MTLComputePipelineState> expand_pipeline = g_hc_expand_pipeline;
         uint64_t n_elem = (uint64_t)n_embd * n_hc * n_tokens64;
         if (n_hc == 4) {
-            expand_pipeline = ds4_gpu_hot_pipeline(g_dsv4_hc_expand4_pipeline,
-                                                      "kernel_dsv4_hc_expand4");
+            expand_pipeline = g_hc_round_bf16 ?
+                ds4_gpu_get_pipeline("kernel_dsv4_hc_expand4_bf16") :
+                ds4_gpu_hot_pipeline(g_dsv4_hc_expand4_pipeline, "kernel_dsv4_hc_expand4");
             n_elem = (uint64_t)n_embd * n_tokens64;
+        } else if (g_hc_round_bf16) {
+            expand_pipeline = nil;
         }
         if (!expand_pipeline) {
             fprintf(stderr, "ds4: Metal HC expand split pipeline is unavailable\n");

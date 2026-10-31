@@ -3167,6 +3167,15 @@ int ds4_gpu_hc_expand_add_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+/* V4.1: HC weighted sum (split: split-mixer weights) and HC=4 expand with
+ * the BF16 rounding of the outputs fused in; same bits as the plain call
+ * plus ds4_gpu_dsv41_quantize(BF16). */
+int ds4_gpu_hc_weighted_sum_bf16_tensor(ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *weights,
+        uint32_t n_embd, uint32_t n_hc, bool split);
+int ds4_gpu_hc_expand_split_bf16_tensor(ds4_gpu_tensor *out_hc,
+        const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc);
 int ds4_gpu_hc_expand_split_tensor(
         ds4_gpu_tensor       *out_hc,
         const ds4_gpu_tensor *block_out,

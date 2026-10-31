@@ -887,6 +887,68 @@ static int check_fused_norm(void) {
 }
 #endif
 
+#ifdef __APPLE__
+/* Fused BF16 rounding in the HC weighted sum (pre and split weights) and
+ * the HC=4 split expand against the plain kernels plus the separate pass:
+ * random activations and mixers with some huge values, rows 1..6. */
+static int check_fused_hc(void) {
+    enum { ROWS = 6, E = 5120, HC = 4, MIX = 2 * HC + HC * HC };
+    const uint64_t hcb = (uint64_t)ROWS * HC * E * 4, eb = (uint64_t)ROWS * E * 4, mb = (uint64_t)ROWS * MIX * 4;
+    float *hc = malloc(hcb), *blk = malloc(eb), *mix = malloc(mb), *plain = malloc(hcb), *fused = malloc(hcb);
+    CHECK(hc && blk && mix && plain && fused);
+    for (uint64_t i = 0; i < hcb / 4; i++) hc[i] = random_value() * 8.0f;
+    for (uint64_t i = 0; i < eb / 4; i++) blk[i] = random_value() * 8.0f;
+    for (uint64_t i = 0; i < mb / 4; i++) mix[i] = random_value();
+    hc[3] = 3.0e38f; mix[0] = 4.0f; /* overflow in row 0 */
+    ds4_gpu_tensor *hct = upload(hc, hcb), *bt = upload(blk, eb), *mt = upload(mix, mb);
+    ds4_gpu_tensor *ot = upload(NULL, hcb);
+    CHECK(hct && bt && mt && ot);
+    for (int kind = 0; kind < 3; kind++) {
+        for (uint32_t rows = 1; rows <= ROWS; rows++) {
+            const uint64_t width = kind == 2 ? (uint64_t)HC * E : E;
+            ds4_gpu_tensor *o = ds4_gpu_tensor_view(ot, 0, rows * width * 4);
+            CHECK(o);
+            for (int f = 0; f < 2; f++) {
+                CHECK(ds4_gpu_tensor_fill_f32(ot, NAN, hcb / 4));
+                CHECK(ds4_gpu_begin_commands());
+                if (kind < 2 && !f) {
+                    CHECK(kind ? ds4_gpu_hc_weighted_sum_split_tensor(o, hct, mt, E, HC) :
+                                 ds4_gpu_hc_weighted_sum_tensor(o, hct, mt, E, HC));
+                    CHECK(ds4_gpu_dsv41_quantize(o, E, rows, DS4_V41_BF16));
+                } else if (kind < 2) {
+                    CHECK(ds4_gpu_hc_weighted_sum_bf16_tensor(o, hct, mt, E, HC, kind == 1));
+                } else if (!f) {
+                    CHECK(ds4_gpu_hc_expand_split_tensor(o, bt, hct, mt, E, HC));
+                    CHECK(ds4_gpu_dsv41_quantize(o, HC * E, rows, DS4_V41_BF16));
+                } else {
+                    CHECK(ds4_gpu_hc_expand_split_bf16_tensor(o, bt, hct, mt, E, HC));
+                }
+                CHECK(ds4_gpu_end_commands());
+                CHECK(ds4_gpu_tensor_read(ot, 0, f ? fused : plain, hcb));
+            }
+            if (memcmp(fused, plain, rows * width * 4))
+                fprintf(stderr, "fused hc mismatch kind=%d rows=%u\n", kind, rows);
+            CHECK(!memcmp(fused, plain, rows * width * 4));
+            for (uint64_t i = rows * width; i < hcb / 4; i++) CHECK(isnan(fused[i]));
+            bool unrounded = false, nonfinite = false;
+            for (uint64_t i = 0; i < rows * width; i++) {
+                uint32_t bits; memcpy(&bits, &fused[i], 4);
+                unrounded |= isfinite(fused[i]) && (bits & 0xffffu);
+                nonfinite |= !isfinite(fused[i]);
+            }
+            CHECK(!unrounded && nonfinite);
+            ds4_gpu_tensor_free(o);
+        }
+        fprintf(stderr, "V4.1 fused BF16 HC %s rows 1..%u: PASS\n",
+                kind == 0 ? "weighted sum" : kind == 1 ? "weighted sum split" : "expand split", ROWS);
+    }
+    CHECK(!ds4_gpu_hc_expand_split_bf16_tensor(ot, bt, hct, mt, E, 3));
+    ds4_gpu_tensor_free(hct); ds4_gpu_tensor_free(bt); ds4_gpu_tensor_free(mt); ds4_gpu_tensor_free(ot);
+    free(hc); free(blk); free(mix); free(plain); free(fused);
+    return 1;
+}
+#endif
+
 static int check_attention_output(bool large) {
     enum { GROUP = 4096, RANK = 1024, GROUPS = 8, OUT = 5120 };
     const uint32_t ROWS = large ? 8192u : 513u;
@@ -1980,6 +2042,11 @@ int main(int argc, char **argv) {
         return ok ? 0 : 1;
     }
 #ifdef __APPLE__
+    if (argc == 2 && !strcmp(argv[1], "--fused-hc")) {
+        const int ok = ds4_gpu_init() && check_fused_hc();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--fused-norm")) {
         const int ok = ds4_gpu_init() && check_fused_norm();
         ds4_gpu_cleanup();
