@@ -10084,6 +10084,10 @@ struct server_slot {
     job *assigned;
     job *running;
     bool busy;
+    /* SCR routing, under s->mu: the prompt of the last dispatched request and
+     * whether that request has finished while the slot is still busy. */
+    ds4_tokens route_prompt;
+    bool finishing;
     bool prefill_waiting;
 
     bool decode_pending;
@@ -14949,6 +14953,12 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     if (server_scr_enabled(s)) {
         bool cancelled = job_cancelled(j);
         bool success = j->scr_terminal_success && !cancelled;
+        if (success && s->batched_mode) {
+            /* The response is out: a follow-up may wait for this slot. */
+            pthread_mutex_lock(&s->mu);
+            slot->finishing = true;
+            pthread_mutex_unlock(&s->mu);
+        }
         if (cancelled && !j->reuse.error_phase) j->reuse.error_phase = "cancelled";
         ds4_scr_retire_receipt r = {0};
         if (!success) r = server_scr_retire_owned(s, slot);
@@ -15061,6 +15071,8 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
 #include "adapter/include/slot_router.h"
 #define SERVER_ROUTE_MAX_SLOTS 64
 #define SERVER_ROUTE_MIN_MATCH 128u
+/* About two seconds of prefill: worth waiting for a slot that is freeing. */
+#define SERVER_ROUTE_WAIT_GAIN 2048u
 
 /* Tokens a different conversation can share with this request: everything
  * before the first assistant marker (system prompt and first user turn).
@@ -15090,6 +15102,7 @@ static const char *server_route_reason(uint32_t reason) {
     case DS4_SLOT_ROUTE_EMPTY: return "empty";
     case DS4_SLOT_ROUTE_STALE: return "stale";
     case DS4_SLOT_ROUTE_CHEAPEST: return "cheapest";
+    case DS4_SLOT_ROUTE_WAIT: return "wait";
     default: return "queue";
     }
 }
@@ -15105,6 +15118,16 @@ static server_slot *job_route_scr_locked(server *s, const job *j, time_t now,
         server_slot *slot = &s->slots[i];
         ds4_slot_route_input *x = &in[i];
         x->available = !slot->busy && !slot->assigned;
+        if (!x->available && slot->finishing && slot->route_prompt.len > 0) {
+            /* The worker still owns the session; its last prompt stands in. */
+            const ds4_tokens *p = &slot->route_prompt, *q = &j->req.prompt;
+            int n = p->len < q->len ? p->len : q->len, i = 0;
+            while (i < n && p->v[i] == q->v[i]) i++;
+            x->finishing = 1;
+            x->live_tokens = (uint32_t)p->len;
+            x->reuse_tokens = (uint32_t)i;
+            continue;
+        }
         if (!x->available || !slot->session || !ds4_session_checkpoint_valid(slot->session))
             continue;
         x->live_tokens = (uint32_t)ds4_session_pos(slot->session);
@@ -15120,14 +15143,15 @@ static server_slot *job_route_scr_locked(server *s, const job *j, time_t now,
         .request_tokens = j->req.prompt.len > 0 ? (uint32_t)j->req.prompt.len : 0u,
         .conversation_floor = server_route_conversation_floor(s, &j->req.prompt),
         .min_match = SERVER_ROUTE_MIN_MATCH,
+        .wait_gain = SERVER_ROUTE_WAIT_GAIN,
         .stale_after_seconds = (uint64_t)SLOT_STALE_AFTER_SEC,
     };
     const int32_t chosen = ds4_slot_route(&req, in, (uint32_t)s->slot_count, d);
-    if (chosen >= 0)
+    if (chosen >= 0 || d->reason == DS4_SLOT_ROUTE_WAIT)
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: slot route slot=%d reason=%s reuse=%u floor=%u live=%u evicted=%u prompt=%u",
                    chosen, server_route_reason(d->reason), d->reuse_tokens, req.conversation_floor,
-                   in[chosen].live_tokens, d->evicted_tokens, req.request_tokens);
+                   chosen >= 0 ? in[chosen].live_tokens : 0u, d->evicted_tokens, req.request_tokens);
     return chosen >= 0 && chosen < s->slot_count ? &s->slots[chosen] : NULL;
 }
 #endif
@@ -15200,6 +15224,12 @@ static void dispatch_jobs_locked(server *s) {
         chosen->next = NULL;
         chosen_slot->assigned = chosen;
         chosen_slot->busy = true;
+        chosen_slot->finishing = false;
+        if (server_scr_enabled(s)) {
+            chosen_slot->route_prompt.len = 0;
+            for (int i = 0; i < chosen->req.prompt.len; i++)
+                ds4_tokens_push(&chosen_slot->route_prompt, chosen->req.prompt.v[i]);
+        }
         if (chosen_evict_live > 0) {
             server_log(DS4_LOG_KVCACHE,
                        "slot %d: request reuses nothing; evicting checkpoint "
@@ -15291,6 +15321,7 @@ static void *slot_worker_main(void *arg) {
 
         pthread_mutex_lock(&s->mu);
         slot->busy = false;
+        slot->finishing = false;
         dispatch_jobs_locked(s);
         pthread_mutex_unlock(&s->mu);
     }
@@ -15855,6 +15886,7 @@ static int server_close_resources(server *s) {
         live_tool_state_free(&slot->anthropic_live);
         visible_live_free(&slot->thinking_live);
         free(slot->live_text);
+        ds4_tokens_free(&slot->route_prompt);
         slot->live_text = NULL;
         slot->live_text_len = 0;
         slot->live_text_pos = 0;

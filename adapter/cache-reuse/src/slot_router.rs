@@ -15,6 +15,12 @@
 //! 4. **Cheapest**: the slot with the fewest live tokens (the least prefilled
 //!    work lost), the longest idle on ties.
 //!
+//! Before those, the request **waits** when its owner is busy but finishing
+//! (its response is delivered, post-request bookkeeping is running) and
+//! would reuse at least `wait_gain` tokens more than the best available
+//! owner: a client's immediate follow-up should not start a cold slot just
+//! because the previous turn has not released its slot yet.
+//!
 //! With no available slot the request queues.
 
 /// Per-slot state relative to one request.
@@ -25,6 +31,8 @@ pub struct SlotRouteInput {
     pub available: u8,
     /// A protocol-bound live tier matched (tool-call ids or visible transcript).
     pub bound: u8,
+    /// Busy, but its request has finished and the slot is about to free.
+    pub finishing: u8,
     pub live_tokens: u32,
     /// Tokens of the request this slot can reuse.
     pub reuse_tokens: u32,
@@ -38,6 +46,8 @@ pub struct SlotRouteRequest {
     pub request_tokens: u32,
     pub conversation_floor: u32,
     pub min_match: u32,
+    /// Extra reusable tokens that justify waiting for a finishing owner.
+    pub wait_gain: u32,
     pub stale_after_seconds: u64,
 }
 
@@ -46,6 +56,7 @@ pub const SLOT_ROUTE_OWNER: u32 = 1;
 pub const SLOT_ROUTE_EMPTY: u32 = 2;
 pub const SLOT_ROUTE_STALE: u32 = 3;
 pub const SLOT_ROUTE_CHEAPEST: u32 = 4;
+pub const SLOT_ROUTE_WAIT: u32 = 5;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -76,6 +87,17 @@ pub fn route(req: &SlotRouteRequest, slots: &[SlotRouteInput]) -> SlotRouteDecis
         }
     };
     let available = || slots.iter().enumerate().filter(|(_, s)| s.available != 0);
+
+    let best_available = available().filter(|(_, s)| owns(req, s)).map(|(_, s)| s.reuse_tokens).max().unwrap_or(0);
+    if let Some(s) = slots
+        .iter()
+        .filter(|s| s.available == 0 && s.finishing != 0 && owns(req, s))
+        .max_by_key(|s| s.reuse_tokens)
+    {
+        if s.reuse_tokens >= best_available.saturating_add(req.wait_gain.max(1)) {
+            return SlotRouteDecision { slot: -1, reason: SLOT_ROUTE_WAIT, reuse_tokens: s.reuse_tokens, evicted_tokens: 0 };
+        }
+    }
 
     // Most reuse; then the least of the slot's own history lost; then lowest index.
     if let Some((i, _)) = available()
@@ -136,11 +158,12 @@ mod tests {
         request_tokens: 9000,
         conversation_floor: 6200,
         min_match: 128,
+        wait_gain: 2048,
         stale_after_seconds: 3600,
     };
 
     fn slot(available: bool, live: u32, reuse: u32, idle: u64) -> SlotRouteInput {
-        SlotRouteInput { available: available as u8, bound: 0, live_tokens: live, reuse_tokens: reuse, idle_seconds: idle }
+        SlotRouteInput { available: available as u8, bound: 0, finishing: 0, live_tokens: live, reuse_tokens: reuse, idle_seconds: idle }
     }
 
     #[test]
@@ -177,6 +200,25 @@ mod tests {
         let slots = [slot(false, 8100, 8000, 0), slot(true, 0, 0, 0)];
         let d = route(&REQ, &slots);
         assert_eq!((d.slot, d.reason), (1, SLOT_ROUTE_EMPTY));
+    }
+
+    #[test]
+    fn immediate_follow_up_waits_for_its_finishing_slot() {
+        let mut owner = slot(false, 11071, 10910, 0);
+        owner.finishing = 1;
+        let slots = [owner, slot(true, 0, 0, 0)];
+        let d = route(&REQ, &slots);
+        assert_eq!((d.slot, d.reason, d.reuse_tokens), (-1, SLOT_ROUTE_WAIT, 10910));
+        // A still-generating owner is not waited for.
+        let slots = [slot(false, 11071, 10910, 0), slot(true, 0, 0, 0)];
+        assert_eq!(route(&REQ, &slots).reason, SLOT_ROUTE_EMPTY);
+        // Not worth waiting when an available owner reuses nearly as much.
+        let slots = [owner, slot(true, 10000, 9500, 0)];
+        assert_eq!(route(&REQ, &slots).reason, SLOT_ROUTE_OWNER);
+        // A finishing slot of another conversation is no reason to wait.
+        let mut other = slot(false, 7000, 6200, 0);
+        other.finishing = 1;
+        assert_eq!(route(&REQ, &[other, slot(true, 0, 0, 0)]).reason, SLOT_ROUTE_EMPTY);
     }
 
     #[test]
