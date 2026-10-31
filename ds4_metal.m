@@ -19676,6 +19676,36 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
     return 1;
 }
 
+/* Decode-row matvec pipeline whose writer rounds outputs to BF16. */
+static id<MTLComputePipelineState> ds4_gpu_get_mul_mv_bf16_pipeline(
+        const char *function_name,
+        int16_t     nsg) {
+    NSString *key = [NSString stringWithFormat:@"%s_nsg=%d_bf16", function_name, (int)nsg];
+    id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
+    if (cached) return cached;
+    MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
+    const bool bf16 = true;
+    [constants setConstantValue:&nsg type:MTLDataTypeShort atIndex:600];
+    [constants setConstantValue:&bf16 type:MTLDataTypeBool atIndex:602];
+    NSError *error = nil;
+    id<MTLFunction> fn = [g_library newFunctionWithName:[NSString stringWithUTF8String:function_name]
+                                         constantValues:constants
+                                                  error:&error];
+    if (!fn) {
+        fprintf(stderr, "ds4: Metal %s (bf16) function not found: %s\n",
+                function_name, [[error localizedDescription] UTF8String]);
+        return nil;
+    }
+    id<MTLComputePipelineState> pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+    if (!pipeline) {
+        fprintf(stderr, "ds4: Metal %s (bf16) pipeline failed: %s\n",
+                function_name, [[error localizedDescription] UTF8String]);
+        return nil;
+    }
+    [g_pipeline_cache setObject:pipeline forKey:key];
+    return pipeline;
+}
+
 static int ds4_gpu_matmul_q8_0_tensor_impl(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -19780,6 +19810,23 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         uint64_t              out_dim,
         const ds4_gpu_tensor *x,
         uint32_t              n_rows) {
+    return ds4_gpu_matmul_q8_0_decode_rows_exact_bf16_tensor(out, model_map,
+        model_size, weight_offset, in_dim, out_dim, x, n_rows, NULL);
+}
+
+/* rounded != NULL asks for BF16-rounded outputs; *rounded reports whether
+ * the matvec applied it (row-tiled plans only), else the caller rounds. */
+int ds4_gpu_matmul_q8_0_decode_rows_exact_bf16_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows,
+        int                  *rounded) {
+    if (rounded) *rounded = 0;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !x || !model_map || n_rows == 0 ||
         n_rows > INT32_MAX || in_dim == 0 || out_dim == 0 ||
@@ -19832,9 +19879,12 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         dispatch.function_name = plan.name;
         dispatch.smem *= plan.nr1;
 
-        id<MTLComputePipelineState> pipeline =
+        const bool fuse_bf16 = rounded && plan.nr1 > 1u;
+        id<MTLComputePipelineState> pipeline = fuse_bf16 ?
+            ds4_gpu_get_mul_mv_bf16_pipeline(dispatch.function_name, dispatch.nsg) :
             ds4_gpu_get_mul_mv_pipeline(dispatch.function_name, dispatch.nsg);
         if (!pipeline) return 0;
+        if (fuse_bf16) *rounded = 1;
 
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);

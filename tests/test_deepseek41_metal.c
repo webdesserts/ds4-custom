@@ -747,6 +747,84 @@ static int check_f32_rows(void) {
 }
 #endif
 
+#ifdef __APPLE__
+/* Fused BF16 rounding in the Q8_0 decode-row writer against the unfused
+ * matvec plus the separate BF16 pass: random scales and inputs, a NaN row
+ * and an overflowing row (non-finite values pass the rounding unchanged),
+ * rows 1..6, auto and off plans. When the plan has no row tile the call
+ * reports *rounded == 0 and must leave outputs unrounded. */
+static int check_fused_bf16(void) {
+    enum { ROWS = 6 };
+    typedef struct { uint16_t d; int8_t qs[32]; } q8_block;
+    const struct { uint32_t in, out; } shapes[] = {{5120, 1280}, {1280, 4096}, {2304, 5120}, {4096, 64}};
+    const char *modes[] = {"auto", "off"};
+    for (size_t sh = 0; sh < sizeof(shapes) / sizeof(*shapes); sh++) {
+        const uint32_t in = shapes[sh].in, out_dim = shapes[sh].out;
+        const uint64_t wb = (uint64_t)out_dim * in / 32 * sizeof(q8_block);
+        const uint64_t xb = (uint64_t)ROWS * in * 4, ob = (uint64_t)ROWS * out_dim * 4;
+        void *model = NULL;
+        CHECK(posix_memalign(&model, getpagesize(), wb) == 0);
+        q8_block *w = model;
+        for (uint64_t i = 0; i < wb / sizeof(*w); i++) {
+            const int value = (int)(random_value() * 8192);
+            w[i].d = (uint16_t)(0x3000u | ((unsigned)abs(value) % 1024u));
+            for (int j = 0; j < 32; j++) w[i].qs[j] = (int8_t)((int)(random_value() * 8192) % 128);
+        }
+        float *x = malloc(xb), *plain = malloc(ob), *fused = malloc(ob);
+        CHECK(x && plain && fused);
+        for (uint64_t i = 0; i < xb / 4; i++) x[i] = random_value();
+        x[(uint64_t)1 * in + 7] = NAN;
+        for (uint32_t i = 0; i < in; i++) x[(uint64_t)3 * in + i] = 3.0e38f;
+        ds4_gpu_tensor *xt = upload(x, xb), *ot = upload(NULL, ob);
+        CHECK(xt && ot && ds4_gpu_set_model_map(model, wb));
+        for (int mode = 0; mode < 2; mode++) {
+            setenv("DS4_METAL_DECODE_ROWS_MODE", modes[mode], 1);
+            for (uint32_t rows = 1; rows <= ROWS; rows++) {
+                CHECK(ds4_gpu_tensor_fill_f32(ot, NAN, ob / 4));
+                CHECK(ds4_gpu_begin_commands());
+                CHECK(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(ot, model, wb, 0, in, out_dim, xt, rows));
+                CHECK(ds4_gpu_dsv41_quantize(ot, out_dim, rows, DS4_V41_BF16));
+                CHECK(ds4_gpu_end_commands());
+                CHECK(ds4_gpu_tensor_read(ot, 0, plain, ob));
+                CHECK(ds4_gpu_tensor_fill_f32(ot, NAN, ob / 4));
+                int rounded = -1;
+                CHECK(ds4_gpu_begin_commands());
+                CHECK(ds4_gpu_matmul_q8_0_decode_rows_exact_bf16_tensor(ot, model, wb, 0, in, out_dim, xt, rows, &rounded));
+                if (!rounded) CHECK(ds4_gpu_dsv41_quantize(ot, out_dim, rows, DS4_V41_BF16));
+                CHECK(ds4_gpu_end_commands());
+                CHECK(ds4_gpu_tensor_read(ot, 0, fused, ob));
+                CHECK(rounded == 0 || rounded == 1);
+                if (memcmp(fused, plain, (uint64_t)rows * out_dim * 4))
+                    fprintf(stderr, "fused bf16 mismatch %ux%u mode=%s rows=%u rounded=%d\n",
+                            in, out_dim, modes[mode], rows, rounded);
+                CHECK(!memcmp(fused, plain, (uint64_t)rows * out_dim * 4));
+                for (uint64_t i = (uint64_t)rows * out_dim; i < ob / 4; i++) CHECK(isnan(fused[i]));
+                /* Row tiles exist only for auto with several rows and a wide grid. */
+                const bool tiled = mode == 0 && rows > 1 && out_dim >= 128 * 2;
+                if (tiled != (rounded == 1))
+                    fprintf(stderr, "fused bf16 %ux%u mode=%s rows=%u rounded=%d\n", in, out_dim, modes[mode], rows, rounded);
+                CHECK(tiled == (rounded == 1));
+                if (rows > 3) {
+                    /* The NaN and overflow rows really reach non-finite outputs. */
+                    bool nan_seen = false, nonfinite_seen = false;
+                    for (uint32_t i = 0; i < out_dim; i++) {
+                        nan_seen |= isnan(fused[(uint64_t)1 * out_dim + i]);
+                        nonfinite_seen |= !isfinite(fused[(uint64_t)3 * out_dim + i]);
+                    }
+                    CHECK(nan_seen && nonfinite_seen);
+                }
+            }
+            fprintf(stderr, "V4.1 fused BF16 Q8_0 decode rows %ux%u mode=%s rows 1..%u: PASS\n",
+                    in, out_dim, modes[mode], ROWS);
+        }
+        unsetenv("DS4_METAL_DECODE_ROWS_MODE");
+        ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(ot);
+        free(x); free(plain); free(fused); free(model);
+    }
+    return 1;
+}
+#endif
+
 static int check_attention_output(bool large) {
     enum { GROUP = 4096, RANK = 1024, GROUPS = 8, OUT = 5120 };
     const uint32_t ROWS = large ? 8192u : 513u;
@@ -1840,6 +1918,11 @@ int main(int argc, char **argv) {
         return ok ? 0 : 1;
     }
 #ifdef __APPLE__
+    if (argc == 2 && !strcmp(argv[1], "--fused-bf16")) {
+        const int ok = ds4_gpu_init() && check_fused_bf16();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--f32-rows")) {
         const int ok = ds4_gpu_init() && check_f32_rows();
         ds4_gpu_cleanup();

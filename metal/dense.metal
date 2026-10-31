@@ -2,6 +2,18 @@
 
 constant short FC_mul_mv_nsg   [[function_constant(FC_MUL_MV + 0)]];
 constant short FC_mul_mv_nxpsg [[function_constant(FC_MUL_MV + 1)]];
+// Decode-row writers round outputs to BF16 (V4.1 activation boundary) when
+// the pipeline sets this; the bit operation equals kernel_dsv41_bf16_linear
+// on the stored float.
+constant bool  FC_mul_mv_bf16_set [[function_constant(FC_MUL_MV + 2)]];
+constant bool  FC_mul_mv_bf16 = is_function_constant_defined(FC_mul_mv_bf16_set) && FC_mul_mv_bf16_set;
+
+static inline float ds4_mv_round_bf16(float x) {
+    uint bits = as_type<uint>(x);
+    if ((bits & 0x7f800000u) != 0x7f800000u)
+        bits += 0x7fffu + ((bits >> 16u) & 1u);
+    return as_type<float>(bits & 0xffff0000u);
+}
 
 struct ds4_metal_args_mul_mv {
     int ne00;
@@ -247,7 +259,7 @@ static inline void helper_mv_rows_reduce_and_write(
             float tot = simd_sum(shmem_f32[NW*(row1*NR0 + row) + tiisg]);
 
             if (tiisg == 0 && sgitg == 0) {
-                dst_row[r0 + row] = tot;
+                dst_row[r0 + row] = FC_mul_mv_bf16 ? ds4_mv_round_bf16(tot) : tot;
             }
         }
     }
