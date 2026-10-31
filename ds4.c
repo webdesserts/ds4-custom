@@ -41008,6 +41008,9 @@ typedef struct {
     ds4_gpu_tensor *previous_kv[4], *previous_score[4];
     ds4_gpu_tensor *verify_previous_kv[4], *verify_previous_score[4];
     bool verify_prefix;
+    /* Set on per-row copies whose index_q/index_weights a multi-row batch
+     * already projected, roped and quantized (ds41_index_rows_prepare). */
+    bool index_prepared;
     ds4_gpu_tensor *engram_q_norm[2], *engram_k_norm[2];
     ds41_prefill_row batch, *rows_view;
     ds41_prefill_row carry;
@@ -41907,10 +41910,11 @@ static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
     if (n_comp && ds41_index_source(il)) {
-        if (!ds41_matmul(g->index_q, m, l->indexer_attn_q_b, g->qr, true) ||
+        if ((!g->index_prepared &&
+            (!ds41_matmul(g->index_q, m, l->indexer_attn_q_b, g->qr, true) ||
             !ds41_rope(g->index_q, DS4_N_INDEXER_HEAD, 128, il, pos, false) ||
             !ds4_gpu_dsv41_quantize(g->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
-            !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true) ||
+            !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true))) ||
 #ifdef __APPLE__
             !ds4_gpu_glm_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
                 g->index_cache[owner], n_comp, DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f, false)) return false;
@@ -43588,6 +43592,45 @@ static uint32_t ds41_short_prefill_count(const ds41_gpu_graph *g, const ds4_weig
  * elsewhere ds4_gpu_flush_commands synchronizes the device. */
 /* DS4_V41_VERIFY_MERGE_ROWS=0 restores one RoPE/quantize dispatch per row
  * in batched verify attention; results are identical either way. */
+/* DS4_V41_INDEX_ROWS=0 keeps the indexer query and weight projections of
+ * small batches inside the per-row attention loop. Metal only. */
+static bool ds41_index_rows_enabled(void) {
+#ifdef __APPLE__
+    const char *v = getenv("DS4_V41_INDEX_ROWS");
+    return !v || strcmp(v, "0") != 0;
+#else
+    return false;
+#endif
+}
+
+/* Indexer query/weight projections for every row of a small batch in one
+ * weight pass each (the exact decode-row plan of ds41_matmul_batch), then
+ * the per-row RoPE and FP4 quantization the row loop would apply. They
+ * depend only on the row's own qr, norm and position, never on the window,
+ * so hoisting them out of the in-order row loop changes no value. Returns
+ * whether the rows were prepared. */
+static bool ds41_index_rows_prepare(ds41_gpu_graph *g, ds41_prefill_row *active,
+                                    const ds4_model *m, const ds4_layer_weights *l,
+                                    uint32_t il, const uint32_t *positions,
+                                    uint32_t rows, bool consecutive, bool *ok) {
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    uint32_t last = 0;
+    for (uint32_t i = 0; i < rows; i++) if (positions[i] > last) last = positions[i];
+    if (!*ok || rows < 2 || !ratio || !ds41_index_source(il) || (last + 1u) / ratio == 0 ||
+        !ds41_index_rows_enabled()) return false;
+    *ok = ds41_matmul_batch(active->index_q, m, l->indexer_attn_q_b, active->qr, rows, true) &&
+        ds41_matmul_batch(active->index_weights, m, l->indexer_proj, active->norm, rows, true);
+    if (*ok && consecutive) {
+        *ok = ds4_gpu_dsv41_rope(active->index_q, 128, DS4_N_INDEXER_HEAD, rows, positions[0],
+                                 true, false);
+    }
+    for (uint32_t i = 0; *ok && !consecutive && i < rows; i++)
+        *ok = ds41_rope(g->rows_view[i].index_q, DS4_N_INDEXER_HEAD, 128, il, positions[i], false);
+    if (*ok) *ok = ds4_gpu_dsv41_quantize(active->index_q, 128, DS4_N_INDEXER_HEAD * rows,
+                                          DS4_V41_FP4_E8M0);
+    return *ok;
+}
+
 static bool ds41_verify_merge_rows_enabled(void) {
     const char *v = getenv("DS4_V41_VERIFY_MERGE_ROWS");
     return !v || strcmp(v, "0") != 0;
@@ -43759,9 +43802,12 @@ static bool ds41_graph_step_batch_body(ds41_gpu_graph *const *graphs, const int 
             ok = ds41_archive_capture_window(ds41_graph_capture_archive(graphs[i]), il,
                 positions[i], 1, g->rows_view[i].kv);
         if (merged && ok) ok = ds41_attention_prologue(&all, il, rows);
+        const bool index_prepared = ds41_index_rows_prepare(g, &active, model, l, il,
+            positions, rows, consecutive, &ok);
         for (int i = 0; ok && i < count; i++) {
             ds41_gpu_graph row = *graphs[i];
             row.pos = positions[i];
+            row.index_prepared = index_prepared;
 #define DS41_SESSION_ROW(name, width) row.name = g->rows_view[i].name;
             DS41_PREFILL_ROWS(DS41_SESSION_ROW)
 #undef DS41_SESSION_ROW
