@@ -2582,6 +2582,11 @@ int ds4_gpu_swiglu_tensor(
         float                   clamp,
         float                   weight);
 
+/* swiglu / add with the V4.1 BF16 rounding of the n outputs fused in. */
+int ds4_gpu_swiglu_bf16_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up, uint32_t n, float clamp, float weight);
+int ds4_gpu_add_bf16_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a,
+        const ds4_gpu_tensor *b, uint32_t n);
 int ds4_gpu_add_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *a,

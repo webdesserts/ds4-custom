@@ -41369,6 +41369,34 @@ static bool ds41_fused_hc_enabled(void) {
     return enabled;
 }
 
+/* Shared-expert swiglu and the routed+shared add likewise round in their
+ * kernels; DS4_METAL_V41_FUSED_EW=0 keeps the separate pass. */
+static bool ds41_fused_ew_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *v = getenv("DS4_METAL_V41_FUSED_EW");
+        enabled = !(v && !strcmp(v, "0"));
+    }
+    return enabled;
+}
+
+static bool ds41_swiglu_rounded(ds4_gpu_tensor *mid, const ds4_gpu_tensor *gate,
+                                const ds4_gpu_tensor *up, uint32_t rows) {
+    if (ds41_fused_ew_enabled())
+        return ds4_gpu_swiglu_bf16_tensor(mid, gate, up, rows * DS4_N_FF_EXP,
+            DS4_SWIGLU_CLAMP_EXP, 1.0f);
+    return ds4_gpu_swiglu_tensor(mid, gate, up, rows * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
+        ds4_gpu_dsv41_quantize(mid, DS4_N_FF_EXP, rows, DS4_V41_BF16);
+}
+
+static bool ds41_add_rounded(ds4_gpu_tensor *out, const ds4_gpu_tensor *a,
+                             const ds4_gpu_tensor *b, uint32_t rows) {
+    if (ds41_fused_ew_enabled())
+        return ds4_gpu_add_bf16_tensor(out, a, b, rows * DS4_N_EMBD);
+    return ds4_gpu_add_tensor(out, a, b, rows * DS4_N_EMBD) &&
+        ds4_gpu_dsv41_quantize(out, DS4_N_EMBD, rows, DS4_V41_BF16);
+}
+
 static bool ds41_hc_sum_rounded(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
                                 const ds4_gpu_tensor *weights, bool split, uint32_t rows) {
     if (ds41_fused_hc_enabled())
@@ -41860,9 +41888,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     if (shared_here && !shared_queued &&
         (!ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) ||
         !ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true) ||
-        !ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
-                              DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) ||
-        !ds41_bf16(g->shared_mid, DS4_N_FF_EXP) ||
+        !ds41_swiglu_rounded(g->shared_mid, g->shared_gate, g->shared_up, 1) ||
         !ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true))) return false;
     bool routed_ok;
 #ifndef __APPLE__
@@ -41899,8 +41925,8 @@ static bool ds41_moe_finish(ds41_gpu_graph *g, uint32_t il) {
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     ds4_gpu_tensor *routed = shared_owner ? g->block : g->routed;
     if (!ds41_sum_partial(g, routed, il, DS4_TP_GATE_FFN)) return false;
-    return (shared_owner || ds4_gpu_add_tensor(g->block, routed, g->shared, DS4_N_EMBD)) &&
-        ds41_bf16(g->block, DS4_N_EMBD);
+    return shared_owner ? ds41_bf16(g->block, DS4_N_EMBD) :
+        ds41_add_rounded(g->block, routed, g->shared, 1);
 }
 
 static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
@@ -42336,9 +42362,7 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
         ((shared_owner && !balance_shared && g->tp_rank != (il & 1u)) ||
         (ds41_stage("moe.shared") && ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
         ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true) &&
-        ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
-            count * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
-        ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, count, DS4_V41_BF16) &&
+        ds41_swiglu_rounded(b->shared_mid, b->shared_gate, b->shared_up, count) &&
         ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true))) &&
         ds41_stage("moe.routed") &&
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -43084,8 +43108,7 @@ static bool ds41_graph_prefill_sweep_body(ds41_gpu_graph *g, const ds4_model *m,
                 ok = ds41_moe_batch(g, m, &w->layer[il], il, count, false);
                 DS41_STAGE("shared/routed ffn");
                 if (ok && batch_hc) {
-                    ok = ds4_gpu_add_tensor(active.block, active.routed, active.shared, count * DS4_N_EMBD) &&
-                        ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, count, DS4_V41_BF16) &&
+                    ok = ds41_add_rounded(active.block, active.routed, active.shared, count) &&
                         ds41_hc_expand_rounded(active.residual, active.block, active.after_attn,
                             active.ffn_split, count);
                 }
@@ -43093,8 +43116,8 @@ static bool ds41_graph_prefill_sweep_body(ds41_gpu_graph *g, const ds4_model *m,
 #define DS41_USE_MOE_ROW(name, width) row.name = g->rows_view[t].name;
                     DS41_PREFILL_ROWS(DS41_USE_MOE_ROW)
 #undef DS41_USE_MOE_ROW
-                    ok = ds4_gpu_add_tensor(row.block, row.routed, row.shared, DS4_N_EMBD) &&
-                        ds41_bf16(row.block, DS4_N_EMBD) && ds41_graph_after_moe(&row);
+                    ok = ds41_add_rounded(row.block, row.routed, row.shared, 1) &&
+                        ds41_graph_after_moe(&row);
                 }
             }
             DS41_STAGE("hc expand");
@@ -43403,9 +43426,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             ds41_moe_batch(g, model, l, il, rows, shared_owner) &&
             ds41_stage("hc.post_ffn") &&
             (shared_owner ? ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
-                (uint64_t)rows * DS4_N_EMBD * sizeof(float)) :
-                ds4_gpu_add_tensor(active.block, active.routed, active.shared, rows * DS4_N_EMBD)) &&
-            ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
+                (uint64_t)rows * DS4_N_EMBD * sizeof(float)) &&
+                ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) :
+                ds41_add_rounded(active.block, active.routed, active.shared, rows)) &&
             ds41_hc_expand_rounded(active.residual, active.block, active.after_attn,
                 active.ffn_split, rows);
         /* Without its own rows, the second Engram upload reuses the first

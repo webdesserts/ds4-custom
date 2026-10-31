@@ -31469,6 +31469,10 @@ int ds4_gpu_attention_decode_heads_tensor(
     return 1;
 }
 
+/* Set only by the *_bf16 elementwise wrappers: swiglu and add2 then use
+ * their BF16-rounding kernels. */
+static bool g_ew_round_bf16;
+
 int ds4_gpu_swiglu_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *gate,
@@ -31480,6 +31484,9 @@ int ds4_gpu_swiglu_tensor(
     if (!out || !gate || !up || n == 0) return 0;
     if (!isfinite(clamp) || clamp < 0.0f || !isfinite(weight)) return 0;
 
+    id<MTLComputePipelineState> swiglu_pipeline = g_ew_round_bf16 ?
+        ds4_gpu_get_pipeline("kernel_swiglu_flat_bf16_f32") : g_swiglu_flat_pipeline;
+    if (!swiglu_pipeline) return 0;
     @autoreleasepool {
         id<MTLBuffer> gatebuf = ds4_gpu_tensor_buffer(gate);
         id<MTLBuffer> upbuf = ds4_gpu_tensor_buffer(up);
@@ -31509,14 +31516,14 @@ int ds4_gpu_swiglu_tensor(
             .alpha = weight,
             .limit = clamp,
         };
-        NSUInteger nth = g_swiglu_flat_pipeline.maxTotalThreadsPerThreadgroup;
+        NSUInteger nth = swiglu_pipeline.maxTotalThreadsPerThreadgroup;
         if (nth > 256u) nth = 256u;
         if (nth > (NSUInteger)n) nth = (NSUInteger)n;
         if (nth == 0u) nth = 1u;
         const NSUInteger groups = ((NSUInteger)n + nth - 1u) / nth;
 
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:g_swiglu_flat_pipeline];
+        [enc setComputePipelineState:swiglu_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:gatebuf offset:ds4_gpu_tensor_offset(gate) atIndex:1];
         [enc setBuffer:upbuf offset:ds4_gpu_tensor_offset(up) atIndex:2];
@@ -31539,6 +31546,9 @@ int ds4_gpu_add_tensor(
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !a || !b || n == 0) return 0;
 
+    id<MTLComputePipelineState> add_pipeline = g_ew_round_bf16 ?
+        ds4_gpu_get_pipeline("kernel_add2_bf16_f32") : g_add2_pipeline;
+    if (!add_pipeline) return 0;
     @autoreleasepool {
         id<MTLBuffer> abuf = ds4_gpu_tensor_buffer(a);
         id<MTLBuffer> bbuf = ds4_gpu_tensor_buffer(b);
@@ -31557,14 +31567,14 @@ int ds4_gpu_add_tensor(
         if (!cb) return 0;
 
         ds4_gpu_add_flat_args args = { .n = n };
-        NSUInteger nth = g_add2_pipeline.maxTotalThreadsPerThreadgroup;
+        NSUInteger nth = add_pipeline.maxTotalThreadsPerThreadgroup;
         if (nth > 256u) nth = 256u;
         if (nth > (NSUInteger)n) nth = (NSUInteger)n;
         if (nth == 0u) nth = 1u;
         const NSUInteger groups = ((NSUInteger)n + nth - 1u) / nth;
 
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:g_add2_pipeline];
+        [enc setComputePipelineState:add_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:abuf offset:ds4_gpu_tensor_offset(a) atIndex:1];
         [enc setBuffer:bbuf offset:ds4_gpu_tensor_offset(b) atIndex:2];
@@ -31577,6 +31587,22 @@ int ds4_gpu_add_tensor(
     }
 
     return 1;
+}
+
+int ds4_gpu_swiglu_bf16_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up, uint32_t n, float clamp, float weight) {
+    g_ew_round_bf16 = true;
+    const int ok = ds4_gpu_swiglu_tensor(out, gate, up, n, clamp, weight);
+    g_ew_round_bf16 = false;
+    return ok;
+}
+
+int ds4_gpu_add_bf16_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a,
+        const ds4_gpu_tensor *b, uint32_t n) {
+    g_ew_round_bf16 = true;
+    const int ok = ds4_gpu_add_tensor(out, a, b, n);
+    g_ew_round_bf16 = false;
+    return ok;
 }
 
 int ds4_gpu_add3_tensor(

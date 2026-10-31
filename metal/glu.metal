@@ -61,3 +61,32 @@ kernel void kernel_swiglu_flat_f32(
     const float silu = x0 / (1.0f + exp(-x0));
     dst_f32[i] = silu*x1*args.alpha;
 }
+
+// Same with the V4.1 BF16 rounding of the output (bit operation of
+// kernel_dsv41_bf16_linear) fused in.
+kernel void kernel_swiglu_flat_bf16_f32(
+        constant ds4_metal_args_glu & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint i [[thread_position_in_grid]]) {
+    if (i >= (uint)args.ne0) return;
+
+    device const float * src0_f32 = (device const float *) src0 + args.i00;
+    device const float * src1_f32 = (device const float *) src1 + args.i10;
+    device       float * dst_f32  = (device       float *) dst;
+
+    float x0 = src0_f32[i];
+    float x1 = src1_f32[i];
+    if (args.limit > 1.0e-6f) {
+        x0 = min(x0, args.limit);
+        x1 = clamp(x1, -args.limit, args.limit);
+    }
+
+    const float silu = x0 / (1.0f + exp(-x0));
+    const float y = silu*x1*args.alpha;
+    uint bits = as_type<uint>(y);
+    if ((bits & 0x7f800000u) != 0x7f800000u)
+        bits += 0x7fffu + ((bits >> 16u) & 1u);
+    dst_f32[i] = as_type<float>(bits & 0xffff0000u);
+}

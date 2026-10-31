@@ -205,6 +205,21 @@ kernel void kernel_add2_f32(
     out[i] = a[i] + b[i];
 }
 
+// Same with the V4.1 BF16 rounding of the sum fused in.
+kernel void kernel_add2_bf16_f32(
+        constant ds4_metal_args_add3 &args,
+        device const float *a,
+        device const float *b,
+        device float *out,
+        uint i [[thread_position_in_grid]]) {
+    if (i >= args.n) return;
+    const float y = a[i] + b[i];
+    uint bits = as_type<uint>(y);
+    if ((bits & 0x7f800000u) != 0x7f800000u)
+        bits += 0x7fffu + ((bits >> 16u) & 1u);
+    out[i] = as_type<float>(bits & 0xffff0000u);
+}
+
 kernel void kernel_add3_f32(
         constant ds4_metal_args_add3 &args,
         device const float *a,

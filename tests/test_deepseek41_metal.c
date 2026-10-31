@@ -1067,6 +1067,48 @@ static int check_fused_q8_single(void) {
 }
 #endif
 
+#ifdef __APPLE__
+/* Fused BF16 rounding in swiglu (with and without the clamp) and in the
+ * two-input add, against the plain kernels plus the separate pass; inputs
+ * span the clamp, NaN and overflow. */
+static int check_fused_ew(void) {
+    const uint32_t sizes[] = {2304, 5 * 2304, 5120, 6 * 5120, 37};
+    for (size_t si = 0; si < sizeof(sizes) / sizeof(*sizes); si++) {
+        const uint32_t n = sizes[si];
+        const uint64_t b = (uint64_t)n * 4;
+        float *a = malloc(b), *c = malloc(b), *plain = malloc(b), *fused = malloc(b);
+        CHECK(a && c && plain && fused);
+        for (uint32_t i = 0; i < n; i++) { a[i] = random_value() * 40.0f; c[i] = random_value() * 40.0f; }
+        a[1] = NAN; a[2] = 3.0e38f; c[2] = 3.0e38f; c[3] = -INFINITY;
+        ds4_gpu_tensor *at = upload(a, b), *ct = upload(c, b), *ot = upload(NULL, b);
+        CHECK(at && ct && ot);
+        for (int kind = 0; kind < 3; kind++) {
+            const float limit = kind == 1 ? 10.0f : 0.0f;
+            for (int f = 0; f < 2; f++) {
+                CHECK(ds4_gpu_tensor_fill_f32(ot, 0, n));
+                CHECK(ds4_gpu_begin_commands());
+                if (kind < 2) CHECK(f ? ds4_gpu_swiglu_bf16_tensor(ot, at, ct, n, limit, 1.0f) :
+                                        ds4_gpu_swiglu_tensor(ot, at, ct, n, limit, 1.0f));
+                else CHECK(f ? ds4_gpu_add_bf16_tensor(ot, at, ct, n) : ds4_gpu_add_tensor(ot, at, ct, n));
+                if (!f) CHECK(ds4_gpu_dsv41_quantize(ot, n, 1, DS4_V41_BF16));
+                CHECK(ds4_gpu_end_commands());
+                CHECK(ds4_gpu_tensor_read(ot, 0, f ? fused : plain, b));
+            }
+            if (memcmp(fused, plain, b)) fprintf(stderr, "fused ew mismatch kind=%d n=%u\n", kind, n);
+            CHECK(!memcmp(fused, plain, b));
+            bool nonfinite = false;
+            for (uint32_t i = 0; i < n; i++) nonfinite |= !isfinite(fused[i]);
+            /* Fast-math swiglu need not propagate NaN; the add must. */
+            CHECK(kind < 2 || nonfinite);
+        }
+        ds4_gpu_tensor_free(at); ds4_gpu_tensor_free(ct); ds4_gpu_tensor_free(ot);
+        free(a); free(c); free(plain); free(fused);
+        fprintf(stderr, "V4.1 fused BF16 swiglu/clamped swiglu/add n=%u: PASS\n", n);
+    }
+    return 1;
+}
+#endif
+
 static int check_attention_output(bool large) {
     enum { GROUP = 4096, RANK = 1024, GROUPS = 8, OUT = 5120 };
     const uint32_t ROWS = large ? 8192u : 513u;
@@ -2160,6 +2202,11 @@ int main(int argc, char **argv) {
         return ok ? 0 : 1;
     }
 #ifdef __APPLE__
+    if (argc == 2 && !strcmp(argv[1], "--fused-ew")) {
+        const int ok = ds4_gpu_init() && check_fused_ew();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--fused-q8")) {
         const int ok = ds4_gpu_init() && check_fused_q8_single();
         ds4_gpu_cleanup();

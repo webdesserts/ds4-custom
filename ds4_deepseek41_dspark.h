@@ -292,9 +292,7 @@ static bool ds41_dspark_stage(ds41_dspark *d, const ds4_model *m, uint32_t stage
     }
     if (!(ds41_dspark_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, n, true) &&
         ds41_dspark_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, n, true) &&
-        ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
-            n * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
-        ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, n, DS4_V41_BF16) &&
+        ds41_swiglu_rounded(b->shared_mid, b->shared_gate, b->shared_up, n) &&
         ds41_dspark_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, n, true))) {
         fprintf(stderr, "ds4: V4.1 draft shared expert failed\n"); return false;
     }
@@ -306,8 +304,7 @@ static bool ds41_dspark_stage(ds41_dspark *d, const ds4_model *m, uint32_t stage
             experts, active, DS4_SWIGLU_CLAMP_EXP, b->norm, stage, n, &mid_f16, true)) {
         fprintf(stderr, "ds4: V4.1 draft routed experts failed\n"); return false;
     }
-    return ds4_gpu_add_tensor(b->block, b->routed, b->shared, n * DS4_N_EMBD) &&
-        ds4_gpu_dsv41_quantize(b->block, DS4_N_EMBD, n, DS4_V41_BF16) &&
+    return ds41_add_rounded(b->block, b->routed, b->shared, n) &&
         ds41_hc_expand_rounded(b->residual, b->block, b->after_attn, b->ffn_split, n);
 }
 
