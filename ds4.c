@@ -41295,6 +41295,16 @@ static bool ds41_fused_f16_enabled(void) {
     return enabled;
 }
 
+/* Single-row Q8_0 matvecs likewise; DS4_METAL_V41_FUSED_Q8=0 keeps the pass. */
+static bool ds41_fused_q8_single_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *v = getenv("DS4_METAL_V41_FUSED_Q8");
+        enabled = !(v && !strcmp(v, "0"));
+    }
+    return enabled;
+}
+
 static bool ds41_matmul_float_rounded(ds4_gpu_tensor *out, const ds4_model *m,
         const ds4_tensor *weight, const ds4_gpu_tensor *in, uint32_t count, bool *done) {
     *done = false;
@@ -41314,6 +41324,12 @@ static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
         bool done;
         const bool ok = ds41_matmul_float_rounded(out, m, weight, in, 1, &done);
         if (done || !ok) return ok;
+        if (weight->type == DS4_TENSOR_Q8_0 && ds41_fused_q8_single_enabled()) {
+            int rounded = 0;
+            return ds4_gpu_matmul_q8_0_bf16_tensor(out, m->map, m->size, weight->abs_offset,
+                    weight->dim[0], weight->dim[1], in, &rounded) &&
+                (rounded || ds41_bf16(out, (uint32_t)weight->dim[1]));
+        }
     }
     return metal_graph_matmul_plain_tensor(out, m, weight, weight->dim[0], weight->dim[1], in, 1) &&
            (!round || ds41_bf16(out, (uint32_t)weight->dim[1]));
