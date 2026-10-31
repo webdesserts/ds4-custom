@@ -271,7 +271,7 @@ static void test_configuration_and_help(void) {
     const char *pairs[][2] = {
         {"--scr-tail-tokens", "127"}, {"--scr-tail-tokens", "129"}, {"--scr-tail-tokens", "1048576"},
         {"--scr-tail-tokens", "oops"}, {"--ctx", "64"}, {"--host", "0.0.0.0"},
-        {"--host", "::1"}, {"--host", "example.test"}, {"--batched-session", "1"},
+        {"--host", "::1"}, {"--host", "example.test"}, {"--mixed-prefill-quantum", "256"},
         {"--kv-cache-min-tokens", "512"}, {"--kv-cache-cold-max-tokens", "0"},
         {"--vision", "not-opened"}, {"--gpu-devices", "0"}, {"--gpu-vram", "auto"},
         {"--backend", "cpu"}, {"--role", "worker"}, {"--dist-prefill-chunk", "128"},
@@ -460,9 +460,10 @@ static void test_mapped_recovery_and_logical_canonicalization(void) {
     fixture.mapped = true;
     assert(!server_session_sync_physical(&s, &slot, &input, err, sizeof(err)));
     assert(fixture.physical_sync_calls == 1 && !fixture.sync_calls);
+    /* Batched SCR slots sync a mapped transcript in one executor turn. */
     s.batched_mode = true;
-    assert(server_session_sync_physical(&s, &slot, &input, err, sizeof(err)) == 1);
-    assert(fixture.physical_sync_calls == 1);
+    assert(!server_session_sync_physical(&s, &slot, &input, err, sizeof(err)));
+    assert(fixture.physical_sync_calls == 2 && !fixture.sync_calls && !s.model_busy);
     s.batched_mode = false; fixture.mapped = false;
     assert(!server_session_sync_physical(&s, &slot, &input, err, sizeof(err)));
     assert(fixture.sync_calls == 1);

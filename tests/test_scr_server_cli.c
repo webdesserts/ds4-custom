@@ -143,22 +143,30 @@ int main(void) {
         server_scr_config_valid(&dc, false) && cli_exit(ARGC(dspark), dspark) == 0);
     char *dspark_alone[] = {"server", "--metal", "--scr", "--dspark"};
     char *mtp_alone[] = {"server", "--metal", "--scr", "--mtp-model", "/inert/not-opened.gguf"};
-    char *batched[] = {"server", "--metal", "--scr", "--batched-session", "2"};
+    /* Batched sessions coexist with SCR and DSpark: slots decode in executor
+     * turns. The mixed prefill quantum stays a refused batch tuning flag. */
+    char *batched[] = {"server", "--metal", "--scr", "--batched-session", "4", "--dspark",
+        "--mtp-model", "/inert/not-opened.gguf"};
+    server_config bc = resolved(ARGC(batched), batched);
+    assert(bc.batched_sessions == 4 && server_scr_config_valid(&bc, false) &&
+        cli_exit(ARGC(batched), batched) == 0);
+    char *mixed[] = {"server", "--metal", "--scr", "--batched-session", "2",
+        "--mixed-prefill-quantum", "256"};
+    assert(cli_exit(ARGC(mixed), mixed) == 2);
     char *glm_mtp[] = {"server", "--metal", "--scr", "--mtp-timing"};
     assert(cli_exit(ARGC(dspark_alone), dspark_alone) == 2 &&
-        cli_exit(ARGC(mtp_alone), mtp_alone) == 2 && cli_exit(ARGC(batched), batched) == 2 &&
+        cli_exit(ARGC(mtp_alone), mtp_alone) == 2 &&
         cli_exit(ARGC(glm_mtp), glm_mtp) == 2);
     /* Incompatible engine modes. */
-    for (unsigned mode = 0; mode < 4; mode++) {
+    for (unsigned mode = 0; mode < 3; mode++) {
         server_config d = c;
         if (mode == 0) d.engine.dspark = true;
         if (mode == 1) d.engine.mtp_path = "/inert/not-opened.gguf";
-        if (mode == 2) d.batched_sessions = 2;
-        if (mode == 3) d.engine.glm_mtp = true;
+        if (mode == 2) d.engine.glm_mtp = true;
         assert(!server_scr_config_valid(&d, false));
     }
     assert(DS4_DEFAULT_TEMPERATURE == 1.0f && DS4_DEFAULT_TOP_P == 1.0f &&
         DS4_DEFAULT_MIN_P == 0.05f);
-    puts("scr cli: --scr production stack, tuning flags, retired selectors accepted, deployed argv, K bounds, checkpoint pool options, DSpark pair; stub sessions, no model");
+    puts("scr cli: --scr production stack, tuning flags, retired selectors accepted, deployed argv, K bounds, checkpoint pool options, DSpark pair, batched sessions; stub sessions, no model");
     return 0;
 }

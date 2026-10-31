@@ -12434,6 +12434,13 @@ static int server_next_prefill_slot_locked(const server *s) {
     return -1;
 }
 
+static bool server_scr_enabled(const server *s);
+/* Batched SCR servers decode each slot in executor turns: SCR sessions own
+ * archive/coordinate state the fused session batch cannot publish. */
+static bool server_turn_decode(const server *s) {
+    return s && s->batched_mode && server_scr_enabled(s);
+}
+
 static bool server_prefill_enter(server *s, server_slot *slot) {
     if (!s || !slot || slot_job_cancelled(slot)) return false;
     if (!s->batched_mode) {
@@ -12638,10 +12645,8 @@ static int server_session_sync_physical(server *s, server_slot *slot,
     bool mapped = ds4_session_has_physical_coordinates(slot->session);
     pthread_mutex_unlock(&s->inference_mu);
     if (!mapped) return server_session_sync(s, slot, prompt, err, errlen);
-    if (s->batched_mode) {
-        snprintf(err, errlen, "mapped recovery does not support batched prefill");
-        return 1;
-    }
+    /* A mapped transcript syncs in one call; in batched mode it takes one
+     * executor turn (batched mode only serves mapped sessions under SCR). */
     if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
     int rc = ds4_session_sync_physical(slot->session, prompt, err, errlen);
     server_prefill_leave(s);
@@ -13296,6 +13301,20 @@ static int server_eval_tokens(server *s, server_slot *slot, int token,
                               char *err, size_t errlen) {
     *n_accepted = 0;
     if (!s || !slot) return 1;
+    if (server_turn_decode(s)) {
+        /* SCR sessions publish per-step archive/coordinate state that the
+         * fused batch refuses; each step takes an executor turn instead. */
+        if (!server_prefill_enter(s, slot)) {
+            if (err && errlen) snprintf(err, errlen, "%s",
+                                        g_stop_requested ? "shutdown requested" :
+                                                           "client disconnected");
+            return DS4_SESSION_SYNC_INTERRUPTED;
+        }
+        int rc = ds4_session_eval(slot->session, token, err, errlen);
+        server_prefill_leave(s);
+        if (rc == 0) { accepted[0] = token; *n_accepted = 1; }
+        return rc;
+    }
     if (!s->batched_mode) {
         if (g_stop_requested || slot_job_cancelled(slot)) {
             if (err && errlen) snprintf(err, errlen, "%s",
@@ -14085,11 +14104,16 @@ decode_again:
             temperature = 0.0f;
         }
         const int eos_token = ds4_token_eos(s->engine);
+        /* Mapped SCR head reads refuse while any GPU command buffer is being
+         * encoded, so in turn mode they wait out another slot's executor
+         * call. */
+        if (server_turn_decode(s)) server_inference_lock(s);
         int token = j->req.ignore_eos ?
             ds4_session_argmax_ignoring_eos(slot->session,
                                             j->req.think_mode) :
             ds4_session_sample(slot->session, temperature, top_k,
                                top_p, min_p, &rng);
+        if (server_turn_decode(s)) server_inference_unlock(s);
         if (token < 0) {
             finish = "error";
             snprintf(err, sizeof(err), "failed to select a non-EOS token");
@@ -14108,10 +14132,19 @@ decode_again:
         int toks[17];
         int ntok = 0;
         const int block_start = ds4_session_pos(slot->session);
-        if (!s->batched_mode &&
+        if ((!s->batched_mode || server_turn_decode(s)) &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
+            /* Batched SCR: one whole speculative cycle per executor turn, so
+             * a cycle commits before another slot's prefill or cycle runs. */
+            const bool turn = server_turn_decode(s);
+            if (turn && !server_prefill_enter(s, slot)) {
+                finish = "error";
+                snprintf(err, sizeof(err), "%s", g_stop_requested ?
+                         "shutdown requested" : "client disconnected");
+                break;
+            }
             if (j->req.ignore_eos) {
                 ntok = ds4_session_eval_speculative_argmax_ignoring_eos(
                     slot->session, token, max_tokens - completion,
@@ -14125,6 +14158,7 @@ decode_again:
                     toks, (int)(sizeof(toks) / sizeof(toks[0])),
                     err, sizeof(err));
             }
+            if (turn) server_prefill_leave(s);
             if (ntok < 0) {
                 finish = "error";
                 break;
@@ -15807,8 +15841,7 @@ static server_config parse_options(int argc, char **argv) {
     bool scr_incompatible = false;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
-        if (!strcmp(arg, "--vision") || !strcmp(arg, "--batched-session") ||
-            !strcmp(arg, "--mixed-prefill-quantum") ||
+        if (!strcmp(arg, "--vision") || !strcmp(arg, "--mixed-prefill-quantum") ||
             /* --kv-disk-dir and --kv-disk-space-mb select the checkpoint pool. */
             (!strncmp(arg, "--kv-disk-", 10) && strcmp(arg, "--kv-disk-dir") &&
              strcmp(arg, "--kv-disk-space-mb")) || !strncmp(arg, "--kv-cache-", 11) ||
@@ -16048,7 +16081,7 @@ static server_config parse_options(int argc, char **argv) {
     }
     server_scr_resolve_config(&c);
     if (!server_scr_config_valid(&c, scr_incompatible)) {
-        server_log(DS4_LOG_DEFAULT, "ds4-server: SCR requires eight-aligned archive capacity 128..%u <= context, K1..%u, Metal, loopback, DSpark only as --dspark with --mtp-model, and no MTP/batch/KV-cache tuning/vision/GPU/TP/distributed overrides", DS4_SCR_ARCHIVE_MAX_CAPACITY, DS4_SCR_MULTI_MAX_RANGES);
+        server_log(DS4_LOG_DEFAULT, "ds4-server: SCR requires eight-aligned archive capacity 128..%u <= context, K1..%u, Metal, loopback, DSpark only as --dspark with --mtp-model, and no MTP/mixed-prefill/KV-cache tuning/vision/GPU/TP/distributed overrides", DS4_SCR_ARCHIVE_MAX_CAPACITY, DS4_SCR_MULTI_MAX_RANGES);
         exit(2);
     }
     char tp_err[256];
@@ -16270,7 +16303,12 @@ int main(int argc, char **argv) {
                    server_prefill_quantum_for(&s, false),
                    server_prefill_quantum_for(&s, true),
                    server_decode_coalesce_us());
-        if (ds4_engine_mtp_draft_tokens(engine) > 1 && !s.qwen4_batch_mtp) {
+        if (server_turn_decode(&s)) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: SCR batched mode: each slot decodes in executor turns%s",
+                       ds4_engine_mtp_draft_tokens(engine) > 1 ?
+                       " with its own speculative cycles" : "");
+        } else if (ds4_engine_mtp_draft_tokens(engine) > 1 && !s.qwen4_batch_mtp) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: MTP speculative decoding is disabled while native session batching is active");
         }

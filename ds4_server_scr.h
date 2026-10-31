@@ -751,8 +751,7 @@ static bool server_scr_config_valid(const server_config *c, bool incompatible) {
     if (!c->scr_enabled) return !c->scr_max_ranges_present;
     /* DSpark speculation is the one support model SCR coexists with, and
      * only as the --dspark/--mtp-model pair; legacy MTP stays refused. */
-    if (c->engine.glm_mtp || c->engine.dspark != (c->engine.mtp_path != NULL) ||
-        c->batched_sessions) return false;
+    if (c->engine.glm_mtp || c->engine.dspark != (c->engine.mtp_path != NULL)) return false;
     return c->scr_max_ranges >= 1 && c->scr_max_ranges <= (int)DS4_SCR_MULTI_MAX_RANGES && !incompatible && c->engine.backend == DS4_BACKEND_METAL &&
         !c->engine.cuda_tensor_parallel && c->engine.tp.role == DS4_TP_NONE &&
         c->engine.distributed.role == DS4_DISTRIBUTED_NONE &&
