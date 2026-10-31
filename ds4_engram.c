@@ -611,9 +611,64 @@ struct ds4_engram_async {
 #endif
 };
 
+#ifdef __APPLE__
+/* One (token, table) item's rows read concurrently: a verify step waits on
+ * this read before layer 1, and 24 serial random reads cost 24 storage
+ * latencies. Each row keeps its own read, decode and output slot, so bytes
+ * and observation counts equal the serial loop; DS4_ENGRAM_ASYNC_ROWS=0
+ * keeps that loop. */
+typedef struct {
+    const engram_async_item *item;
+    ds4_engram_observation observation[DS4_ENGRAM_COLS];
+    int error[DS4_ENGRAM_COLS];
+} engram_async_rows;
+
+static void engram_async_row_run(void *context, size_t col) {
+    engram_async_rows *rows = context;
+    const engram_async_item *item = rows->item;
+    ds4_engram_observation *o = item->observe ? &rows->observation[col] : NULL;
+    if (o) o->enabled = true;
+    errno = 0;
+    if (!engram_read(&item->table, &item->ids[col], 1, item->out + col * DS4_ENGRAM_DIM, o))
+        rows->error[col] = errno ? errno : EIO;
+}
+
+static bool engram_async_rows_enabled(void) {
+    const char *v = getenv("DS4_ENGRAM_ASYNC_ROWS");
+    return !v || strcmp(v, "0") != 0;
+}
+#endif
+
 static void engram_async_item_run(void *context) {
     engram_async_item *item = context;
     errno = 0;
+#ifdef __APPLE__
+    if (engram_async_rows_enabled()) {
+        engram_async_rows rows = {.item = item};
+        ds4_engram_observation *o = item->observe ? &item->observation : NULL;
+        if (o) *o = (ds4_engram_observation){.enabled = true, .calls = 1};
+        const uint64_t began = observation_begin(o);
+        bool valid = item->table.fd >= 0;
+        for (size_t col = 0; valid && col < DS4_ENGRAM_COLS; col++)
+            valid = item->ids[col] < item->table.rows;
+        if (valid) {
+            dispatch_apply_f(DS4_ENGRAM_COLS,
+                dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &rows, engram_async_row_run);
+        }
+        item->ok = valid;
+        item->error = valid ? 0 : EINVAL;
+        /* The serial loop stops at its first failing row: report that row. */
+        for (size_t col = 0; item->ok && col < DS4_ENGRAM_COLS; col++) {
+            if (rows.error[col]) { item->ok = false; item->error = rows.error[col]; }
+            if (o) ds4_engram_observation_add(o, &rows.observation[col]);
+        }
+        if (o) {
+            observation_elapsed(o, began, &o->call_wall_nanoseconds);
+            o->failed_calls = !item->ok;
+        }
+        return;
+    }
+#endif
     item->ok = ds4_engram_read_observed(&item->table, item->ids, DS4_ENGRAM_COLS,
         item->out, item->observe ? &item->observation : NULL);
     item->error = item->ok ? 0 : errno ? errno : EIO;
