@@ -219,6 +219,18 @@ static bool ds41_dspark_attention_output(ds41_prefill_row *b, const ds4_model *m
     return ds41_dspark_matmul_batch(b->block, m, l->attn_output_b, b->low, DS41_DRAFT_ROWS, true);
 }
 
+/* Commits the encoded part of the draft without waiting, so the GPU starts
+ * while the rest is encoded; queue order keeps the result unchanged.
+ * DS4_V41_DRAFT_FLUSH=0 encodes the whole draft as one command buffer. */
+static bool ds41_dspark_flush(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *v = getenv("DS4_V41_DRAFT_FLUSH");
+        enabled = !(v && !strcmp(v, "0"));
+    }
+    return !enabled || !ds4_gpu_commands_active() || ds4_gpu_flush_commands();
+}
+
 static bool ds41_dspark_stage(ds41_dspark *d, const ds4_model *m, uint32_t stage, uint32_t pos) {
     ds41_prefill_row *b = &d->batch;
     const ds4_layer_weights *l = &d->weights->stage[stage].block;
@@ -244,7 +256,8 @@ static bool ds41_dspark_stage(ds41_dspark *d, const ds4_model *m, uint32_t stage
         !ds4_gpu_dsv41_quantize(b->heads, DS4_N_HEAD * DS4_N_HEAD_DIM, n, DS4_V41_BF16) ||
         !ds4_gpu_dsv41_rope(b->heads, DS4_N_HEAD_DIM, DS4_N_HEAD, n, pos, false, true) ||
         !ds41_dspark_attention_output(b, m, l) ||
-        !ds41_after_attention_batch(b, m, l, n)) {
+        !ds41_after_attention_batch(b, m, l, n) ||
+        !ds41_dspark_flush()) {
         fprintf(stderr, "ds4: V4.1 draft attention failed\n");
         return false;
     }
@@ -302,8 +315,9 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_forward(ds41_dspark *d, const ds4_model
             DS4_N_EMBD, DS4_N_HC);
         ds4_gpu_tensor_free(out);
     }
+    if (ok) ok = ds41_dspark_flush();
     for (uint32_t stage = 0; ok && stage < 3; stage++) {
-        ok = ds41_dspark_stage(d, draft, stage, pos);
+        ok = ds41_dspark_stage(d, draft, stage, pos) && ds41_dspark_flush();
         if (!ok) fprintf(stderr, "ds4: V4.1 DSpark stage %u failed\n", stage);
     }
     if (ok) ok = ds4_gpu_hc_weighted_sum_split_tensor(b->x, b->residual,
