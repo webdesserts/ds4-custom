@@ -41282,8 +41282,39 @@ static bool ds41_bf16(ds4_gpu_tensor *x, uint32_t width) {
     return ds4_gpu_dsv41_quantize(x, width, 1, DS4_V41_BF16) != 0;
 }
 
+/* F16/F32 matvecs whose outputs V4.1 rounds to BF16 round in the matvec
+ * writer when the kernel supports it (same bits);
+ * DS4_METAL_V41_FUSED_F16=0 keeps the separate pass. Returns false when not
+ * applicable, leaving *done false. */
+static bool ds41_fused_f16_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *v = getenv("DS4_METAL_V41_FUSED_F16");
+        enabled = !(v && !strcmp(v, "0"));
+    }
+    return enabled;
+}
+
+static bool ds41_matmul_float_rounded(ds4_gpu_tensor *out, const ds4_model *m,
+        const ds4_tensor *weight, const ds4_gpu_tensor *in, uint32_t count, bool *done) {
+    *done = false;
+    if ((weight->type != DS4_TENSOR_F16 && weight->type != DS4_TENSOR_F32) ||
+        !ds41_fused_f16_enabled()) return true;
+    const uint32_t width = (uint32_t)weight->dim[0], outputs = (uint32_t)weight->dim[1];
+    int rounded = 0;
+    if (!ds4_gpu_dsv41_projection_bf16(out, m->map, m->size, weight->abs_offset,
+            weight->type == DS4_TENSOR_F32, width, outputs, count, in, &rounded)) return false;
+    *done = true;
+    return rounded || ds4_gpu_dsv41_quantize(out, outputs, count, DS4_V41_BF16);
+}
+
 static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
                         const ds4_tensor *weight, const ds4_gpu_tensor *in, bool round) {
+    if (round) {
+        bool done;
+        const bool ok = ds41_matmul_float_rounded(out, m, weight, in, 1, &done);
+        if (done || !ok) return ok;
+    }
     return metal_graph_matmul_plain_tensor(out, m, weight, weight->dim[0], weight->dim[1], in, 1) &&
            (!round || ds41_bf16(out, (uint32_t)weight->dim[1]));
 }
@@ -41369,10 +41400,20 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
             round && ds41_fused_bf16_enabled() ? &rounded : NULL);
         if (rounded) return ok;
     } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F16) {
+        if (round && ds41_fused_f16_enabled()) {
+            bool done;
+            ok = ds41_matmul_float_rounded(out, m, weight, in, count, &done);
+            if (done || !ok) return ok;
+        }
         ok = ds4_gpu_dsv41_projection_rows(out, m->map, m->size,
             weight->abs_offset, width, outputs, count, in);
     } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F32 &&
                ds41_f32_rows_enabled()) {
+        if (round && ds41_fused_f16_enabled()) {
+            bool done;
+            ok = ds41_matmul_float_rounded(out, m, weight, in, count, &done);
+            if (done || !ok) return ok;
+        }
         ok = ds4_gpu_dsv41_projection_rows_f32(out, m->map, m->size,
             weight->abs_offset, width, outputs, count, in);
     } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F32) {
