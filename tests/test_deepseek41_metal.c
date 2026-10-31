@@ -959,16 +959,27 @@ static int check_index_projection(void) {
     return 1;
 }
 
-/* Exact decode-row Q8_0 and F16 matvecs stream each weight tile once for
- * several activation rows.  Every multi-row call must equal the single-row
- * kernel on each row bit for bit.  Bench mode also times the multi-row tiles
- * against the one-row-per-threadgroup grid (tile cap 1) with weights rotated
- * through about 1 GiB so each call reads them from DRAM, not cache. */
+/* Exact decode-row Q8_0 and F16 matvecs have several grid plans
+ * (DS4_METAL_DECODE_ROWS_MODE and the row-tile caps); every plan must equal
+ * the single-row kernel on each row bit for bit.  Bench mode times the plans
+ * with weights cold and warm.  Cold rotates the calls through about 1 GiB of
+ * weight copies, so each call reads its weights from DRAM as in decode, where
+ * gigabytes of other weights stream between two uses of a matrix.  Warm
+ * reuses one copy, which stays in the system-level cache. */
 typedef struct { uint32_t width, outputs; int q8; } decode_rows_shape;
+typedef struct { const char *mode, *cap, *label; } decode_rows_mode;
 
 static size_t decode_rows_weight_bytes(const decode_rows_shape *s) {
     return s->q8 ? (size_t)s->outputs * (s->width / 32u) * 34u
                  : (size_t)s->outputs * s->width * sizeof(uint16_t);
+}
+
+static void decode_rows_set_mode(const decode_rows_shape *s, const decode_rows_mode *m) {
+    const char *knob = s->q8 ? "DS4_METAL_Q8_ROWS_NR1" : "DS4_METAL_F16_ROWS_NR1";
+    if (m) setenv("DS4_METAL_DECODE_ROWS_MODE", m->mode, 1);
+    else unsetenv("DS4_METAL_DECODE_ROWS_MODE");
+    if (m && m->cap) setenv(knob, m->cap, 1);
+    else unsetenv(knob);
 }
 
 static int decode_rows_call(ds4_gpu_tensor *out, const void *model, size_t model_bytes,
@@ -981,20 +992,24 @@ static int decode_rows_call(ds4_gpu_tensor *out, const void *model, size_t model
         s->outputs, rows, in);
 }
 
-/* Mean milliseconds per call over iters calls batched into one submission. */
+/* Best of three batched submissions of iters calls, in ms per call. */
 static double decode_rows_time(ds4_gpu_tensor *out, const void *model, size_t model_bytes,
                                size_t stride, uint32_t copies, const decode_rows_shape *s,
                                ds4_gpu_tensor *in, uint32_t rows, uint32_t iters) {
-    if (!decode_rows_call(out, model, model_bytes, 0, s, in, rows) || !ds4_gpu_synchronize())
-        return -1;
-    const double start = monotonic_seconds();
-    if (!ds4_gpu_begin_commands()) return -1;
-    for (uint32_t i = 0; i < iters; i++) {
-        if (!decode_rows_call(out, model, model_bytes, (size_t)(i % copies) * stride, s, in, rows))
-            return -1;
+    double best = INFINITY;
+    for (int rep = 0; rep < 3; rep++) {
+        const double start = monotonic_seconds();
+        if (!ds4_gpu_begin_commands()) return -1;
+        for (uint32_t i = 0; i < iters; i++) {
+            if (!decode_rows_call(out, model, model_bytes, (size_t)(i % copies) * stride,
+                                  s, in, rows))
+                return -1;
+        }
+        if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return -1;
+        const double ms = (monotonic_seconds() - start) * 1000.0 / iters;
+        if (ms < best) best = ms;
     }
-    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return -1;
-    return (monotonic_seconds() - start) * 1000.0 / iters;
+    return best;
 }
 
 static int check_decode_rows(int bench) {
@@ -1011,6 +1026,17 @@ static int check_decode_rows(int bench) {
         {4100, 1024, 0},
     };
     static const uint32_t counts[] = {1, 2, 3, 5, 6, 7, 8, 13, MAX_ROWS};
+    /* Every compiled kernel: row tiles 2-8 through the caps, 2-4 interleaved. */
+    static const decode_rows_mode modes[] = {
+        {"auto", NULL, "auto"}, {"off", NULL, "off"}, {"rows", "4", "rows4"},
+        {"rows", "8", "rows8"}, {"interleave", NULL, "interleave"},
+        {"interleave-rows", "4", "irows4"}, {"interleave-rows", "2", "irows2"},
+    };
+    static const decode_rows_mode bench_modes[] = {
+        {"off", NULL, "off"}, {"rows", "8", "rows8"}, {"interleave", NULL, "interleave"},
+        {"interleave-rows", "2", "irows2"}, {"auto", NULL, "auto"},
+    };
+    enum { BENCH_MODES = sizeof(bench_modes) / sizeof(*bench_modes) };
     static const uint32_t bench_counts[] = {2, 3, 5, 6, 8};
     /* DS4_METAL_PLAIN_MV_NR0=1 selects the one-output-row F16 tile; =2 the
      * two-row tile, or four rows for 512/1024 outputs from >= 4096 inputs. */
@@ -1018,7 +1044,6 @@ static int check_decode_rows(int bench) {
 
     for (size_t si = 0; si < sizeof(shapes) / sizeof(*shapes); si++) {
         const decode_rows_shape *s = &shapes[si];
-        const char *knob = s->q8 ? "DS4_METAL_Q8_ROWS_NR1" : "DS4_METAL_F16_ROWS_NR1";
         const size_t weight_bytes = decode_rows_weight_bytes(s);
         const size_t page = (size_t)getpagesize();
         const size_t stride = (weight_bytes + page - 1) / page * page;
@@ -1053,6 +1078,7 @@ static int check_decode_rows(int bench) {
         CHECK(ds4_gpu_set_model_map(model, model_bytes));
 
         const uint32_t width = s->width, output = s->outputs;
+        const char *kind = s->q8 ? "Q8_0" : "F16";
         ds4_gpu_tensor *in = upload(NULL, (size_t)MAX_ROWS * width * sizeof(float));
         ds4_gpu_tensor *out = upload(NULL, ((size_t)MAX_ROWS * output + 1) * sizeof(float));
         ds4_gpu_tensor *ref = upload(NULL, (size_t)MAX_ROWS * output * sizeof(float));
@@ -1063,7 +1089,9 @@ static int check_decode_rows(int bench) {
 
         const size_t variants = s->q8 ? 1 : sizeof(f16_nr0) / sizeof(*f16_nr0);
         for (size_t vi = 0; vi < variants; vi++) {
-            if (!s->q8) setenv("DS4_METAL_PLAIN_MV_NR0", f16_nr0[vi], 1);
+            const char *nr0_env = s->q8 ? "-" : f16_nr0[vi];
+            if (!s->q8) setenv("DS4_METAL_PLAIN_MV_NR0", nr0_env, 1);
+            decode_rows_set_mode(s, NULL);
             CHECK(ds4_gpu_begin_commands());
             for (uint32_t t = 0; t < MAX_ROWS; t++) {
                 ds4_gpu_tensor *xr = ds4_gpu_tensor_view(in, (size_t)t * width * 4, width * 4);
@@ -1076,53 +1104,54 @@ static int check_decode_rows(int bench) {
                 ds4_gpu_tensor_free(yr); ds4_gpu_tensor_free(xr);
             }
             CHECK(ds4_gpu_end_commands() && ds4_gpu_synchronize());
-            for (size_t ci = 0; ci < sizeof(counts) / sizeof(*counts); ci++) {
-                const uint32_t rows = counts[ci];
-                memset(y, 0xff, ((size_t)MAX_ROWS * output + 1) * sizeof(float));
-                y[(size_t)rows * output] = 12345;
-                const double start = monotonic_seconds();
-                CHECK(decode_rows_call(out, model, model_bytes, 0, s, in, rows));
-                CHECK(ds4_gpu_synchronize());
-                const double ms = (monotonic_seconds() - start) * 1000;
-                CHECK(y[(size_t)rows * output] == 12345);
-                if (memcmp(y, expected, (size_t)rows * output * sizeof(float)) != 0) {
-                    size_t i = 0;
-                    while (y[i] == expected[i]) i++;
-                    fprintf(stderr, "%s width=%u output=%u rows=%u nr0_env=%s: first mismatch row=%zu col=%zu got %.9g want %.9g\n",
-                        s->q8 ? "Q8_0" : "F16", width, output, rows,
-                        s->q8 ? "-" : f16_nr0[vi], i / output, i % output, y[i], expected[i]);
-                    CHECK(0);
+            for (size_t mi = 0; mi < sizeof(modes) / sizeof(*modes); mi++) {
+                decode_rows_set_mode(s, &modes[mi]);
+                double ms6 = 0;
+                for (size_t ci = 0; ci < sizeof(counts) / sizeof(*counts); ci++) {
+                    const uint32_t rows = counts[ci];
+                    memset(y, 0xff, ((size_t)MAX_ROWS * output + 1) * sizeof(float));
+                    y[(size_t)rows * output] = 12345;
+                    const double start = monotonic_seconds();
+                    CHECK(decode_rows_call(out, model, model_bytes, 0, s, in, rows));
+                    CHECK(ds4_gpu_synchronize());
+                    if (rows == 6) ms6 = (monotonic_seconds() - start) * 1000;
+                    CHECK(y[(size_t)rows * output] == 12345);
+                    if (memcmp(y, expected, (size_t)rows * output * sizeof(float)) != 0) {
+                        size_t i = 0;
+                        while (y[i] == expected[i]) i++;
+                        fprintf(stderr, "%s width=%u output=%u nr0_env=%s mode=%s rows=%u: first mismatch row=%zu col=%zu got %.9g want %.9g\n",
+                            kind, width, output, nr0_env, modes[mi].label, rows,
+                            i / output, i % output, y[i], expected[i]);
+                        CHECK(0);
+                    }
                 }
-                fprintf(stderr, "V4.1 exact %s decode rows width=%u output=%u rows=%u%s%s: bitwise PASS %.3f ms\n",
-                    s->q8 ? "Q8_0" : "F16", width, output, rows,
-                    s->q8 ? "" : " nr0_env=", s->q8 ? "" : f16_nr0[vi], ms);
+                fprintf(stderr, "V4.1 exact %s decode rows width=%u output=%u nr0_env=%s mode=%s rows=1-8,13,16: bitwise PASS (rows=6 %.3f ms)\n",
+                    kind, width, output, nr0_env, modes[mi].label, ms6);
             }
         }
         if (!s->q8) unsetenv("DS4_METAL_PLAIN_MV_NR0");
 
-        if (bench) {
-            /* "multi-row" honours a tile cap already set in the environment. */
-            const char *cap = getenv(knob);
-            char cap_value[16] = "";
-            if (cap) snprintf(cap_value, sizeof(cap_value), "%s", cap);
+        for (size_t ci = 0; bench && ci < sizeof(bench_counts) / sizeof(*bench_counts); ci++) {
+            const uint32_t rows = bench_counts[ci];
             const uint32_t iters = copies > 64u ? copies : 64u;
-            for (size_t ci = 0; ci < sizeof(bench_counts) / sizeof(*bench_counts); ci++) {
-                const uint32_t rows = bench_counts[ci];
-                setenv(knob, "1", 1);
-                const double before = decode_rows_time(out, model, model_bytes, stride, copies,
-                                                       s, in, rows, iters);
-                CHECK(before > 0);
+            double cold[BENCH_MODES], warm[BENCH_MODES];
+            for (size_t mi = 0; mi < BENCH_MODES; mi++) {
+                decode_rows_set_mode(s, &bench_modes[mi]);
+                cold[mi] = decode_rows_time(out, model, model_bytes, stride, copies, s, in, rows, iters);
+                warm[mi] = decode_rows_time(out, model, model_bytes, stride, 1, s, in, rows, 64);
+                CHECK(cold[mi] > 0 && warm[mi] > 0);
                 CHECK(memcmp(y, expected, (size_t)rows * output * sizeof(float)) == 0);
-                if (cap) setenv(knob, cap_value, 1);
-                else unsetenv(knob);
-                const double after = decode_rows_time(out, model, model_bytes, stride, copies,
-                                                      s, in, rows, iters);
-                CHECK(after > 0);
-                CHECK(memcmp(y, expected, (size_t)rows * output * sizeof(float)) == 0);
-                fprintf(stderr, "decode-rows bench %s width=%u output=%u rows=%u: per-row grid %.4f ms, multi-row %.4f ms (%.2fx)\n",
-                    s->q8 ? "Q8_0" : "F16", width, output, rows, before, after, before / after);
             }
+            fprintf(stderr, "decode-rows bench %s width=%u output=%u rows=%u ms/call cold:",
+                kind, width, output, rows);
+            for (size_t mi = 0; mi < BENCH_MODES; mi++)
+                fprintf(stderr, " %s=%.4f", bench_modes[mi].label, cold[mi]);
+            fprintf(stderr, " warm:");
+            for (size_t mi = 0; mi < BENCH_MODES; mi++)
+                fprintf(stderr, " %s=%.4f", bench_modes[mi].label, warm[mi]);
+            fprintf(stderr, "\n");
         }
+        decode_rows_set_mode(s, NULL);
 
         ds4_gpu_tensor_free(ref); ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(in);
         ds4_gpu_cleanup(); free(model);

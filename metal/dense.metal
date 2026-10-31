@@ -338,9 +338,16 @@ void kernel_mul_mv_q8_0_f32_rows_impl(
             tiisg, sgitg, shmem);
 }
 
-#define DS4_Q8_0_ROWS_KERNEL(NR1) \
-[[host_name("kernel_mul_mv_q8_0_f32_rows" #NR1)]] \
-kernel void kernel_mul_mv_q8_0_f32_rows##NR1( \
+// Grid-order variants for the exact decode-row matvecs.  The _interleave
+// kernels take a transposed grid (x = activation-row tile, y = output-row
+// tile), so the threadgroups sharing one weight tile launch next to each other
+// and can reuse it from cache.  POS maps the position back for the shared
+// impl, so the math is unchanged.
+#define DS4_MV_INTERLEAVED(p) uint3((p).y, (p).x, (p).z)
+
+#define DS4_Q8_0_ROWS_KERNEL(NR1, NAME, POS) \
+[[host_name(#NAME)]] \
+kernel void NAME( \
         constant ds4_metal_args_mul_mv & args, \
         device const char * src0, \
         device const char * src1, \
@@ -349,17 +356,36 @@ kernel void kernel_mul_mv_q8_0_f32_rows##NR1( \
         uint3  tgpig[[threadgroup_position_in_grid]], \
         ushort tiisg[[thread_index_in_simdgroup]], \
         ushort sgitg[[simdgroup_index_in_threadgroup]]) { \
-    kernel_mul_mv_q8_0_f32_rows_impl<N_R0_Q8_0, NR1>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); \
+    kernel_mul_mv_q8_0_f32_rows_impl<N_R0_Q8_0, NR1>(args, src0, src1, dst, shmem, POS, tiisg, sgitg); \
 }
 
-DS4_Q8_0_ROWS_KERNEL(2)
-DS4_Q8_0_ROWS_KERNEL(3)
-DS4_Q8_0_ROWS_KERNEL(4)
-DS4_Q8_0_ROWS_KERNEL(5)
-DS4_Q8_0_ROWS_KERNEL(6)
-DS4_Q8_0_ROWS_KERNEL(8)
+DS4_Q8_0_ROWS_KERNEL(2, kernel_mul_mv_q8_0_f32_rows2, tgpig)
+DS4_Q8_0_ROWS_KERNEL(3, kernel_mul_mv_q8_0_f32_rows3, tgpig)
+DS4_Q8_0_ROWS_KERNEL(4, kernel_mul_mv_q8_0_f32_rows4, tgpig)
+DS4_Q8_0_ROWS_KERNEL(5, kernel_mul_mv_q8_0_f32_rows5, tgpig)
+DS4_Q8_0_ROWS_KERNEL(6, kernel_mul_mv_q8_0_f32_rows6, tgpig)
+DS4_Q8_0_ROWS_KERNEL(8, kernel_mul_mv_q8_0_f32_rows8, tgpig)
+DS4_Q8_0_ROWS_KERNEL(2, kernel_mul_mv_q8_0_f32_rows2_interleave, DS4_MV_INTERLEAVED(tgpig))
+DS4_Q8_0_ROWS_KERNEL(3, kernel_mul_mv_q8_0_f32_rows3_interleave, DS4_MV_INTERLEAVED(tgpig))
+DS4_Q8_0_ROWS_KERNEL(4, kernel_mul_mv_q8_0_f32_rows4_interleave, DS4_MV_INTERLEAVED(tgpig))
 
 #undef DS4_Q8_0_ROWS_KERNEL
+
+// kernel_mul_mv_q8_0_f32 on the transposed grid: one activation row per
+// threadgroup, same impl and math.
+[[host_name("kernel_mul_mv_q8_0_f32_interleave")]]
+kernel void kernel_mul_mv_q8_0_f32_interleave(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(
+            args, src0, src1, dst, shmem, DS4_MV_INTERLEAVED(tgpig), tiisg, sgitg);
+}
 
 // Q8_0 matvec whose output is this rank's TP partial in its slab slot: same
 // K walk and reduction tree as kernel_mul_mv_q8_0_f32_impl, plus the checked
@@ -1625,9 +1651,9 @@ void kernel_mul_mv_f16_f32_4_rows_impl(
 }
 
 // args.nr0 selects the output-row tile exactly as kernel_mul_mv_t_t_4_disp.
-#define DS4_F16_4_ROWS_KERNEL(NR1) \
-[[host_name("kernel_mul_mv_f16_f32_4_rows" #NR1)]] \
-kernel void kernel_mul_mv_f16_f32_4_rows##NR1( \
+#define DS4_F16_4_ROWS_KERNEL(NR1, NAME, POS) \
+[[host_name(#NAME)]] \
+kernel void NAME( \
         constant ds4_metal_args_mul_mv & args, \
         device const char * src0, \
         device const char * src1, \
@@ -1637,20 +1663,38 @@ kernel void kernel_mul_mv_f16_f32_4_rows##NR1( \
         ushort tiisg[[thread_index_in_simdgroup]], \
         ushort sgitg[[simdgroup_index_in_threadgroup]]) { \
     switch (args.nr0) { \
-        case 1: kernel_mul_mv_f16_f32_4_rows_impl<1, NR1>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break; \
-        case 2: kernel_mul_mv_f16_f32_4_rows_impl<2, NR1>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break; \
-        case 4: kernel_mul_mv_f16_f32_4_rows_impl<4, NR1>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break; \
+        case 1: kernel_mul_mv_f16_f32_4_rows_impl<1, NR1>(args, src0, src1, dst, shmem, POS, tiisg, sgitg); break; \
+        case 2: kernel_mul_mv_f16_f32_4_rows_impl<2, NR1>(args, src0, src1, dst, shmem, POS, tiisg, sgitg); break; \
+        case 4: kernel_mul_mv_f16_f32_4_rows_impl<4, NR1>(args, src0, src1, dst, shmem, POS, tiisg, sgitg); break; \
     } \
 }
 
-DS4_F16_4_ROWS_KERNEL(2)
-DS4_F16_4_ROWS_KERNEL(3)
-DS4_F16_4_ROWS_KERNEL(4)
-DS4_F16_4_ROWS_KERNEL(5)
-DS4_F16_4_ROWS_KERNEL(6)
-DS4_F16_4_ROWS_KERNEL(8)
+DS4_F16_4_ROWS_KERNEL(2, kernel_mul_mv_f16_f32_4_rows2, tgpig)
+DS4_F16_4_ROWS_KERNEL(3, kernel_mul_mv_f16_f32_4_rows3, tgpig)
+DS4_F16_4_ROWS_KERNEL(4, kernel_mul_mv_f16_f32_4_rows4, tgpig)
+DS4_F16_4_ROWS_KERNEL(5, kernel_mul_mv_f16_f32_4_rows5, tgpig)
+DS4_F16_4_ROWS_KERNEL(6, kernel_mul_mv_f16_f32_4_rows6, tgpig)
+DS4_F16_4_ROWS_KERNEL(8, kernel_mul_mv_f16_f32_4_rows8, tgpig)
+DS4_F16_4_ROWS_KERNEL(2, kernel_mul_mv_f16_f32_4_rows2_interleave, DS4_MV_INTERLEAVED(tgpig))
+DS4_F16_4_ROWS_KERNEL(3, kernel_mul_mv_f16_f32_4_rows3_interleave, DS4_MV_INTERLEAVED(tgpig))
+DS4_F16_4_ROWS_KERNEL(4, kernel_mul_mv_f16_f32_4_rows4_interleave, DS4_MV_INTERLEAVED(tgpig))
 
 #undef DS4_F16_4_ROWS_KERNEL
+
+// kernel_mul_mv_f16_f32_4 on the transposed grid (see DS4_MV_INTERLEAVED).
+[[host_name("kernel_mul_mv_f16_f32_4_interleave")]]
+kernel void kernel_mul_mv_f16_f32_4_interleave(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_t_t_4_disp<half, half4, float, float4, constant ds4_metal_args_mul_mv &>(
+            args, src0, src1, dst, shmem, DS4_MV_INTERLEAVED(tgpig), tiisg, sgitg);
+}
 
 // DS4 compressor projections always compute two same-shaped F16 matvecs from
 // the same normalized activation: one for projected KV and one for pooling

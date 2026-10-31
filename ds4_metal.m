@@ -5403,20 +5403,74 @@ static ds4_gpu_mv_dispatch ds4_gpu_make_q8_0_mv_dispatch(void) {
     };
 }
 
-/* Activation rows per threadgroup (nr1) for the exact decode-row kernels
- * kernel_mul_mv_q8_0_f32_rows<N> and kernel_mul_mv_f16_f32_4_rows<N>, which
- * stream each weight tile once for all N rows.  Rows split into the fewest
- * tiles of at most cap rows, each tile rounded up to a compiled size; padding
- * rows are computed and discarded, which is cheaper than another weight pass
- * (7 rows run one 8-row tile).  Grids under 128 threadgroups along the output
- * axis keep one row per threadgroup, since there the row axis is what fills
- * the GPU (hc_*_fn: 24 outputs ran 2x slower with 6-row tiles on M5 Ultra).
- * env_name overrides cap (1 restores one row per threadgroup) for A/B timing.
- * Returns 1 for a single row. */
+/* Grid plan for the exact decode-row matvecs (Q8_0 kernel_mul_mv_q8_0_f32
+ * and F16 kernel_mul_mv_f16_f32_4 over n_rows activation rows).  Every mode
+ * gives each row the single-row kernel's exact result:
+ *   off             one activation row per threadgroup, grid (outputs, rows);
+ *                   each threadgroup re-reads its weight tile per row.
+ *   rows            _rows<nr1> kernels read each weight tile once for nr1
+ *                   rows, grid (outputs, row tiles).
+ *   interleave      one row per threadgroup on the transposed grid (rows,
+ *                   outputs), so the threadgroups sharing a weight tile
+ *                   launch together and can reuse it from cache.
+ *   interleave-rows _rows<nr1>_interleave, nr1 <= 4.
+ *   auto            (default) rows.  On M5 Ultra, with cold weights at the
+ *                   V4.1 shapes with 512 or more outputs, rows ran 1.4-3.0x
+ *                   faster than off at 6 rows; interleave gained at most 16% over off (1.5x on
+ *                   engram_kv) and interleave-rows (2-row tiles) was up to
+ *                   30% slower than rows.
+ * DS4_METAL_DECODE_ROWS_MODE selects the mode for A/B timing. */
+typedef enum {
+    DS4_DECODE_ROWS_AUTO,
+    DS4_DECODE_ROWS_OFF,
+    DS4_DECODE_ROWS_ROWS,
+    DS4_DECODE_ROWS_INTERLEAVE,
+    DS4_DECODE_ROWS_INTERLEAVE_ROWS,
+} ds4_gpu_decode_rows_mode;
+
+typedef struct {
+    char     name[64];
+    uint32_t nr1;
+    bool     interleave;
+} ds4_gpu_decode_rows_plan;
+
+static ds4_gpu_decode_rows_mode ds4_gpu_decode_rows_mode_env(void) {
+    const char *v = getenv("DS4_METAL_DECODE_ROWS_MODE");
+    if (!v) return DS4_DECODE_ROWS_AUTO;
+    if (!strcmp(v, "off")) return DS4_DECODE_ROWS_OFF;
+    if (!strcmp(v, "rows")) return DS4_DECODE_ROWS_ROWS;
+    if (!strcmp(v, "interleave")) return DS4_DECODE_ROWS_INTERLEAVE;
+    if (!strcmp(v, "interleave-rows")) return DS4_DECODE_ROWS_INTERLEAVE_ROWS;
+    return DS4_DECODE_ROWS_AUTO;
+}
+
+/* Activation rows per threadgroup for the _rows<N> kernels.  Rows split into
+ * the fewest tiles of at most cap rows, each rounded up to a compiled size;
+ * padding rows are computed and discarded, which is cheaper than another
+ * weight pass.  Default caps, from cold-weight timings on M5 Ultra:
+ *   Q8_0  6, or 5 under 2048 output threadgroups.  One 5- or 6-row tile beat
+ *         two smaller tiles on the wide projections (attn_q_b 1280x32768 at
+ *         6 rows: 0.104 versus 0.114 ms), but the 6-row tile lost to 3+3 on
+ *         narrow ones (attn_q_a 5120x1280: 0.020 versus 0.017 ms), and
+ *         8-row tiles lost to 4+4 almost everywhere.
+ *   F16   4, or 5 from 8192 output threadgroups.  Each row keeps 16
+ *         activation floats live; five or more rows per tile lost occupancy,
+ *         so 6 rows run as 3+3, except that engram_kv (6144x25600) ran 5 rows
+ *         in 0.41 ms as one tile versus 0.54 ms as 3+3.
+ * Grids under 128 output threadgroups keep one row per threadgroup, since
+ * there the row axis is what fills the GPU (hc_*_fn: 24 outputs ran 2x
+ * slower with 6-row tiles).  DS4_METAL_Q8_ROWS_NR1 / DS4_METAL_F16_ROWS_NR1
+ * override the cap (1 restores one row per threadgroup); max_cap bounds it
+ * to the compiled tiles of a kernel family. */
 static uint32_t ds4_gpu_decode_rows_nr1(uint32_t n_rows, uint64_t out_groups,
-                                        const char *env_name, uint32_t default_cap) {
+                                        bool f16, uint32_t max_cap) {
     static const uint32_t tiles[] = {2, 3, 4, 5, 6, 8};
-    const uint32_t cap = (uint32_t)ds4_gpu_env_u64(env_name, default_cap, 1u, 8u);
+    const uint32_t default_cap = f16 ? (out_groups >= 8192u ? 5u : 4u)
+                                     : (out_groups >= 2048u ? 6u : 5u);
+    uint32_t cap = (uint32_t)ds4_gpu_env_u64(
+        f16 ? "DS4_METAL_F16_ROWS_NR1" : "DS4_METAL_Q8_ROWS_NR1",
+        default_cap, 1u, 8u);
+    if (cap > max_cap) cap = max_cap;
     if (n_rows < 2u || cap < 2u || out_groups < 128u) return 1;
     const uint32_t n_tiles = (n_rows + cap - 1u) / cap;
     const uint32_t want = (n_rows + n_tiles - 1u) / n_tiles;
@@ -5428,18 +5482,33 @@ static uint32_t ds4_gpu_decode_rows_nr1(uint32_t n_rows, uint64_t out_groups,
     return nr1;
 }
 
-/* Q8_0 holds only an 8-value slice per activation row live; at 6 rows one
- * 6-row tile beat two 3-row tiles on the wide V4.1 projections (attn_q_b
- * 1280x32768: 0.104 versus 0.114 ms on M5 Ultra). */
-static uint32_t ds4_gpu_q8_0_rows_nr1(uint32_t n_rows, uint64_t out_groups) {
-    return ds4_gpu_decode_rows_nr1(n_rows, out_groups, "DS4_METAL_Q8_ROWS_NR1", 8u);
+/* base names the single-row kernel; a single row always runs it unchanged. */
+static ds4_gpu_decode_rows_plan ds4_gpu_plan_decode_rows(
+        const char *base, bool f16, uint32_t n_rows, uint64_t out_groups) {
+    ds4_gpu_decode_rows_plan plan = { .nr1 = 1, .interleave = false };
+    ds4_gpu_decode_rows_mode mode = n_rows > 1u
+        ? ds4_gpu_decode_rows_mode_env() : DS4_DECODE_ROWS_OFF;
+    if (mode == DS4_DECODE_ROWS_AUTO) mode = DS4_DECODE_ROWS_ROWS;
+    if (mode == DS4_DECODE_ROWS_ROWS) {
+        plan.nr1 = ds4_gpu_decode_rows_nr1(n_rows, out_groups, f16, 8u);
+    } else if (mode == DS4_DECODE_ROWS_INTERLEAVE_ROWS) {
+        plan.nr1 = ds4_gpu_decode_rows_nr1(n_rows, out_groups, f16, 4u);
+    }
+    plan.interleave = mode == DS4_DECODE_ROWS_INTERLEAVE ||
+                      mode == DS4_DECODE_ROWS_INTERLEAVE_ROWS;
+    char rows[8] = "";
+    if (plan.nr1 > 1u) snprintf(rows, sizeof(rows), "_rows%u", plan.nr1);
+    snprintf(plan.name, sizeof(plan.name), "%s%s%s", base, rows,
+             plan.interleave ? "_interleave" : "");
+    return plan;
 }
 
-/* F16 keeps 16 activation floats per row live; five or more rows per tile
- * lost occupancy, so 6 rows run as two 3-row tiles and 8 as two 4-row tiles
- * (engram_kv 6144x25600: 2.9x at 6 rows versus 2.6x with one 6-row tile). */
-static uint32_t ds4_gpu_f16_rows_nr1(uint32_t n_rows, uint64_t out_groups) {
-    return ds4_gpu_decode_rows_nr1(n_rows, out_groups, "DS4_METAL_F16_ROWS_NR1", 4u);
+static MTLSize ds4_gpu_decode_rows_grid(const ds4_gpu_decode_rows_plan *plan,
+                                        uint64_t out_groups, uint32_t n_rows) {
+    const NSUInteger row_tiles = ((NSUInteger)n_rows + plan->nr1 - 1u) / plan->nr1;
+    return plan->interleave
+        ? MTLSizeMake(row_tiles, (NSUInteger)out_groups, 1)
+        : MTLSizeMake((NSUInteger)out_groups, row_tiles, 1);
 }
 
 /* Single-token F16/F32 matvecs with few output rows (the Qwen hyper-connection
@@ -19727,17 +19796,12 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         args.ne1 = (int32_t)n_rows;
         args.nr0 = dispatch.nr0;
 
-        /* Two or more rows share each weight pass through the _rows<nr1>
-         * kernel; one row keeps the single-row kernel. */
-        const uint32_t nr1 = ds4_gpu_q8_0_rows_nr1(n_rows,
-            (out_dim + (uint64_t)dispatch.nr0 - 1u) / (uint64_t)dispatch.nr0);
-        char rows_name[48];
-        if (nr1 > 1u) {
-            snprintf(rows_name, sizeof(rows_name),
-                     "kernel_mul_mv_q8_0_f32_rows%u", nr1);
-            dispatch.function_name = rows_name;
-            dispatch.smem = 32u * (NSUInteger)dispatch.nr0 * nr1 * sizeof(float);
-        }
+        const uint64_t out_groups =
+            (out_dim + (uint64_t)dispatch.nr0 - 1u) / (uint64_t)dispatch.nr0;
+        const ds4_gpu_decode_rows_plan plan = ds4_gpu_plan_decode_rows(
+            dispatch.function_name, false, n_rows, out_groups);
+        dispatch.function_name = plan.name;
+        dispatch.smem *= plan.nr1;
 
         id<MTLComputePipelineState> pipeline =
             ds4_gpu_get_mul_mv_pipeline(dispatch.function_name, dispatch.nsg);
@@ -19754,11 +19818,7 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
         [enc setThreadgroupMemoryLength:dispatch.smem atIndex:0];
         [enc dispatchThreadgroups:
-                MTLSizeMake(((NSUInteger)out_dim +
-                             (NSUInteger)dispatch.nr0 - 1u) /
-                                (NSUInteger)dispatch.nr0,
-                            ((NSUInteger)n_rows + nr1 - 1u) / nr1,
-                            1)
+                ds4_gpu_decode_rows_grid(&plan, out_groups, n_rows)
              threadsPerThreadgroup:
                 MTLSizeMake(32, (NSUInteger)dispatch.nsg, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -21070,22 +21130,17 @@ static int ds4_gpu_matmul_f16_tensor_impl(
                 mv_dispatch.smem = 32u * sizeof(float);
             }
             mv_args.nr0 = mv_dispatch.nr0;
-            /* Exact multi-row calls on the float4 kernel share each weight
-             * pass across nr1 rows; each row stays bitwise identical to the
-             * single-row dispatch. */
-            uint32_t nr1 = 1;
-            char rows_name[48];
-            if (exact_rows && n_tok > 1 &&
-                !strcmp(mv_dispatch.function_name, "kernel_mul_mv_f16_f32_4")) {
-                nr1 = ds4_gpu_f16_rows_nr1((uint32_t)n_tok,
-                    (out_dim + (uint64_t)mv_dispatch.nr0 - 1u) / (uint64_t)mv_dispatch.nr0);
-            }
-            if (nr1 > 1u) {
-                snprintf(rows_name, sizeof(rows_name),
-                         "kernel_mul_mv_f16_f32_4_rows%u", nr1);
-                mv_dispatch.function_name = rows_name;
-                mv_dispatch.smem = 32u * (NSUInteger)mv_dispatch.nr0 * nr1 * sizeof(float);
-            }
+            /* Exact multi-row calls on the float4 kernel take the decode-row
+             * plan; other kernels keep one activation row per threadgroup. */
+            const uint64_t out_groups =
+                (out_dim + (uint64_t)mv_dispatch.nr0 - 1u) / (uint64_t)mv_dispatch.nr0;
+            const bool plan_rows = exact_rows && n_tok > 1 &&
+                !strcmp(mv_dispatch.function_name, "kernel_mul_mv_f16_f32_4");
+            const ds4_gpu_decode_rows_plan plan = ds4_gpu_plan_decode_rows(
+                mv_dispatch.function_name, true, plan_rows ? (uint32_t)n_tok : 1u,
+                out_groups);
+            mv_dispatch.function_name = plan.name;
+            mv_dispatch.smem *= plan.nr1;
             id<MTLComputePipelineState> pipeline =
                 ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
             if (!pipeline) return 0;
@@ -21099,9 +21154,9 @@ static int ds4_gpu_matmul_f16_tensor_impl(
             if (mv_dispatch.smem) {
                 [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
             }
-            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
-                                                  ((NSUInteger)n_tok + nr1 - 1u) / nr1,
-                                                  1)
+            [enc dispatchThreadgroups:(plan_rows
+                    ? ds4_gpu_decode_rows_grid(&plan, out_groups, (uint32_t)n_tok)
+                    : MTLSizeMake((NSUInteger)out_groups, (NSUInteger)n_tok, 1))
                  threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
 
