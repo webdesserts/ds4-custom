@@ -753,6 +753,83 @@ static int check_f32_rows(void) {
  * and an overflowing row (non-finite values pass the rounding unchanged),
  * rows 1..6, auto and off plans. When the plan has no row tile the call
  * reports *rounded == 0 and must leave outputs unrounded. */
+/* DS4_METAL_V41_FUSED_ROUTER: the one-dispatch 384-expert router against
+ * the generic nine-dispatch chain (=0), bitwise over probs, selected ids and
+ * weights, for the batch and single-row entry points. Patterns include all
+ * scores equal and few distinct values, where only an identical sorting
+ * network keeps the tie order. */
+static int check_fused_router(void) {
+    enum { ROWS = 129, N = 384, USED = 6, PATTERNS = 6 };
+    const size_t bias_bytes = (size_t)getpagesize();
+    float *bias = NULL;
+    CHECK(posix_memalign((void **)&bias, bias_bytes, bias_bytes) == 0);
+    memset(bias, 0, bias_bytes);
+    CHECK(ds4_gpu_set_model_map(bias, bias_bytes));
+    float *logits = malloc((size_t)ROWS * N * sizeof(float));
+    int32_t tokens[ROWS] = {0};
+    CHECK(logits);
+    ds4_gpu_tensor *x = upload(NULL, ROWS * N * sizeof(float));
+    ds4_gpu_tensor *tok = upload(tokens, sizeof(tokens));
+    ds4_gpu_tensor *p[2], *ids[2], *w[2];
+    for (int v = 0; v < 2; v++) {
+        p[v] = upload(NULL, ROWS * N * sizeof(float));
+        ids[v] = upload(NULL, ROWS * USED * sizeof(int32_t));
+        w[v] = upload(NULL, ROWS * USED * sizeof(float));
+        CHECK(p[v] && ids[v] && w[v]);
+    }
+    CHECK(x && tok);
+    static const unsigned counts[] = {1, 2, 3, 5, 6, 8, 17, ROWS};
+    static const char *const names[PATTERNS] = {
+        "random", "all-equal", "four-values", "saturating", "tiny", "zero-bias-random"};
+    int passes = 0;
+    for (unsigned mode = 0; mode < PATTERNS; mode++) {
+        for (unsigned e = 0; e < N; e++)
+            bias[e] = mode == 5 ? 0.0f : mode == 1 ? 0.25f : (float)(e % 7) * 0.125f;
+        for (unsigned i = 0; i < ROWS * N; i++)
+            logits[i] = mode == 1 ? 0.0f : mode == 2 ? (float)(i % 4) - 1.5f :
+                mode == 3 ? (i % 2 ? -80.0f : 40.0f) : mode == 4 ? random_value() * 1e-3f - 30.0f :
+                random_value() * 8;
+        CHECK(ds4_gpu_tensor_write(x, 0, logits, ROWS * N * sizeof(float)));
+        for (unsigned ci = 0; ci < sizeof(counts) / sizeof(*counts); ci++) {
+            const unsigned rows = counts[ci];
+            for (int v = 0; v < 2; v++) {
+                if (v) setenv("DS4_METAL_V41_FUSED_ROUTER", "0", 1);
+                memset(ds4_gpu_tensor_contents(p[v]), 0xa5, ROWS * N * sizeof(float));
+                memset(ds4_gpu_tensor_contents(ids[v]), 0xa5, ROWS * USED * sizeof(int32_t));
+                memset(ds4_gpu_tensor_contents(w[v]), 0xa5, ROWS * USED * sizeof(float));
+                const int ok = rows == 1 ?
+                    ds4_gpu_router_select_tensor(ids[v], w[v], p[v], bias, bias_bytes,
+                        0, 0, 0, 0, N, USED, 1.5f, 0, 0, true, false, x) :
+                    ds4_gpu_router_select_batch_tensor(ids[v], w[v], p[v], bias, bias_bytes,
+                        0, 0, 0, 0, 0, true, false, x, tok, N, USED, 1.5f, rows);
+                unsetenv("DS4_METAL_V41_FUSED_ROUTER");
+                CHECK(ok && ds4_gpu_synchronize());
+            }
+            const size_t pb = (size_t)rows * N * sizeof(float), sb = (size_t)rows * USED * 4u;
+            const int same_p = memcmp(ds4_gpu_tensor_contents(p[0]), ds4_gpu_tensor_contents(p[1]), pb) == 0;
+            const int same_i = memcmp(ds4_gpu_tensor_contents(ids[0]), ds4_gpu_tensor_contents(ids[1]), sb) == 0;
+            const int same_w = memcmp(ds4_gpu_tensor_contents(w[0]), ds4_gpu_tensor_contents(w[1]), sb) == 0;
+            if (!same_p || !same_i || !same_w) {
+                const int32_t *a = ds4_gpu_tensor_contents(ids[0]), *b = ds4_gpu_tensor_contents(ids[1]);
+                const float *wa = ds4_gpu_tensor_contents(w[0]), *wb = ds4_gpu_tensor_contents(w[1]);
+                fprintf(stderr, "fused router %s rows=%u: probs %s ids %s weights %s; row0 ids %d,%d,%d vs %d,%d,%d w %.9g vs %.9g\n",
+                    names[mode], rows, same_p ? "same" : "DIFF", same_i ? "same" : "DIFF",
+                    same_w ? "same" : "DIFF", a[0], a[1], a[2], b[0], b[1], b[2], wa[0], wb[0]);
+                CHECK(0);
+            }
+            passes++;
+        }
+        fprintf(stderr, "V4.1 fused router %s rows=1-8,17,129: bitwise PASS\n", names[mode]);
+    }
+    for (int v = 0; v < 2; v++) {
+        ds4_gpu_tensor_free(p[v]); ds4_gpu_tensor_free(ids[v]); ds4_gpu_tensor_free(w[v]);
+    }
+    ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(tok);
+    free(logits);
+    fprintf(stderr, "V4.1 fused router: %d bitwise cases PASS\n", passes);
+    return 1;
+}
+
 static int check_fused_bf16(void) {
     enum { ROWS = 6 };
     typedef struct { uint16_t d; int8_t qs[32]; } q8_block;
@@ -2280,6 +2357,11 @@ int main(int argc, char **argv) {
     }
     if (argc == 2 && !strcmp(argv[1], "--fused-norm")) {
         const int ok = ds4_gpu_init() && check_fused_norm();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--fused-router")) {
+        const int ok = ds4_gpu_init() && check_fused_router();
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }

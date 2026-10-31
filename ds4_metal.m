@@ -34392,6 +34392,11 @@ static int ds4_gpu_encode_sum_rows_f32(
     return 1;
 }
 
+static bool ds4_gpu_v41_fused_router_enabled(void) {
+    const char *v = getenv("DS4_METAL_V41_FUSED_ROUTER");
+    return !v || strcmp(v, "0") != 0;
+}
+
 static int ds4_gpu_encode_router_select(
         id<MTLCommandBuffer>  cb,
         ds4_gpu_tensor     *selected,
@@ -34594,6 +34599,40 @@ static int ds4_gpu_encode_router_select(
         return 1;
     }
 
+    /* V4.1 (384 experts, biased, no hash or visual routing): one dispatch
+     * replays the nine-dispatch generic chain below bit for bit.
+     * DS4_METAL_V41_FUSED_ROUTER=0 keeps the chain. */
+    if (n_expert == 384u && n_expert_used == 6u && has_bias && biasbuf && !hash_mode &&
+        !mixed_visual && !g_quality_mode && ds4_gpu_v41_fused_router_enabled()) {
+        id<MTLComputePipelineState> fused = ds4_gpu_get_pipeline("kernel_dsv41_router_select_f32");
+        /* The thread count of the argsort it replaces (see
+         * ds4_gpu_indexer_topk_tensor_impl): its sorting network depends on it. */
+        NSUInteger max_threads = g_argsort_f32_i32_desc_pipeline.maxTotalThreadsPerThreadgroup;
+        if (max_threads == 0) max_threads = 256;
+        NSUInteger nth = 1;
+        while (nth < n_expert && 2u * nth <= max_threads) nth *= 2u;
+        if (fused && nth >= n_expert && fused.maxTotalThreadsPerThreadgroup >= nth &&
+            fused.threadExecutionWidth == 32u) {
+            const struct {
+                int32_t n_expert, n_used;
+                float scale, min_sum, max_sum;
+            } args = { (int32_t)n_expert, (int32_t)n_expert_used, expert_weight_scale,
+                       6.103515625e-5f, ds4_gpu_positive_infinity() };
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:fused];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:logitsbuf offset:logits_off atIndex:1];
+            [enc setBuffer:probsbuf offset:probs_off atIndex:2];
+            [enc setBuffer:biasbuf offset:bias_off atIndex:3];
+            [enc setBuffer:selectedbuf offset:selected_off atIndex:4];
+            [enc setBuffer:weightsbuf offset:weights_off atIndex:5];
+            [enc setThreadgroupMemoryLength:nth * 3u * sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+            return 1;
+        }
+    }
     if (flash_router_fast_path && !mixed_visual && !g_quality_mode && n_tokens == 1) {
         id<MTLComputePipelineState> softplus_sqrt_pipeline =
             ds4_gpu_hot_pipeline(g_dsv4_softplus_sqrt_pipeline,

@@ -318,3 +318,90 @@ kernel void kernel_argsort_merge_f32_i32(
 template [[host_name("kernel_argsort_merge_f32_i32_desc")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC>;
 template [[host_name("kernel_argsort_merge_f32_i32_desc_causal")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC, true>;
 template [[host_name("kernel_argsort_merge_f32_i32_desc_causal_prefix")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC, true, true>;
+
+struct ds4_metal_dsv41_router_args {
+    int32_t n_expert;
+    int32_t n_used;
+    float   scale;
+    float   min_sum;
+    float   max_sum;
+};
+
+// One-dispatch V4.1 router selection (DS4_METAL_V41_FUSED_ROUTER). One
+// threadgroup of ntg.x (a power of two >= n_expert) threads per row replays
+// the generic chain bit for bit:
+//   kernel_unary softplus then sqrt   -> probs
+//   bin add of the selection bias     -> scores
+//   kernel_argsort_f32_i32_desc       -> selected (same network and width)
+//   get_rows, sum_rows (one simdgroup of n_used lanes), clamp, row divide,
+//   scalar multiply                   -> weights
+// Threadgroup round trips separate the steps whose intermediates the generic
+// chain stores, so the compiler cannot contract across them.
+kernel void kernel_dsv41_router_select_f32(
+        constant ds4_metal_dsv41_router_args & args,
+        device const float * logits,
+        device       float * probs,
+        device const float * bias,
+        device     int32_t * selected,
+        device       float * weights,
+        threadgroup int32_t * shmem_i32 [[threadgroup(0)]],
+        uint    row [[threadgroup_position_in_grid]],
+        ushort  col [[thread_position_in_threadgroup]],
+        ushort  ntg [[threads_per_threadgroup]],
+        ushort  tiisg [[thread_index_in_simdgroup]],
+        ushort  sgitg [[simdgroup_index_in_threadgroup]]) {
+    const int width = args.n_expert;
+    threadgroup float *shmem_f32 = (threadgroup float *)(shmem_i32 + ntg);
+    threadgroup float *shmem_p = shmem_f32 + ntg;
+    device const float *logits_row = logits + (uint64_t)row * width;
+    device       float *probs_row = probs + (uint64_t)row * width;
+
+    shmem_i32[col] = col;
+    if (col < width) {
+        const float x = logits_row[col];
+        const float ex = exp(x);
+        const float em = min(ex, 0.03125f);
+        const float poly = em*(1.0f - em*(0.5f - em*(1.0f/3.0f - 0.25f*em)));
+        shmem_p[col] = select(select(log(1 + ex), poly, ex < 0.03125f), x, x > 20);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (col < width) {
+        const float p = sqrt(shmem_p[col]);
+        shmem_p[col] = p;
+        probs_row[col] = p;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (col < width) shmem_f32[col] = shmem_p[col] + bias[col];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int k = 2; k <= ntg; k *= 2) {
+        for (int j = k / 2; j > 0; j /= 2) {
+            int ixj = col ^ j;
+            if (ixj > col) {
+                if ((col & k) == 0) {
+                    if (shmem_i32[col] >= width ||
+                       (shmem_i32[ixj] <  width &&
+                            shmem_f32[shmem_i32[col]] < shmem_f32[shmem_i32[ixj]])) {
+                        SWAP(shmem_i32[col], shmem_i32[ixj]);
+                    }
+                } else {
+                    if (shmem_i32[ixj] >= width ||
+                       (shmem_i32[col] <  width &&
+                            shmem_f32[shmem_i32[col]] > shmem_f32[shmem_i32[ixj]])) {
+                        SWAP(shmem_i32[col], shmem_i32[ixj]);
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (sgitg != 0 || tiisg >= args.n_used) return;
+    const int e = shmem_i32[tiisg];
+    selected[(uint64_t)row * args.n_used + tiisg] = e;
+    const float w = shmem_p[e];
+    const float s = clamp(simd_sum(w), args.min_sum, args.max_sum);
+    shmem_f32[tiisg] = w / s;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    weights[(uint64_t)row * args.n_used + tiisg] = shmem_f32[tiisg] * args.scale;
+}
