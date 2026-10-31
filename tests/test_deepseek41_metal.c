@@ -959,6 +959,178 @@ static int check_index_projection(void) {
     return 1;
 }
 
+/* Exact decode-row Q8_0 and F16 matvecs stream each weight tile once for
+ * several activation rows.  Every multi-row call must equal the single-row
+ * kernel on each row bit for bit.  Bench mode also times the multi-row tiles
+ * against the one-row-per-threadgroup grid (tile cap 1) with weights rotated
+ * through about 1 GiB so each call reads them from DRAM, not cache. */
+typedef struct { uint32_t width, outputs; int q8; } decode_rows_shape;
+
+static size_t decode_rows_weight_bytes(const decode_rows_shape *s) {
+    return s->q8 ? (size_t)s->outputs * (s->width / 32u) * 34u
+                 : (size_t)s->outputs * s->width * sizeof(uint16_t);
+}
+
+static int decode_rows_call(ds4_gpu_tensor *out, const void *model, size_t model_bytes,
+                            size_t offset, const decode_rows_shape *s,
+                            ds4_gpu_tensor *in, uint32_t rows) {
+    if (s->q8)
+        return ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(out, model, model_bytes, offset,
+            s->width, s->outputs, in, rows);
+    return ds4_gpu_dsv41_projection_rows(out, model, model_bytes, offset, s->width,
+        s->outputs, rows, in);
+}
+
+/* Mean milliseconds per call over iters calls batched into one submission. */
+static double decode_rows_time(ds4_gpu_tensor *out, const void *model, size_t model_bytes,
+                               size_t stride, uint32_t copies, const decode_rows_shape *s,
+                               ds4_gpu_tensor *in, uint32_t rows, uint32_t iters) {
+    if (!decode_rows_call(out, model, model_bytes, 0, s, in, rows) || !ds4_gpu_synchronize())
+        return -1;
+    const double start = monotonic_seconds();
+    if (!ds4_gpu_begin_commands()) return -1;
+    for (uint32_t i = 0; i < iters; i++) {
+        if (!decode_rows_call(out, model, model_bytes, (size_t)(i % copies) * stride, s, in, rows))
+            return -1;
+    }
+    if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return -1;
+    return (monotonic_seconds() - start) * 1000.0 / iters;
+}
+
+static int check_decode_rows(int bench) {
+    enum { MAX_ROWS = 16 };
+    static const decode_rows_shape shapes[] = {
+        /* Q8_0: V4.1 attn_kv, q_a, shared experts, attn_output_a/b, q_b. */
+        {5120, 512, 1}, {5120, 1024, 1}, {5120, 1280, 1}, {5120, 2304, 1},
+        {2304, 5120, 1}, {4096, 4096, 1}, {4096, 8192, 1}, {8192, 5120, 1},
+        {1280, 32768, 1},
+        /* F16: engram_kv, hc_*_fn, indexer q_b/proj/k, compressor; 4100 runs
+         * the scalar tail loop. */
+        {6144, 25600, 0}, {20480, 24, 0}, {1280, 4096, 0}, {5120, 32, 0},
+        {512, 128, 0}, {5120, 512, 0}, {4096, 1024, 0}, {4096, 4096, 0},
+        {4100, 1024, 0},
+    };
+    static const uint32_t counts[] = {1, 2, 3, 5, 6, 7, 8, 13, MAX_ROWS};
+    static const uint32_t bench_counts[] = {2, 3, 5, 6, 8};
+    /* DS4_METAL_PLAIN_MV_NR0=1 selects the one-output-row F16 tile; =2 the
+     * two-row tile, or four rows for 512/1024 outputs from >= 4096 inputs. */
+    static const char *const f16_nr0[] = {"1", "2"};
+
+    for (size_t si = 0; si < sizeof(shapes) / sizeof(*shapes); si++) {
+        const decode_rows_shape *s = &shapes[si];
+        const char *knob = s->q8 ? "DS4_METAL_Q8_ROWS_NR1" : "DS4_METAL_F16_ROWS_NR1";
+        const size_t weight_bytes = decode_rows_weight_bytes(s);
+        const size_t page = (size_t)getpagesize();
+        const size_t stride = (weight_bytes + page - 1) / page * page;
+        uint32_t copies = 1;
+        if (bench) {
+            const size_t target = (size_t)1 << 30;
+            copies = (uint32_t)((target + stride - 1) / stride);
+            if (copies > 1024u) copies = 1024u;
+        }
+        const size_t model_bytes = stride * copies;
+        void *model = NULL;
+        CHECK(posix_memalign(&model, page, model_bytes) == 0);
+        if (s->q8) {
+            uint8_t *blocks = model;
+            for (size_t b = 0; b < weight_bytes / 34u; b++) {
+                const int value = (int)(random_value() * 8192);
+                const uint16_t scale = (uint16_t)(0x2000u | ((unsigned)abs(value) % 1024u));
+                memcpy(blocks + b * 34u, &scale, sizeof(scale));
+                for (uint32_t q = 0; q < 32; q++)
+                    blocks[b * 34u + 2u + q] = (uint8_t)(int8_t)((int)(random_value() * 31) % 128);
+            }
+        } else {
+            uint16_t *weights = model;
+            for (size_t i = 0; i < weight_bytes / sizeof(*weights); i++) {
+                const int value = (int)(random_value() * 8192);
+                weights[i] = (uint16_t)(0x2000u | ((unsigned)abs(value) % 1024u) |
+                                        (value < 0 ? 0x8000u : 0));
+            }
+        }
+        for (uint32_t c = 1; c < copies; c++)
+            memcpy((char *)model + (size_t)c * stride, model, weight_bytes);
+        CHECK(ds4_gpu_set_model_map(model, model_bytes));
+
+        const uint32_t width = s->width, output = s->outputs;
+        ds4_gpu_tensor *in = upload(NULL, (size_t)MAX_ROWS * width * sizeof(float));
+        ds4_gpu_tensor *out = upload(NULL, ((size_t)MAX_ROWS * output + 1) * sizeof(float));
+        ds4_gpu_tensor *ref = upload(NULL, (size_t)MAX_ROWS * output * sizeof(float));
+        CHECK(in && out && ref);
+        float *x = ds4_gpu_tensor_contents(in), *y = ds4_gpu_tensor_contents(out);
+        const float *expected = ds4_gpu_tensor_contents(ref);
+        for (size_t i = 0; i < (size_t)MAX_ROWS * width; i++) x[i] = bf16(random_value());
+
+        const size_t variants = s->q8 ? 1 : sizeof(f16_nr0) / sizeof(*f16_nr0);
+        for (size_t vi = 0; vi < variants; vi++) {
+            if (!s->q8) setenv("DS4_METAL_PLAIN_MV_NR0", f16_nr0[vi], 1);
+            CHECK(ds4_gpu_begin_commands());
+            for (uint32_t t = 0; t < MAX_ROWS; t++) {
+                ds4_gpu_tensor *xr = ds4_gpu_tensor_view(in, (size_t)t * width * 4, width * 4);
+                ds4_gpu_tensor *yr = ds4_gpu_tensor_view(ref, (size_t)t * output * 4, output * 4);
+                CHECK(xr && yr);
+                CHECK(s->q8 ? ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(yr, model, model_bytes,
+                                  0, width, output, xr, 1)
+                            : ds4_gpu_matmul_f16_tensor(yr, model, model_bytes, 0, width,
+                                  output, xr, 1));
+                ds4_gpu_tensor_free(yr); ds4_gpu_tensor_free(xr);
+            }
+            CHECK(ds4_gpu_end_commands() && ds4_gpu_synchronize());
+            for (size_t ci = 0; ci < sizeof(counts) / sizeof(*counts); ci++) {
+                const uint32_t rows = counts[ci];
+                memset(y, 0xff, ((size_t)MAX_ROWS * output + 1) * sizeof(float));
+                y[(size_t)rows * output] = 12345;
+                const double start = monotonic_seconds();
+                CHECK(decode_rows_call(out, model, model_bytes, 0, s, in, rows));
+                CHECK(ds4_gpu_synchronize());
+                const double ms = (monotonic_seconds() - start) * 1000;
+                CHECK(y[(size_t)rows * output] == 12345);
+                if (memcmp(y, expected, (size_t)rows * output * sizeof(float)) != 0) {
+                    size_t i = 0;
+                    while (y[i] == expected[i]) i++;
+                    fprintf(stderr, "%s width=%u output=%u rows=%u nr0_env=%s: first mismatch row=%zu col=%zu got %.9g want %.9g\n",
+                        s->q8 ? "Q8_0" : "F16", width, output, rows,
+                        s->q8 ? "-" : f16_nr0[vi], i / output, i % output, y[i], expected[i]);
+                    CHECK(0);
+                }
+                fprintf(stderr, "V4.1 exact %s decode rows width=%u output=%u rows=%u%s%s: bitwise PASS %.3f ms\n",
+                    s->q8 ? "Q8_0" : "F16", width, output, rows,
+                    s->q8 ? "" : " nr0_env=", s->q8 ? "" : f16_nr0[vi], ms);
+            }
+        }
+        if (!s->q8) unsetenv("DS4_METAL_PLAIN_MV_NR0");
+
+        if (bench) {
+            /* "multi-row" honours a tile cap already set in the environment. */
+            const char *cap = getenv(knob);
+            char cap_value[16] = "";
+            if (cap) snprintf(cap_value, sizeof(cap_value), "%s", cap);
+            const uint32_t iters = copies > 64u ? copies : 64u;
+            for (size_t ci = 0; ci < sizeof(bench_counts) / sizeof(*bench_counts); ci++) {
+                const uint32_t rows = bench_counts[ci];
+                setenv(knob, "1", 1);
+                const double before = decode_rows_time(out, model, model_bytes, stride, copies,
+                                                       s, in, rows, iters);
+                CHECK(before > 0);
+                CHECK(memcmp(y, expected, (size_t)rows * output * sizeof(float)) == 0);
+                if (cap) setenv(knob, cap_value, 1);
+                else unsetenv(knob);
+                const double after = decode_rows_time(out, model, model_bytes, stride, copies,
+                                                      s, in, rows, iters);
+                CHECK(after > 0);
+                CHECK(memcmp(y, expected, (size_t)rows * output * sizeof(float)) == 0);
+                fprintf(stderr, "decode-rows bench %s width=%u output=%u rows=%u: per-row grid %.4f ms, multi-row %.4f ms (%.2fx)\n",
+                    s->q8 ? "Q8_0" : "F16", width, output, rows, before, after, before / after);
+            }
+        }
+
+        ds4_gpu_tensor_free(ref); ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(in);
+        ds4_gpu_cleanup(); free(model);
+        CHECK(ds4_gpu_init());
+    }
+    return 1;
+}
+
 typedef struct { float value; uint32_t id; } topk_entry;
 
 static int compare_topk_entry(const void *a, const void *b) {
@@ -1311,6 +1483,13 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && (!strcmp(argv[1], "--decode-rows") ||
+                      !strcmp(argv[1], "--decode-rows-bench"))) {
+        const int ok = ds4_gpu_init() &&
+            check_decode_rows(!strcmp(argv[1], "--decode-rows-bench"));
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--index-projection")) {
         const int ok = ds4_gpu_init() && check_index_projection();
         ds4_gpu_cleanup();
@@ -1319,7 +1498,7 @@ int main(int argc, char **argv) {
     if (argc != 1) return 2;
     int ok = ds4_gpu_init() && check_router() && check_quantization() && check_engram() && check_rope_stride() && check_pool() &&
              check_candidates() && check_sparse_gather() && check_indexer_batch() &&
-             check_embedding() && check_index_projection() && check_general_topk() && check_causal_topk() && check_compact_carry() && check_attention_output(false) &&
+             check_embedding() && check_index_projection() && check_decode_rows(0) && check_general_topk() && check_causal_topk() && check_compact_carry() && check_attention_output(false) &&
              check_tp_attention();
     ds4_gpu_cleanup();
     return ok ? 0 : 1;

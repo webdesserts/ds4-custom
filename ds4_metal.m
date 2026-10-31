@@ -5403,6 +5403,45 @@ static ds4_gpu_mv_dispatch ds4_gpu_make_q8_0_mv_dispatch(void) {
     };
 }
 
+/* Activation rows per threadgroup (nr1) for the exact decode-row kernels
+ * kernel_mul_mv_q8_0_f32_rows<N> and kernel_mul_mv_f16_f32_4_rows<N>, which
+ * stream each weight tile once for all N rows.  Rows split into the fewest
+ * tiles of at most cap rows, each tile rounded up to a compiled size; padding
+ * rows are computed and discarded, which is cheaper than another weight pass
+ * (7 rows run one 8-row tile).  Grids under 128 threadgroups along the output
+ * axis keep one row per threadgroup, since there the row axis is what fills
+ * the GPU (hc_*_fn: 24 outputs ran 2x slower with 6-row tiles on M5 Ultra).
+ * env_name overrides cap (1 restores one row per threadgroup) for A/B timing.
+ * Returns 1 for a single row. */
+static uint32_t ds4_gpu_decode_rows_nr1(uint32_t n_rows, uint64_t out_groups,
+                                        const char *env_name, uint32_t default_cap) {
+    static const uint32_t tiles[] = {2, 3, 4, 5, 6, 8};
+    const uint32_t cap = (uint32_t)ds4_gpu_env_u64(env_name, default_cap, 1u, 8u);
+    if (n_rows < 2u || cap < 2u || out_groups < 128u) return 1;
+    const uint32_t n_tiles = (n_rows + cap - 1u) / cap;
+    const uint32_t want = (n_rows + n_tiles - 1u) / n_tiles;
+    uint32_t nr1 = 1;
+    for (size_t i = 0; i < sizeof(tiles) / sizeof(*tiles) && tiles[i] <= cap; i++) {
+        nr1 = tiles[i];
+        if (nr1 >= want) break;
+    }
+    return nr1;
+}
+
+/* Q8_0 holds only an 8-value slice per activation row live; at 6 rows one
+ * 6-row tile beat two 3-row tiles on the wide V4.1 projections (attn_q_b
+ * 1280x32768: 0.104 versus 0.114 ms on M5 Ultra). */
+static uint32_t ds4_gpu_q8_0_rows_nr1(uint32_t n_rows, uint64_t out_groups) {
+    return ds4_gpu_decode_rows_nr1(n_rows, out_groups, "DS4_METAL_Q8_ROWS_NR1", 8u);
+}
+
+/* F16 keeps 16 activation floats per row live; five or more rows per tile
+ * lost occupancy, so 6 rows run as two 3-row tiles and 8 as two 4-row tiles
+ * (engram_kv 6144x25600: 2.9x at 6 rows versus 2.6x with one 6-row tile). */
+static uint32_t ds4_gpu_f16_rows_nr1(uint32_t n_rows, uint64_t out_groups) {
+    return ds4_gpu_decode_rows_nr1(n_rows, out_groups, "DS4_METAL_F16_ROWS_NR1", 4u);
+}
+
 /* Single-token F16/F32 matvecs with few output rows (the Qwen hyper-connection
  * low-rank down projections and routers) launch one row per SIMD group on M5,
  * where two-row tiles leave most of the 40 cores idle.  The per-row K walk,
@@ -19688,6 +19727,18 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         args.ne1 = (int32_t)n_rows;
         args.nr0 = dispatch.nr0;
 
+        /* Two or more rows share each weight pass through the _rows<nr1>
+         * kernel; one row keeps the single-row kernel. */
+        const uint32_t nr1 = ds4_gpu_q8_0_rows_nr1(n_rows,
+            (out_dim + (uint64_t)dispatch.nr0 - 1u) / (uint64_t)dispatch.nr0);
+        char rows_name[48];
+        if (nr1 > 1u) {
+            snprintf(rows_name, sizeof(rows_name),
+                     "kernel_mul_mv_q8_0_f32_rows%u", nr1);
+            dispatch.function_name = rows_name;
+            dispatch.smem = 32u * (NSUInteger)dispatch.nr0 * nr1 * sizeof(float);
+        }
+
         id<MTLComputePipelineState> pipeline =
             ds4_gpu_get_mul_mv_pipeline(dispatch.function_name, dispatch.nsg);
         if (!pipeline) return 0;
@@ -19706,7 +19757,7 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
                 MTLSizeMake(((NSUInteger)out_dim +
                              (NSUInteger)dispatch.nr0 - 1u) /
                                 (NSUInteger)dispatch.nr0,
-                            (NSUInteger)n_rows,
+                            ((NSUInteger)n_rows + nr1 - 1u) / nr1,
                             1)
              threadsPerThreadgroup:
                 MTLSizeMake(32, (NSUInteger)dispatch.nsg, 1)];
@@ -21019,6 +21070,22 @@ static int ds4_gpu_matmul_f16_tensor_impl(
                 mv_dispatch.smem = 32u * sizeof(float);
             }
             mv_args.nr0 = mv_dispatch.nr0;
+            /* Exact multi-row calls on the float4 kernel share each weight
+             * pass across nr1 rows; each row stays bitwise identical to the
+             * single-row dispatch. */
+            uint32_t nr1 = 1;
+            char rows_name[48];
+            if (exact_rows && n_tok > 1 &&
+                !strcmp(mv_dispatch.function_name, "kernel_mul_mv_f16_f32_4")) {
+                nr1 = ds4_gpu_f16_rows_nr1((uint32_t)n_tok,
+                    (out_dim + (uint64_t)mv_dispatch.nr0 - 1u) / (uint64_t)mv_dispatch.nr0);
+            }
+            if (nr1 > 1u) {
+                snprintf(rows_name, sizeof(rows_name),
+                         "kernel_mul_mv_f16_f32_4_rows%u", nr1);
+                mv_dispatch.function_name = rows_name;
+                mv_dispatch.smem = 32u * (NSUInteger)mv_dispatch.nr0 * nr1 * sizeof(float);
+            }
             id<MTLComputePipelineState> pipeline =
                 ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
             if (!pipeline) return 0;
@@ -21033,7 +21100,7 @@ static int ds4_gpu_matmul_f16_tensor_impl(
                 [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
             }
             [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
-                                                  (NSUInteger)n_tok,
+                                                  ((NSUInteger)n_tok + nr1 - 1u) / nr1,
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
