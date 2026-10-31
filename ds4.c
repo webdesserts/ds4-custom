@@ -42038,6 +42038,7 @@ typedef struct {
     uint32_t pos;
     double t0_ms, t1_ms;
     uint64_t skipped;
+    uint32_t unflushed;
 } ds41_route_trace;
 static ds41_route_trace g_route_trace;
 static pthread_mutex_t g_route_trace_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -42141,6 +42142,17 @@ static void ds41_route_trace_end(int accepted, bool ok) {
         fputc(']', fp);
     }
     fputs("}\n", fp);
+    /* Bounded lag for readers tailing the file. */
+    if (++t->unflushed >= 64u) { fflush(fp); t->unflushed = 0; }
+    pthread_mutex_unlock(&g_route_trace_mu);
+}
+
+void ds4_route_trace_flush(void) {
+    pthread_mutex_lock(&g_route_trace_mu);
+    if (g_route_trace.fp && g_route_trace.unflushed) {
+        fflush(g_route_trace.fp);
+        g_route_trace.unflushed = 0;
+    }
     pthread_mutex_unlock(&g_route_trace_mu);
 }
 
@@ -75293,7 +75305,12 @@ bool ds4_engine_is_deepseek41(ds4_engine *e) {
     return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41;
 }
 
+#ifndef DS4_HAS_DEEPSEEK41_GPU
+void ds4_route_trace_flush(void) {}
+#endif
+
 void ds4_engine_close(ds4_engine *e) {
+    ds4_route_trace_flush();
     if (!e) return;
     ds4_engine_tp_unbind(e);
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)

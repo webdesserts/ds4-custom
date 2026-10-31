@@ -15284,6 +15284,7 @@ static void *worker_main(void *arg) {
         if (!j) break;
         generate_job(s, &s->slots[0], j);
         job_complete(j);
+        ds4_route_trace_flush();
         /* Mirror slot_worker_main: the checkpoint may have changed in any way
          * during the job, and the memory-text probe tier plus the staleness
          * tiers read the slot's rendered-text cache and activity stamp. */
@@ -15311,6 +15312,7 @@ static void *slot_worker_main(void *arg) {
 
         generate_job(s, slot, j);
         job_complete(j);
+        ds4_route_trace_flush();
         /* The checkpoint may have changed in any way during the job (sync,
          * rewind, generation, disk load, reset); refresh the rendered-text
          * cache the memory-text probe relies on before the slot becomes

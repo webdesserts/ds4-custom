@@ -556,6 +556,9 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
 /* Pay the one-time first-submission GPU cost outside any measured window;
  * used by the TP worker right after session create (no-op on CPU/GLM). */
 void ds4_session_gpu_warmup(ds4_session *s);
+/* Write buffered DS4_V41_ROUTE_TRACE lines (the server calls it after each
+ * request; engine close does too). */
+void ds4_route_trace_flush(void);
 /* Slot id recorded in DS4_V41_ROUTE_TRACE lines for this session (-1: none). */
 void ds4_session_set_route_trace_slot(ds4_session *s, int slot);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
