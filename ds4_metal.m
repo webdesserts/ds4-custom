@@ -644,6 +644,8 @@ static NSMutableDictionary<NSString *, DS4MetalQ4ExpertTable *> *g_q4_expert_tab
 static NSMutableDictionary<NSString *, id> *g_q4_expert_layer_residency_cache;
 static NSMutableArray<id<MTLBuffer>> *g_transient_buffers;
 static id g_model_residency_set;
+/* Guards g_model_residency_set for the queue keepalive thread. */
+static pthread_mutex_t g_model_residency_mu = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct {
     id<MTLBuffer> __strong mask;
@@ -2119,7 +2121,9 @@ static void ds4_gpu_model_residency_clear(void) {
             }
             [g_model_residency_set endResidency];
             [g_model_residency_set removeAllAllocations];
+            pthread_mutex_lock(&g_model_residency_mu);
             g_model_residency_set = nil;
+            pthread_mutex_unlock(&g_model_residency_mu);
         }
     }
 #endif
@@ -2160,18 +2164,22 @@ static int ds4_gpu_model_residency_request_views(void) {
         desc.initialCapacity = g_model_view_count;
 
         NSError *error = nil;
-        g_model_residency_set = [g_device newResidencySetWithDescriptor:desc error:&error];
-        if (!g_model_residency_set) {
+        id<MTLResidencySet> residency_set = [g_device newResidencySetWithDescriptor:desc error:&error];
+        if (!residency_set) {
             fprintf(stderr, "ds4: Metal model residency set creation failed: %s\n",
                     [[error localizedDescription] UTF8String]);
             return 0;
         }
 
         for (uint32_t i = 0; i < g_model_view_count; i++) {
-            [g_model_residency_set addAllocation:g_model_views[i].buffer];
+            [residency_set addAllocation:g_model_views[i].buffer];
         }
-        [g_model_residency_set commit];
-        [g_model_residency_set requestResidency];
+        [residency_set commit];
+        [residency_set requestResidency];
+        /* Published complete, under the lock the queue keepalive reads it with. */
+        pthread_mutex_lock(&g_model_residency_mu);
+        g_model_residency_set = residency_set;
+        pthread_mutex_unlock(&g_model_residency_mu);
         if (getenv("DS4_METAL_DISABLE_QUEUE_RESIDENCY_SET") == NULL &&
             g_queue &&
             [g_queue respondsToSelector:@selector(addResidencySet:)]) {
@@ -11471,9 +11479,16 @@ int ds4_gpu_warm_command_queue(void) {
  * engine's command queue has been idle for about 3 s, the next command
  * buffer on it starts 600-800 ms late (the driver drops and rebuilds the
  * process's GPU mappings; 76-145 GB of no-copy model views here).  Work on
- * other queues does not prevent it.  One 1 KB kernel per second on this
- * queue keeps the mappings alive at no measurable cost.
- * DS4_METAL_DISABLE_QUEUE_KEEPALIVE=1 opts out. */
+ * other queues does not prevent it.
+ *
+ * Renewing the model residency set once per second keeps the mappings
+ * alive without GPU work.  The older keepalive committed a 1 KB kernel per
+ * second on this queue; each commit spent about 0.24 s of system time in
+ * the driver's submit call (24% of a core, ~2.8 W while idle on M5 Ultra
+ * with 167 GB wired), and first tokens after 5 s of idle still started
+ * ~0.4 s late.  DS4_METAL_QUEUE_KEEPALIVE_MODE=submit keeps the kernel; it
+ * is also used while there is no model residency set.
+ * DS4_METAL_DISABLE_QUEUE_KEEPALIVE=1 opts out of both. */
 static pthread_t g_queue_keepalive_thread;
 static volatile int g_queue_keepalive_running;
 static volatile int g_queue_keepalive_stop;
@@ -11487,8 +11502,20 @@ static void *ds4_gpu_queue_keepalive_thread(void *arg) {
     memset(scratch.contents, 0, 256u * sizeof(float));
     const uint32_t iters = 1u;
     uint64_t period_ms = ds4_gpu_env_u64("DS4_METAL_QUEUE_KEEPALIVE_MS", 1000u, 50u, 10000u);
+    const char *mode = getenv("DS4_METAL_QUEUE_KEEPALIVE_MODE");
+    const int submit_only = mode && strcmp(mode, "submit") == 0;
     while (!g_queue_keepalive_stop) {
-        @autoreleasepool {
+        /* The thread starts when the queue is warmed, which can be before
+         * the model residency set exists: decide on every tick. */
+        id residency_set = nil;
+        if (!submit_only) {
+            pthread_mutex_lock(&g_model_residency_mu);
+            residency_set = g_model_residency_set;
+            pthread_mutex_unlock(&g_model_residency_mu);
+        }
+        if (residency_set) {
+            if (@available(macOS 15.0, *)) [residency_set requestResidency];
+        } else @autoreleasepool {
             id<MTLCommandBuffer> cb = [g_queue commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
             [enc setComputePipelineState:pipeline];
