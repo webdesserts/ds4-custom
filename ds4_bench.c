@@ -39,6 +39,8 @@ typedef struct {
     const char *mtp_path;
     const char *prompt_path;
     const char *chat_prompt_path;
+    const char *rendered_prompt_path;
+    bool ctx_prompt;
     const char *system;
     const char *csv_path;
     const char *expert_profile_path;
@@ -285,6 +287,10 @@ static bench_config parse_options(int argc, char **argv) {
             c.prompt_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--chat-prompt-file")) {
             c.chat_prompt_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--rendered-prompt-file")) {
+            c.rendered_prompt_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--ctx-prompt")) {
+            c.ctx_prompt = true;
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--ctx-start")) {
@@ -382,8 +388,9 @@ static bench_config parse_options(int argc, char **argv) {
         }
     }
 
-    if (!!c.prompt_path == !!c.chat_prompt_path) {
-        fprintf(stderr, "ds4-bench: specify exactly one of --prompt-file or --chat-prompt-file\n");
+    if (!!c.prompt_path + !!c.chat_prompt_path + !!c.rendered_prompt_path != 1) {
+        fprintf(stderr, "ds4-bench: specify exactly one of --prompt-file, --chat-prompt-file "
+                "or --rendered-prompt-file\n");
         exit(2);
     }
     if (c.dspark && !c.mtp_path) {
@@ -729,14 +736,29 @@ int main(int argc, char **argv) {
                        ds4_engine_prefill_chunk(engine),
                        cfg.ssd_streaming);
 
-    char *text = read_file(cfg.prompt_path ? cfg.prompt_path : cfg.chat_prompt_path);
+    char *text = read_file(cfg.prompt_path ? cfg.prompt_path :
+                           cfg.chat_prompt_path ? cfg.chat_prompt_path : cfg.rendered_prompt_path);
     ds4_tokens prompt = {0};
     if (cfg.chat_prompt_path) {
         ds4_encode_chat_prompt(engine, cfg.system, text, DS4_THINK_NONE, &prompt);
+    } else if (cfg.rendered_prompt_path) {
+        ds4_tokenize_rendered_chat(engine, text, &prompt);
     } else {
         ds4_tokenize_text(engine, text, &prompt);
     }
     free(text);
+    /* Generate after the whole prompt, as a server request would. */
+    if (cfg.ctx_prompt) {
+        if (prompt.len < 1 || prompt.len + cfg.gen_tokens >= cfg.ctx_alloc) {
+            fprintf(stderr, "ds4-bench: prompt has %d tokens; --ctx-alloc must exceed it plus --gen-tokens\n",
+                    prompt.len);
+            ds4_tokens_free(&prompt);
+            close_engine(engine, tp_leader);
+            return 1;
+        }
+        cfg.ctx_start = cfg.ctx_max = prompt.len;
+        fprintf(stderr, "ds4-bench: prompt context %d tokens\n", prompt.len);
+    }
 
     const int prompt_tokens_needed = cfg.ctx_max +
         (cfg.teacher_forced_decode ? cfg.gen_tokens : 0);

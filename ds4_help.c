@@ -120,7 +120,7 @@ static const char *tool_usage(ds4_help_tool tool) {
     case DS4_HELP_AGENT:
         return "Usage: ds4-agent [options]";
     case DS4_HELP_BENCH:
-        return "Usage: ds4-bench (--prompt-file FILE | --chat-prompt-file FILE) [options]";
+        return "Usage: ds4-bench (--prompt-file FILE | --chat-prompt-file FILE | --rendered-prompt-file FILE) [options]";
     case DS4_HELP_EVAL:
         return "Usage: ds4-eval [options]";
     }
@@ -389,6 +389,8 @@ static void print_bench_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--prompt-file FILE", "Raw benchmark text; token sequence is sliced at each frontier.");
     opt(fp, c, "--chat-prompt-file FILE", "Render FILE as one no-thinking chat user message.");
     opt(fp, c, "-sys, --system TEXT", "System prompt used only with --chat-prompt-file.");
+    opt(fp, c, "--rendered-prompt-file FILE", "Tokenize FILE as already-rendered chat text (special tokens).");
+    opt(fp, c, "--ctx-prompt", "Use the whole prompt as the single context frontier.");
     fputc('\n', fp);
     title(fp, c, "Benchmark Sweep");
     opt(fp, c, "--ctx-start N", "First measured frontier. Default: 2048");
