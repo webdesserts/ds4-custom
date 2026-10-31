@@ -15063,12 +15063,14 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
 #define SERVER_ROUTE_MIN_MATCH 128u
 
 /* Tokens a different conversation can share with this request: everything
- * through the first assistant marker (system prompt and first user turn). A
- * prompt without one shares nothing by convention. */
+ * before the first assistant marker (system prompt and first user turn).
+ * Reuse past the floor includes that marker, so the slot holds this first
+ * turn; the continuation's own assistant rendering may diverge right after
+ * it. A prompt without a marker shares nothing by convention. */
 static uint32_t server_route_conversation_floor(server *s, const ds4_tokens *prompt) {
     const int assistant = ds4_token_assistant(s->engine);
     for (int i = 0; prompt && i < prompt->len; i++)
-        if (prompt->v[i] == assistant) return (uint32_t)i + 1u;
+        if (prompt->v[i] == assistant) return (uint32_t)i;
     return 0;
 }
 
