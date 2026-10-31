@@ -275,3 +275,19 @@ kernel void kernel_cpy_tile_rows_f32_f32(
     const uint r = (args.pos0 + t) % args.ratio;
     dst[gid] = src[r * args.width + e];
 }
+
+// Routing trace: copy n selected ids and n routing weights as raw 32-bit
+// words into a host-visible trace buffer, inside the step's command buffer.
+kernel void kernel_route_trace_copy_u32(
+        constant uint & n,
+        device const uint * selected,
+        device const uint * weights,
+        device       uint * dst_selected,
+        device       uint * dst_weights,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) {
+        return;
+    }
+    dst_selected[gid] = selected[gid];
+    dst_weights[gid] = weights[gid];
+}

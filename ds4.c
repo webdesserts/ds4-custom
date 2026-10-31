@@ -42014,6 +42014,136 @@ static bool ds41_balance_shared(const ds41_gpu_graph *g, const ds4_layer_weights
         l->ffn_down_shexp->type == DS4_TENSOR_Q8_0 && ds41_shared_balance_enabled();
 }
 
+/* ==== V4.1 routing trace ==================================================
+ * DS4_V41_ROUTE_TRACE=<path> appends one JSONL line per target-model step
+ * (decode1, DSpark verify, batched decode; never prefill or the drafter):
+ *   {"v":1,"kind":...,"slot":S,"pos":P,"rows":N,"accepted":A|null,
+ *    "t_ms":T|null,"t0_ms":M,"experts":[[[6 ids] per row] per layer],
+ *    "weights":same shape}
+ * t0_ms is the step start on CLOCK_MONOTONIC, shared by all slots. Each
+ * layer's selection is copied on the GPU into a host-visible buffer inside
+ * the step's own command buffers and written after the step's existing
+ * final wait. A trace that cannot open or allocate logs once and stays off;
+ * it never fails a request. Off, each hook is one predictable branch. */
+#define DS41_TRACE_ROWS 32u
+#define DS41_TRACE_LAYERS 64u
+typedef struct {
+    int state;            /* 0 unresolved, 1 on, -1 off */
+    FILE *fp;
+    ds4_gpu_tensor *selected, *weights;   /* [layer][DS41_TRACE_ROWS][6] */
+    bool active, overflow;
+    uint32_t cursor[DS41_TRACE_LAYERS];
+    const char *kind;
+    int slot;
+    uint32_t pos;
+    double t0_ms, t1_ms;
+    uint64_t skipped;
+} ds41_route_trace;
+static ds41_route_trace g_route_trace;
+static pthread_mutex_t g_route_trace_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static double ds41_monotonic_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec * 1000.0 + (double)t.tv_nsec / 1e6;
+}
+
+static bool ds41_route_trace_open(void) {
+    ds41_route_trace *t = &g_route_trace;
+    if (t->state) return t->state > 0;
+    t->state = -1;
+    const char *path = getenv("DS4_V41_ROUTE_TRACE");
+    if (!path || !*path || DS4_N_LAYER > DS41_TRACE_LAYERS) return false;
+    const uint64_t bytes = (uint64_t)DS4_N_LAYER * DS41_TRACE_ROWS * DS4_N_EXPERT_USED * 4u;
+    t->fp = fopen(path, "a");
+    if (t->fp) setvbuf(t->fp, NULL, _IOFBF, 1u << 20);
+    t->selected = t->fp ? ds4_gpu_tensor_alloc(bytes) : NULL;
+    t->weights = t->selected ? ds4_gpu_tensor_alloc(bytes) : NULL;
+    if (!t->weights || !ds4_gpu_tensor_contents(t->selected) || !ds4_gpu_tensor_contents(t->weights)) {
+        fprintf(stderr, "ds4: V4.1 route trace disabled: cannot open %s or allocate its buffer\n", path);
+        if (t->fp) fclose(t->fp);
+        ds4_gpu_tensor_free(t->selected);
+        ds4_gpu_tensor_free(t->weights);
+        t->fp = NULL; t->selected = t->weights = NULL;
+        return false;
+    }
+    fprintf(stderr, "ds4: V4.1 route trace -> %s\n", path);
+    t->state = 1;
+    return true;
+}
+
+/* Start recording a target step; a no-op unless the trace is on. */
+static void ds41_route_trace_begin(const char *kind, int slot, uint32_t pos) {
+    ds41_route_trace *t = &g_route_trace;
+    if (t->state < 0 || (!t->state && !ds41_route_trace_open())) return;
+    t->active = true; t->overflow = false;
+    memset(t->cursor, 0, sizeof(t->cursor));
+    t->kind = kind; t->slot = slot; t->pos = pos;
+    t->t0_ms = ds41_monotonic_ms(); t->t1_ms = 0;
+}
+
+/* Encode the copy of one layer's routing for `rows` rows (in step order). */
+static void ds41_route_trace_layer(uint32_t il, const ds4_gpu_tensor *selected,
+                                   const ds4_gpu_tensor *weights, uint32_t rows) {
+    ds41_route_trace *t = &g_route_trace;
+    if (!t->active) return;
+    if (il >= DS4_N_LAYER || il >= DS41_TRACE_LAYERS || !rows || t->cursor[il] + rows > DS41_TRACE_ROWS) {
+        t->overflow = true; return;
+    }
+    const uint64_t off = ((uint64_t)il * DS41_TRACE_ROWS + t->cursor[il]) * DS4_N_EXPERT_USED * 4u;
+    if (!ds4_gpu_route_trace_copy(t->selected, off, t->weights, off, selected, weights,
+                                  rows * DS4_N_EXPERT_USED)) t->overflow = true;
+    t->cursor[il] += rows;
+}
+
+/* The step's GPU work has completed: its wall time ends here. */
+static void ds41_route_trace_mark(void) {
+    if (g_route_trace.active && !g_route_trace.t1_ms) g_route_trace.t1_ms = ds41_monotonic_ms();
+}
+
+/* Write the step's line. accepted < 0 writes null; ok=false drops the step. */
+static void ds41_route_trace_end(int accepted, bool ok) {
+    ds41_route_trace *t = &g_route_trace;
+    if (!t->active) return;
+    t->active = false;
+    ds41_route_trace_mark();
+    const uint32_t rows = t->cursor[0];
+    bool complete = ok && !t->overflow && rows;
+    for (uint32_t il = 1; complete && il < DS4_N_LAYER; il++) complete = t->cursor[il] == rows;
+    if (!complete) {
+        if (ok && !t->skipped++) fprintf(stderr, "ds4: V4.1 route trace skipped an incomplete %s step\n", t->kind);
+        return;
+    }
+    const int32_t *sel = ds4_gpu_tensor_contents(t->selected);
+    const float *w = ds4_gpu_tensor_contents(t->weights);
+    pthread_mutex_lock(&g_route_trace_mu);
+    FILE *fp = t->fp;
+    fprintf(fp, "{\"v\":1,\"kind\":\"%s\",\"slot\":%d,\"pos\":%u,\"rows\":%u,\"accepted\":",
+            t->kind, t->slot, t->pos, rows);
+    if (accepted >= 0) fprintf(fp, "%d", accepted); else fputs("null", fp);
+    fprintf(fp, ",\"t_ms\":%.3f,\"t0_ms\":%.3f", t->t1_ms - t->t0_ms, t->t0_ms);
+    for (int part = 0; part < 2; part++) {
+        fputs(part ? ",\"weights\":[" : ",\"experts\":[", fp);
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            fputs(il ? ",[" : "[", fp);
+            for (uint32_t r = 0; r < rows; r++) {
+                const uint64_t base = ((uint64_t)il * DS41_TRACE_ROWS + r) * DS4_N_EXPERT_USED;
+                fputs(r ? ",[" : "[", fp);
+                for (uint32_t k = 0; k < DS4_N_EXPERT_USED; k++) {
+                    if (k) fputc(',', fp);
+                    if (part) fprintf(fp, "%.6g", (double)w[base + k]);
+                    else fprintf(fp, "%d", sel[base + k]);
+                }
+                fputc(']', fp);
+            }
+            fputc(']', fp);
+        }
+        fputc(']', fp);
+    }
+    fputs("}\n", fp);
+    pthread_mutex_unlock(&g_route_trace_mu);
+}
+
 static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
                      const ds4_layer_weights *l, uint32_t il, uint32_t token) {
     uint64_t gate_row = 0, down_row = 0;
@@ -42029,6 +42159,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             m->map, m->size, bias->abs_offset, 0, 0, token,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
             g->route_logits)) return false;
+    ds41_route_trace_layer(il, g->selected, g->route_weights, 1);
 #ifdef DS4_ROCM_BUILD
     if (g->streaming) {
         const ds4_gpu_stream_expert_table table = {
@@ -42539,6 +42670,7 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
     return ds41_stage("moe.router") &&
         ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
         ds41_route_batch(g, m, l, count) &&
+        (ds41_route_trace_layer(il, b->selected, b->route_weights, count), true) &&
         ((shared_owner && !balance_shared && g->tp_rank != (il & 1u)) ||
         (ds41_stage("moe.shared") && ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
         ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true) &&
@@ -61839,6 +61971,7 @@ typedef struct {
 
 struct ds4_session {
     ds4_engine *engine;
+    int route_trace_slot;   /* routing-trace slot id + 1; 0 = none (-1) */
     /* Pad provenance describes checkpoint IDs even when its graph is invalid.
      * Only the new owning route may publish a nonempty coordinate map. */
     ds41_scr_coordinates scr_coordinates;
@@ -75345,6 +75478,10 @@ static int ds4_session_tp_register(ds4_session *s) {
     return 1;
 }
 
+void ds4_session_set_route_trace_slot(ds4_session *s, int slot) {
+    if (s) s->route_trace_slot = slot >= 0 ? slot + 1 : 0;
+}
+
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
     if (e->backend == DS4_BACKEND_CPU) {
@@ -82224,6 +82361,8 @@ static int ds4_sessions_eval_batch_native(
             graphs[prefill_rows + i] = &items[i].session->ds41_graph;
             tokens[prefill_rows + i] = items[i].token;
         }
+        if (!prefill_rows) ds41_route_trace_begin("batch", -1,
+            (uint32_t)items[0].session->checkpoint.len);
         ok = ok && ds41_graph_step_batch(graphs, tokens, count + (int)prefill_rows,
                                           prefill_rows, &e->model, &e->weights);
 #else
@@ -82267,6 +82406,9 @@ static int ds4_sessions_eval_batch_native(
     }
     /* Finish partial command buffers before invalidating failed sessions. */
     if (!ds4_gpu_end_commands()) ok = false;
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    if (native_ds41) ds41_route_trace_end(-1, ok);
+#endif
 #if defined(__APPLE__)
     if (e->tp.active) ds4_gpu_tp_set_session_batch_mode(0);
 #endif
@@ -87441,7 +87583,9 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         ds4_dspark_stats_note_len(s->dspark_stats.draft_len_hist, count - 1u);
     }
     const uint32_t pos0 = g->pos;
+    ds41_route_trace_begin("verify", s->route_trace_slot - 1, pos0);
     if (!ds41_session_verify(s, tokens, count)) goto fail;
+    ds41_route_trace_mark();
     const double verified_at = now_sec();
     uint32_t keep = 1;
     int correction = -1;
@@ -87461,6 +87605,7 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         }
     }
     if (!ds41_session_commit(s, tokens, count, keep)) goto fail;
+    ds41_route_trace_end((int)keep - 1, true);
     for (uint32_t i = 0; i < keep; i++) {
         accepted[i] = tokens[i];
     }
@@ -87493,6 +87638,7 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
     if (stats) s->dspark_stats.total_ms += (now_sec() - started) * 1000;
     return (int)keep;
 fail:
+    ds41_route_trace_end(-1, false);
     if (ds4_gpu_commands_active()) (void)ds4_gpu_end_commands();
     g->valid = s->checkpoint_valid = false;
     if (stats) s->dspark_stats.verifier_errors++;

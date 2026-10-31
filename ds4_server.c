@@ -16410,6 +16410,7 @@ int main(int argc, char **argv) {
             server_close_resources(&s);
             return 1;
         }
+        ds4_session_set_route_trace_slot(slot->session, i);
     }
 
     if (cfg.kv_disk_dir && server_scr_enabled(&s)) {

@@ -2187,10 +2187,13 @@ static int ds41_session_eval_scalar(ds4_session *s, int token, char *err, size_t
         if (errlen) snprintf(err, errlen, "V4.1 generation coordinate binding refused");
         return 1;
     }
-    if (!s->ds41_graph_ready ||
-        (!s->checkpoint_valid && s->checkpoint.len != 0) ||
-        s->ds41_graph.pos != (uint32_t)s->checkpoint.len ||
-        !DS41_EVAL_STEP(&s->ds41_graph, &e->model, &e->weights, token, s->logits)) {
+    ds41_route_trace_begin("decode1", s->route_trace_slot - 1, s->ds41_graph.pos);
+    const bool stepped = s->ds41_graph_ready &&
+        (s->checkpoint_valid || s->checkpoint.len == 0) &&
+        s->ds41_graph.pos == (uint32_t)s->checkpoint.len &&
+        DS41_EVAL_STEP(&s->ds41_graph, &e->model, &e->weights, token, s->logits);
+    ds41_route_trace_end(-1, stepped);
+    if (!stepped) {
         if (s->ds41_graph.archive && s->ds41_graph.archive->sealed &&
             (s->ds41_graph.archive->writer_state == DS41_ARCHIVE_ARMED ||
              s->ds41_graph.archive->writer_state == DS41_ARCHIVE_BLOCKED))

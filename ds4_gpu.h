@@ -58,6 +58,12 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
+/* Copy n selected ids and n routing weights (raw 32-bit words) into a trace
+ * buffer, encoded in the current command buffer. */
+int ds4_gpu_route_trace_copy(ds4_gpu_tensor *dst_selected, uint64_t dst_selected_offset,
+                             ds4_gpu_tensor *dst_weights, uint64_t dst_weights_offset,
+                             const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+                             uint32_t n);
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count);

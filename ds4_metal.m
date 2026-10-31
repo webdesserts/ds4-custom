@@ -31469,6 +31469,49 @@ int ds4_gpu_attention_decode_heads_tensor(
     return 1;
 }
 
+int ds4_gpu_route_trace_copy(
+        ds4_gpu_tensor       *dst_selected,
+        uint64_t                dst_selected_offset,
+        ds4_gpu_tensor       *dst_weights,
+        uint64_t                dst_weights_offset,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!dst_selected || !dst_weights || !selected || !weights || n == 0) return 0;
+    id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_route_trace_copy_u32");
+    if (!pipeline) return 0;
+    @autoreleasepool {
+        const uint64_t bytes = (uint64_t)n * 4u;
+        id<MTLBuffer> sb = ds4_gpu_tensor_buffer(selected);
+        id<MTLBuffer> wb = ds4_gpu_tensor_buffer(weights);
+        id<MTLBuffer> dsb = ds4_gpu_tensor_buffer(dst_selected);
+        id<MTLBuffer> dwb = ds4_gpu_tensor_buffer(dst_weights);
+        if (!sb || !wb || !dsb || !dwb ||
+            ds4_gpu_tensor_bytes(selected) < bytes || ds4_gpu_tensor_bytes(weights) < bytes ||
+            dst_selected_offset > ds4_gpu_tensor_bytes(dst_selected) ||
+            ds4_gpu_tensor_bytes(dst_selected) - dst_selected_offset < bytes ||
+            dst_weights_offset > ds4_gpu_tensor_bytes(dst_weights) ||
+            ds4_gpu_tensor_bytes(dst_weights) - dst_weights_offset < bytes) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        NSUInteger nth = n < 64u ? n : 64u;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&n length:sizeof(n) atIndex:0];
+        [enc setBuffer:sb offset:ds4_gpu_tensor_offset(selected) atIndex:1];
+        [enc setBuffer:wb offset:ds4_gpu_tensor_offset(weights) atIndex:2];
+        [enc setBuffer:dsb offset:ds4_gpu_tensor_offset(dst_selected) + (NSUInteger)dst_selected_offset atIndex:3];
+        [enc setBuffer:dwb offset:ds4_gpu_tensor_offset(dst_weights) + (NSUInteger)dst_weights_offset atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n + nth - 1u) / nth, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "route trace copy")) return 0;
+    }
+    return 1;
+}
+
 /* Set only by the *_bf16 elementwise wrappers: swiglu and add2 then use
  * their BF16-rounding kernels. */
 static bool g_ew_round_bf16;
