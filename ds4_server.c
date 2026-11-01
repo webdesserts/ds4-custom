@@ -10105,6 +10105,8 @@ struct server_slot {
     ds4_tokens route_prompt;
     bool finishing;
     bool prefill_waiting;
+    /* The waiting executor turn is a decode step (server_decode_enter). */
+    bool decode_turn;
 
     bool decode_pending;
     bool decode_in_flight;
@@ -10249,6 +10251,10 @@ struct server {
     int active_generations;
     int mixed_prefill_quantum;
     int last_prefill_slot;
+    /* A slot's prefill sweep yielded between layers (server_prefill_yield):
+     * only decode turns enter, at most yield_budget of them. */
+    bool prefill_yielding;
+    int yield_budget;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     pthread_cond_t clients_cv;
@@ -12449,7 +12455,8 @@ static int server_next_prefill_slot_locked(const server *s) {
     if (!s || s->slot_count <= 0) return -1;
     for (int n = 1; n <= s->slot_count; n++) {
         int id = (s->last_prefill_slot + n) % s->slot_count;
-        if (s->slots[id].prefill_waiting) return id;
+        if (s->slots[id].prefill_waiting &&
+            (!s->prefill_yielding || s->slots[id].decode_turn)) return id;
     }
     return -1;
 }
@@ -12477,6 +12484,7 @@ static bool server_prefill_enter(server *s, server_slot *slot) {
     pthread_cond_broadcast(&s->model_cv);
     while (!g_stop_requested && !slot_job_cancelled(slot) &&
            (s->model_busy || s->decode_pending > 0 ||
+            (s->prefill_yielding && s->yield_budget <= 0) ||
             server_next_prefill_slot_locked(s) != slot->id)) {
         pthread_cond_wait(&s->model_cv, &s->model_mu);
     }
@@ -12488,6 +12496,7 @@ static bool server_prefill_enter(server *s, server_slot *slot) {
     }
     slot->prefill_waiting = false;
     s->last_prefill_slot = slot->id;
+    if (s->prefill_yielding) s->yield_budget--;
     s->model_busy = true;
     pthread_mutex_unlock(&s->model_mu);
     pthread_mutex_lock(&s->inference_mu);
@@ -12502,6 +12511,71 @@ static void server_prefill_leave(server *s) {
     s->model_busy = false;
     pthread_cond_broadcast(&s->model_cv);
     pthread_mutex_unlock(&s->model_mu);
+}
+
+/* An executor turn for one decode step or speculative cycle: unlike a
+ * prefill, it may run while another slot's prefill sweep is yielded. */
+static bool server_decode_enter(server *s, server_slot *slot) {
+    if (!s || !slot) return false;
+    if (s->batched_mode) {
+        pthread_mutex_lock(&s->model_mu);
+        slot->decode_turn = true;
+        pthread_mutex_unlock(&s->model_mu);
+    }
+    const bool entered = server_prefill_enter(s, slot);
+    if (s->batched_mode) {
+        pthread_mutex_lock(&s->model_mu);
+        slot->decode_turn = false;
+        pthread_mutex_unlock(&s->model_mu);
+    }
+    return entered;
+}
+
+/* Prefill yield (ds4_session_set_prefill_yield), called by the engine
+ * between layers of a slot's wide prefill sweep while it holds the executor.
+ * If decode turns are waiting, hand them the executor (one turn each for the
+ * slots waiting now), then take it back before the next layer. Pending
+ * prefills of other slots keep waiting; cancellation does not interrupt the
+ * handback, so the executor is held again whenever this returns. */
+static void server_prefill_yield(void *ud) {
+    server_slot *slot = ud;
+    server *s = slot ? slot->srv : NULL;
+    if (!s || !s->batched_mode) return;
+    pthread_mutex_lock(&s->model_mu);
+    int waiting = 0;
+    for (int i = 0; i < s->slot_count; i++)
+        waiting += s->slots[i].prefill_waiting && s->slots[i].decode_turn;
+    if (!waiting || s->prefill_yielding || g_stop_requested) {
+        pthread_mutex_unlock(&s->model_mu);
+        return;
+    }
+    s->prefill_yielding = true;
+    s->yield_budget = waiting;
+    s->model_busy = false;
+    pthread_cond_broadcast(&s->model_cv);
+    pthread_mutex_unlock(&s->model_mu);
+    pthread_mutex_unlock(&s->inference_mu);
+
+    pthread_mutex_lock(&s->model_mu);
+    while (s->model_busy ||
+           (!g_stop_requested && s->yield_budget > 0 && server_next_prefill_slot_locked(s) >= 0))
+        pthread_cond_wait(&s->model_cv, &s->model_mu);
+    s->prefill_yielding = false;
+    s->yield_budget = 0;
+    s->model_busy = true;
+    pthread_mutex_unlock(&s->model_mu);
+    pthread_mutex_lock(&s->inference_mu);
+}
+
+/* DS4_SERVER_PREFILL_YIELD=0 keeps a prefill sweep on the executor for its
+ * whole call. Only batched SCR servers decode in executor turns. */
+static bool server_prefill_yield_enabled(const server *s) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *v = getenv("DS4_SERVER_PREFILL_YIELD");
+        enabled = !(v && !strcmp(v, "0"));
+    }
+    return enabled && server_turn_decode(s);
 }
 
 static int server_prefill_quantum_for(const server *s,
@@ -13324,7 +13398,7 @@ static int server_eval_tokens(server *s, server_slot *slot, int token,
     if (server_turn_decode(s)) {
         /* SCR sessions publish per-step archive/coordinate state that the
          * fused batch refuses; each step takes an executor turn instead. */
-        if (!server_prefill_enter(s, slot)) {
+        if (!server_decode_enter(s, slot)) {
             if (err && errlen) snprintf(err, errlen, "%s",
                                         g_stop_requested ? "shutdown requested" :
                                                            "client disconnected");
@@ -14159,7 +14233,7 @@ decode_again:
             /* Batched SCR: one whole speculative cycle per executor turn, so
              * a cycle commits before another slot's prefill or cycle runs. */
             const bool turn = server_turn_decode(s);
-            if (turn && !server_prefill_enter(s, slot)) {
+            if (turn && !server_decode_enter(s, slot)) {
                 finish = "error";
                 snprintf(err, sizeof(err), "%s", g_stop_requested ?
                          "shutdown requested" : "client disconnected");
@@ -14965,7 +15039,10 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         goto finished;
     }
     ds4_session_set_cancel(slot->session, job_cancelled, j);
+    ds4_session_set_prefill_yield(slot->session,
+        server_prefill_yield_enabled(s) ? server_prefill_yield : NULL, slot);
     if (!job_cancelled(j)) generate_job_inner(s, slot, j);
+    ds4_session_set_prefill_yield(slot->session, NULL, NULL);
     if (server_scr_enabled(s)) {
         bool cancelled = job_cancelled(j);
         bool success = j->scr_terminal_success && !cancelled;

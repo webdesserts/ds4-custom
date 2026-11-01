@@ -48,7 +48,8 @@ for name in test_scr_append test_scr_rebase_owned test_scr_rebase_failures test_
 done
 # Serving: CLI, HTTP worker behaviour and ds4.reuse.v1 telemetry.
 run test_engram_reader_observation tests/test_engram_reader_observation.c
-for name in test_scr_server_cli test_server_contract test_server_progress test_server_upstream_reuse; do
+for name in test_scr_server_cli test_server_contract test_server_progress test_server_upstream_reuse \
+            test_server_prefill_yield; do
     run "$name" "tests/$name.c" $HOST $SERVER_AUX "$PLANNER_LIB"
 done
 run test_help_scr tests/test_help_scr.c ds4_help.c
