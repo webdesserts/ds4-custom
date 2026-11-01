@@ -41022,6 +41022,9 @@ typedef struct {
      * the graph owns them); row copies keep the session's identity. */
     ds41_workspace *workspace;
     const void *workspace_owner;
+    /* The session's prefill yield (ds4_session_set_prefill_yield). */
+    ds4_session_prefill_yield_fn prefill_yield;
+    void *prefill_yield_ud;
 #define DS41_FIELD(name, count) ds4_gpu_tensor *name;
     DS41_SCRATCH(DS41_FIELD)
 #undef DS41_FIELD
@@ -41038,6 +41041,11 @@ struct ds41_workspace {
     uint32_t users, depth;
     const void *owner;
     bool carry_pending;
+    /* A prefill sweep yielded between layers (ds41_workspace_yield): its
+     * owner and depth are set aside until it resumes; its carry stays. */
+    bool yielded;
+    uint32_t yield_depth;
+    const void *yield_owner;
 };
 
 /* Keep upstream Engram scheduling/conversion authoritative. Readers measure
@@ -41156,7 +41164,14 @@ static bool ds41_workspace_fits(const ds41_workspace *ws, uint32_t ctx) {
 static bool ds41_workspace_enter(const ds41_gpu_graph *g, const char *what) {
     ds41_workspace *ws = g ? g->workspace : NULL;
     if (!ws) return true;
-    if ((ws->depth || ws->carry_pending) && ws->owner != g->workspace_owner) {
+    /* A yielded sweep keeps its carry and the Engram prefetch buffer between
+     * layers: only steps, which use neither, may run until it resumes. */
+    if (ws->yielded && strcmp(what, "decode step") && strcmp(what, "batched step")) {
+        fprintf(stderr, "ds4: V4.1 shared workspace busy: %s for session %p while a prefill "
+                "sweep of %p is yielded\n", what, g->workspace_owner, ws->yield_owner);
+        return false;
+    }
+    if ((ws->depth || (ws->carry_pending && !ws->yielded)) && ws->owner != g->workspace_owner) {
         fprintf(stderr, "ds4: V4.1 shared workspace busy: %s for session %p while %s by %p\n",
                 what, g->workspace_owner, ws->depth ? "in use" : "carry pending", ws->owner);
         return false;
@@ -41169,6 +41184,29 @@ static bool ds41_workspace_enter(const ds41_gpu_graph *g, const char *what) {
 static void ds41_workspace_leave(const ds41_gpu_graph *g) {
     ds41_workspace *ws = g ? g->workspace : NULL;
     if (ws && ws->depth) ws->depth--;
+}
+
+/* Between layers of a wide sweep only the carry, the Engram prefetch buffer
+ * and the session's own state are live; the batch rows and other shared
+ * scratch are rewritten before their next use. Yielding sets the sweep's
+ * ownership aside so other sessions' steps can enter, then restores it. */
+static bool ds41_workspace_yield(ds41_gpu_graph *g) {
+    if (!g->prefill_yield || ds4_gpu_commands_active()) return true;
+    ds41_workspace *ws = g->workspace;
+    if (ws) {
+        if (ws->yielded || ws->owner != g->workspace_owner || ws->depth != 1u) return true;
+        ws->yielded = true;
+        ws->yield_owner = ws->owner; ws->yield_depth = ws->depth;
+        ws->owner = NULL; ws->depth = 0;
+    }
+    g->prefill_yield(g->prefill_yield_ud);
+    if (!ws) return !ds4_gpu_commands_active();
+    const bool clean = !ws->depth && !ds4_gpu_commands_active();
+    if (!clean) fprintf(stderr, "ds4: V4.1 prefill yield returned with the workspace in use (depth %u)\n",
+                        ws->depth);
+    ws->owner = ws->yield_owner; ws->depth = ws->yield_depth;
+    ws->yielded = false; ws->yield_owner = NULL; ws->yield_depth = 0;
+    return clean;
 }
 
 /* A session's prefix call ended: no deferred decoder can resume. */
@@ -43390,6 +43428,10 @@ static bool ds41_graph_prefill_sweep_body(ds41_gpu_graph *g, const ds4_model *m,
                 row.pre = g->rows_view[count - 1u].ffn_split;
             }
         }
+        /* Every slice of layer il is in the carry: let another session step. */
+        if (ok && wide && il + 1u < DS4_N_LAYER && !g->streaming && !g->encoder_resident &&
+            !(encoder_only && il + 1u >= 20u))
+            ok = ds41_workspace_yield(g);
     }
     if (!ds41_engram_prefetch_join(&engram_prefetch, !ok)) ok = false;
 #ifdef DS4_ROCM_BUILD
@@ -62076,6 +62118,8 @@ struct ds4_session {
     void *display_progress_ud;
     ds4_session_cancel_fn cancel;
     void *cancel_ud;
+    ds4_session_prefill_yield_fn prefill_yield;
+    void *prefill_yield_ud;
     uint32_t prefill_cap;
     int ctx_size;
     bool checkpoint_valid;
@@ -76218,6 +76262,12 @@ void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud) 
     if (!s) return;
     s->cancel = fn;
     s->cancel_ud = ud;
+}
+
+void ds4_session_set_prefill_yield(ds4_session *s, ds4_session_prefill_yield_fn fn, void *ud) {
+    if (!s) return;
+    s->prefill_yield = fn;
+    s->prefill_yield_ud = ud;
 }
 int ds4_session_set_scr_planner_budget(ds4_session *s, uint32_t budget_ms) {
     if (!s || budget_ms > 60000u) return 1;

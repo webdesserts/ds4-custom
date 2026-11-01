@@ -4,13 +4,16 @@
  * ownership evidence, not inference. */
 #include <stdbool.h>
 #include <stdint.h>
-static bool fake_sweep_ok = true;
+static bool fake_sweep_ok = true, fake_sweep_yields;
 static unsigned fake_sweeps;
+/* With fake_sweep_yields the stub yields once between "layers", as the real
+ * body does after each layer of a wide sweep. */
 #define DS41_PREFILL_BODY_RUN(g, m, w, tokens, count, progress, progress_ud, total, \
                               cancel, cancel_ud, encoder_only, resume_encoder) \
-    ((void)(g), (void)(m), (void)(w), (void)(tokens), (void)(count), (void)(progress), \
+    ((void)(m), (void)(w), (void)(tokens), (void)(count), (void)(progress), \
      (void)(progress_ud), (void)(total), (void)(cancel), (void)(cancel_ud), \
-     (void)(encoder_only), (void)(resume_encoder), ++fake_sweeps, fake_sweep_ok)
+     (void)(encoder_only), (void)(resume_encoder), ++fake_sweeps, \
+     (!fake_sweep_yields || ds41_workspace_yield(g)) && fake_sweep_ok)
 #include "../ds4.c"
 #include <assert.h>
 
@@ -173,12 +176,76 @@ static void guard(void) {
     free(a); free(b);
 }
 
+/* What another session may do while a sweep of `a` is yielded. */
+static ds41_gpu_graph *yield_other;
+static ds41_workspace *yield_ws;
+static unsigned yields;
+static bool yield_leave_open;
+static void yield_probe(void *ud) {
+    ds41_gpu_graph *a = ud, *b = yield_other;
+    ds41_workspace *ws = yield_ws;
+    yields++;
+    assert(ws->yielded && ws->yield_owner == a && !ws->depth);
+    /* Steps of another session run; its prefill sweeps and other calls do not. */
+    assert(ds41_workspace_enter(b, "decode step"));
+    ds41_workspace_leave(b);
+    assert(ds41_workspace_enter(b, "batched step"));
+    ds41_workspace_leave(b);
+    const unsigned before = fake_sweeps;
+    assert(!ds41_graph_prefill_sweep(b, NULL, NULL, NULL, 1, NULL, NULL, 0, NULL, NULL, false, false));
+    assert(fake_sweeps == before);
+    assert(!ds41_workspace_enter(b, "decoder prepare"));
+    if (yield_leave_open) assert(ds41_workspace_enter(b, "decode step"));
+}
+
+/* A sweep yielded between layers lends the workspace to other sessions'
+ * steps only, then gets its ownership (and reserved carry) back. */
+static void yield_guard(void) {
+    ds41_workspace ws = {0};
+    ds41_gpu_graph *a = calloc(1, sizeof(*a)), *b = calloc(1, sizeof(*b));
+    assert(a && b);
+    graph_shape(a, 1024); graph_shape(b, 1024);
+    a->workspace = b->workspace = &ws; ws.users = 2;
+    yield_other = b; yield_ws = &ws;
+    a->prefill_yield = yield_probe; a->prefill_yield_ud = a;
+    fake_sweep_yields = true;
+
+    yields = 0;
+    assert(ds41_graph_prefill_sweep(a, NULL, NULL, NULL, 1, NULL, NULL, 0, NULL, NULL, false, false));
+    assert(yields == 1 && !ws.yielded && !ws.depth && ws.owner == a && !ws.carry_pending);
+
+    /* The resuming sweep of a deferred decoder keeps its carry across the yield. */
+    assert(ds41_graph_prefill_sweep(a, NULL, NULL, NULL, 1, NULL, NULL, 0, NULL, NULL, true, false));
+    assert(ws.carry_pending);
+    assert(ds41_graph_prefill_sweep(a, NULL, NULL, NULL, 1, NULL, NULL, 0, NULL, NULL, false, true));
+    assert(yields == 3 && !ws.carry_pending && ws.owner == a);
+
+    /* A step still inside the workspace when the yield returns fails the sweep. */
+    yield_leave_open = true;
+    assert(!ds41_graph_prefill_sweep(a, NULL, NULL, NULL, 1, NULL, NULL, 0, NULL, NULL, false, false));
+    yield_leave_open = false;
+    assert(!ws.yielded && !ws.depth);
+
+    /* No yield inside a nested entry, nor without a callback. */
+    yields = 0;
+    assert(ds41_workspace_enter(a, "outer"));
+    assert(ds41_graph_prefill_sweep(a, NULL, NULL, NULL, 1, NULL, NULL, 0, NULL, NULL, false, false));
+    ds41_workspace_leave(a);
+    a->prefill_yield = NULL;
+    assert(ds41_graph_prefill_sweep(a, NULL, NULL, NULL, 1, NULL, NULL, 0, NULL, NULL, false, false));
+    assert(yields == 0);
+    fake_sweep_yields = false;
+    free(a); free(b);
+    puts("yield guard: steps of another session run inside a yielded sweep; its prefill sweeps do not");
+}
+
 int main(void) {
     assert(ds4_gpu_init());
     g_ds4_shape = DS4_SHAPE_FLASH41;
     accounting();
     lending();
     guard();
+    yield_guard();
     ds4_gpu_cleanup();
     puts("test_v41_shared_workspace: ok");
     return 0;

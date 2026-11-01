@@ -2330,6 +2330,7 @@ static int ds41_session_prefix_impl(ds4_session *s, const ds4_tokens *prompt,
         s->checkpoint_valid = false;
         ds41_session_coordinates_clear(s);
     }
+    g->prefill_yield = s->prefill_yield; g->prefill_yield_ud = s->prefill_yield_ud;
     if (g->archive_pending && !ds41_session_rebase_capture_start(s))
         return ds41_session_rebase_failure(s, err, errlen, "private capture activation refused");
     if (!private_fresh && ds41_session_append_prepare_prefix(s, prompt, err, errlen)) return 1;

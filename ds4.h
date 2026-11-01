@@ -427,6 +427,13 @@ void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn
  * usable, but a partial layer-major pass is invalidated and the next sync
  * rebuilds it. Do not assume an interrupted session can be saved or decoded. */
 void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud);
+/* Called by a long V4.1 layer-major prefill between layers, with no GPU work
+ * in flight and the shared workspace yielded: while it runs, other sessions
+ * may take decode and batched (verify) steps, but no prefill sweep. Their
+ * steps must not change this session. The server uses it so a background
+ * prefill does not stall another slot's decode. NULL disables it. */
+typedef void (*ds4_session_prefill_yield_fn)(void *ud);
+void ds4_session_set_prefill_yield(ds4_session *s, ds4_session_prefill_yield_fn fn, void *ud);
 /* Planner budget in milliseconds; 0 is explicit immediate expiry, max60000. */
 int ds4_session_set_scr_planner_budget(ds4_session *s, uint32_t budget_ms);
 void ds4_session_report_progress(ds4_session *s, const char *event, int current, int total);
