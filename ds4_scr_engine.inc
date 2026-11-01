@@ -1315,12 +1315,32 @@ static bool ds41_rebase_import_chunk(ds41_scr_archive *destination,
     }
     if ((destination->cancelled && destination->cancelled((void *)destination->session)) ||
         !ds4_gpu_synchronize() ||
-        !ds41_rebase_import_owners(destination, source, source_start, target_start, count) ||
         !ds41_rebase_import_raw(destination, source, source_start, target_start, count)) {
         destination->lost = true;
         return false;
     }
     destination->captured_end = target_start + count;
+    return true;
+}
+/* Owner rows of a whole range in one command buffer (one drain instead of one
+ * per raw chunk). The raw chunks that follow keep their own bounds; every
+ * owner row is checked against its source tag and an empty destination tag. */
+static bool ds41_rebase_import_range_owners(ds41_scr_archive *destination,
+                                            ds41_scr_archive *source,
+                                            uint32_t source_start, uint32_t target_start,
+                                            uint32_t count) {
+    const uint32_t first = count < 128u ? count : 128u;
+    if (!ds41_rebase_import_bounds(destination, source, source_start, target_start, first) ||
+        count % 2u || count > source->end - source_start ||
+        count > destination->limit - target_start) {
+        errno = EINVAL; return false;
+    }
+    if ((destination->cancelled && destination->cancelled((void *)destination->session)) ||
+        !ds4_gpu_synchronize() ||
+        !ds41_rebase_import_owners(destination, source, source_start, target_start, count)) {
+        destination->lost = true;
+        return false;
+    }
     return true;
 }
 #endif
@@ -2839,7 +2859,9 @@ static bool ds41_session_rebase_import(ds4_session *s, const ds4_scr_range *rang
     ds41_scr_archive *next = g->archive_pending, *old = g->archive;
     if (!range || !g->archive_capture_pending || !ds41_session_rebase_pin(s) ||
         !ds41_multi_cursor(s, next->tokens, range->destination_start) ||
-        next->captured_end != range->destination_start) return false;
+        next->captured_end != range->destination_start ||
+        !ds41_rebase_import_range_owners(next, old, range->source_start,
+                                         range->destination_start, range->count)) return false;
     for (uint32_t copied = 0; copied < range->count;) {
         /* One window read per chunk; flush only a full arena or a finished range. */
         uint32_t occupied = next->captured_end - next->raw_origin;
