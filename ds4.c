@@ -43506,10 +43506,10 @@ static bool ds41_index_rows_prepare(ds41_gpu_graph *g, ds41_prefill_row *active,
     return *ok;
 }
 
+/* Verify overlaps encoding with GPU work on Metal only. */
 static bool ds41_verify_overlap_enabled(void) {
 #ifdef __APPLE__
-    const char *v = getenv("DS4_V41_VERIFY_OVERLAP");
-    return !v || strcmp(v, "0") != 0;
+    return true;
 #else
     return false;
 #endif
