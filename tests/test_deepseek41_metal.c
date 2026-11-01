@@ -623,8 +623,7 @@ static int check_sparse_gather(void) {
 /* The decode-row low projection streams each group's weights once per token
  * tile. With random scales and inputs, any change to the per-token K walk or
  * reduction order shows up in the bits, so compare against the single-token
- * kernel for every tile size and the per-token (DS4_METAL_V41_LOW_ROWS=0)
- * grid. */
+ * kernel for every tile size (one row takes the per-token grid). */
 static int check_low_rows(void) {
     enum { GROUP = 4096, RANK = 1024, GROUPS = 8, OUT = 5120, ROWS = 8 };
     typedef struct { uint16_t d; int8_t qs[32]; } q8_block;
@@ -659,22 +658,19 @@ static int check_low_rows(void) {
     }
     CHECK(ds4_gpu_end_commands());
     CHECK(ds4_gpu_tensor_read(low, 0, reference, lb));
-    for (int tiled = 1; tiled >= 0; tiled--) {
-        if (tiled) unsetenv("DS4_METAL_V41_LOW_ROWS");
-        else setenv("DS4_METAL_V41_LOW_ROWS", "0", 1);
+    {
         for (uint32_t rows = 1; rows <= ROWS; rows++) {
             CHECK(ds4_gpu_tensor_fill_f32(low, NAN, lb / 4));
             CHECK(ds4_gpu_dsv41_attention_output_batch(out, low, model, a_bytes + b_bytes,
                 0, a_bytes, xt, rows));
             const float *got = ds4_gpu_tensor_contents(low);
             if (memcmp(got, reference, (uint64_t)rows * GROUPS * RANK * 4))
-                fprintf(stderr, "low rows mismatch tiled=%d rows=%u\n", tiled, rows);
+                fprintf(stderr, "low rows mismatch rows=%u\n", rows);
             CHECK(!memcmp(got, reference, (uint64_t)rows * GROUPS * RANK * 4));
             if (rows < ROWS) CHECK(isnan(got[(uint64_t)rows * GROUPS * RANK]));
-            fprintf(stderr, "V4.1 decode-row low projection tiled=%d rows=%u: PASS\n", tiled, rows);
+            fprintf(stderr, "V4.1 decode-row low projection rows=%u: PASS\n", rows);
         }
     }
-    unsetenv("DS4_METAL_V41_LOW_ROWS");
     ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(low); ds4_gpu_tensor_free(out);
     free(x); free(reference); free(model);
     return 1;

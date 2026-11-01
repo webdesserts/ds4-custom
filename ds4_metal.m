@@ -32276,12 +32276,10 @@ static int ds4_gpu_encode_attn_out_low_q8_direct(
 }
 
 /* Token tile for the decode-row attention-output low projection: 0 keeps
- * one token per grid slice (single token, or DS4_METAL_V41_LOW_ROWS=0). */
+ * one token per grid slice (a single token, or more rows than tiles). */
 static uint32_t ds4_gpu_attn_out_low_rows(uint32_t n_tokens) {
     static const uint8_t tiles[] = {0, 0, 2, 3, 4, 5, 6, 4, 4};
-    if (n_tokens >= sizeof(tiles)) return 0;
-    const char *v = getenv("DS4_METAL_V41_LOW_ROWS");
-    return v && !strcmp(v, "0") ? 0 : tiles[n_tokens];
+    return n_tokens < sizeof(tiles) ? tiles[n_tokens] : 0;
 }
 
 /* Q8_0 low projection with the token tile in grid.y: each group's weights
