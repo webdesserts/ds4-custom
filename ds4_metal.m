@@ -48550,12 +48550,7 @@ int ds4_gpu_dsv41_quantize(ds4_gpu_tensor *x, uint32_t width, uint32_t rows,
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(linear ?
             "kernel_dsv41_bf16_linear" : "kernel_dsv41_quantize");
         if (!pipeline) return 0;
-        static int divide = -1;
-        if (divide < 0) {
-            const char *v = getenv("DS4_METAL_V41_FP4_DIVIDE");
-            divide = v && strcmp(v, "0") != 0;
-        }
-        const uint32_t args[] = {width, rows, (uint32_t)format, (uint32_t)divide};
+        const uint32_t args[] = {width, rows, (uint32_t)format};
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
