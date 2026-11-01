@@ -4139,15 +4139,10 @@ static int ds41_even_policy_impl(ds4_session *s, const ds4_tokens *request,
     }
     bool continuation = s->checkpoint.len > 0 && s->checkpoint_valid && g->valid &&
         g->pos == (uint32_t)s->checkpoint.len && prefix.common == prefix.live_logical;
-    bool cutoff = r->logical_tokens - prefix.common <= 128u;
     /* A short divergent follow-up (an edited or re-rendered last turn) cannot
      * continue the live graph, and the fresh route would recompute the whole
-     * prompt from token 0; a sealed archive lets the planner cover it instead.
-     * DS4_SCR_SHORT_FOLLOWUP_FULL=1 restores the full re-prefill. */
-    if (cutoff && a && !continuation) {
-        const char *full = getenv("DS4_SCR_SHORT_FOLLOWUP_FULL");
-        if (!(full && !strcmp(full, "1"))) cutoff = false;
-    }
+     * prompt from token 0; a sealed archive lets the planner cover it instead. */
+    const bool cutoff = r->logical_tokens - prefix.common <= 128u && (!a || continuation);
     if (a) {
         generation = a->source_generation; source_start = a->start; source_end = a->end;
         source_identity = a->coordinates.identity;
