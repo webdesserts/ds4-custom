@@ -820,8 +820,8 @@ static int check_f32_rows(void) {
  * and an overflowing row (non-finite values pass the rounding unchanged),
  * rows 1..6, auto and off plans. When the plan has no row tile the call
  * reports *rounded == 0 and must leave outputs unrounded. */
-/* DS4_METAL_V41_FUSED_ROUTER: the one-dispatch 384-expert router against
- * the generic nine-dispatch chain (=0), bitwise over probs, selected ids and
+/* The one-dispatch 384-expert router against the generic nine-dispatch
+ * chain (DS4_GPU_TEST_V41_GENERIC_ROUTER), bitwise over probs, selected ids and
  * weights, for the batch and single-row entry points. Patterns include all
  * scores equal and few distinct values, where only an identical sorting
  * network keeps the tie order. */
@@ -860,7 +860,7 @@ static int check_fused_router(void) {
         for (unsigned ci = 0; ci < sizeof(counts) / sizeof(*counts); ci++) {
             const unsigned rows = counts[ci];
             for (int v = 0; v < 2; v++) {
-                if (v) setenv("DS4_METAL_V41_FUSED_ROUTER", "0", 1);
+                if (v) ds4_gpu_test_set_flags(DS4_GPU_TEST_V41_GENERIC_ROUTER);
                 memset(ds4_gpu_tensor_contents(p[v]), 0xa5, ROWS * N * sizeof(float));
                 memset(ds4_gpu_tensor_contents(ids[v]), 0xa5, ROWS * USED * sizeof(int32_t));
                 memset(ds4_gpu_tensor_contents(w[v]), 0xa5, ROWS * USED * sizeof(float));
@@ -869,7 +869,7 @@ static int check_fused_router(void) {
                         0, 0, 0, 0, N, USED, 1.5f, 0, 0, true, false, x) :
                     ds4_gpu_router_select_batch_tensor(ids[v], w[v], p[v], bias, bias_bytes,
                         0, 0, 0, 0, 0, true, false, x, tok, N, USED, 1.5f, rows);
-                unsetenv("DS4_METAL_V41_FUSED_ROUTER");
+                ds4_gpu_test_set_flags(0);
                 CHECK(ok && ds4_gpu_synchronize());
             }
             const size_t pb = (size_t)rows * N * sizeof(float), sb = (size_t)rows * USED * 4u;

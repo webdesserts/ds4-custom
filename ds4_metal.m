@@ -34388,9 +34388,9 @@ static int ds4_gpu_encode_sum_rows_f32(
     return 1;
 }
 
+/* Tests reach the generic router chain with DS4_GPU_TEST_V41_GENERIC_ROUTER. */
 static bool ds4_gpu_v41_fused_router_enabled(void) {
-    const char *v = getenv("DS4_METAL_V41_FUSED_ROUTER");
-    return !v || strcmp(v, "0") != 0;
+    return (g_test_flags & DS4_GPU_TEST_V41_GENERIC_ROUTER) == 0u;
 }
 
 static int ds4_gpu_encode_router_select(
@@ -34597,7 +34597,7 @@ static int ds4_gpu_encode_router_select(
 
     /* V4.1 (384 experts, biased, no hash or visual routing): one dispatch
      * replays the nine-dispatch generic chain below bit for bit.
-     * DS4_METAL_V41_FUSED_ROUTER=0 keeps the chain. */
+     * Tests select the chain with DS4_GPU_TEST_V41_GENERIC_ROUTER. */
     if (n_expert == 384u && n_expert_used == 6u && has_bias && biasbuf && !hash_mode &&
         !mixed_visual && !g_quality_mode && ds4_gpu_v41_fused_router_enabled()) {
         id<MTLComputePipelineState> fused = ds4_gpu_get_pipeline("kernel_dsv41_router_select_f32");
