@@ -19493,13 +19493,6 @@ int ds4_gpu_dsv4_topk_mask_tensor(
     return 1;
 }
 
-/* Set only by ds4_gpu_matmul_q8_0_bf16_tensor: the single-row Q8_0 matvec
- * then takes its BF16-rounding writer and sets g_q8_rounded. */
-static bool g_q8_round_request;
-static bool g_q8_rounded;
-static id<MTLComputePipelineState> ds4_gpu_get_mul_mv_bf16_pipeline(
-        const char *function_name, int16_t nsg);
-
 static int ds4_gpu_matmul_q8_0_legacy_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -19587,13 +19580,9 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
             ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
             if (out_dim > 65536u) mv_dispatch.nsg = 8;
             mv_args.nr0 = mv_dispatch.nr0;
-            const bool fuse_bf16 = g_q8_round_request &&
-                !strcmp(mv_dispatch.function_name, "kernel_mul_mv_q8_0_f32");
-            id<MTLComputePipelineState> pipeline = fuse_bf16 ?
-                ds4_gpu_get_mul_mv_bf16_pipeline(mv_dispatch.function_name, mv_dispatch.nsg) :
+            id<MTLComputePipelineState> pipeline =
                 ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
             if (!pipeline) return 0;
-            if (fuse_bf16) g_q8_rounded = true;
 
             id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
             [enc setComputePipelineState:pipeline];
@@ -19892,25 +19881,6 @@ int ds4_gpu_matmul_q8_0_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok) {
     return ds4_gpu_matmul_q8_0_tensor_impl(out, model_map, model_size, weight_offset, in_dim, out_dim, x, n_tok, false);
-}
-
-int ds4_gpu_matmul_q8_0_bf16_tensor(
-        ds4_gpu_tensor       *out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        int                    *rounded) {
-    g_q8_round_request = true;
-    g_q8_rounded = false;
-    const int ok = ds4_gpu_matmul_q8_0_tensor_impl(out, model_map, model_size,
-        weight_offset, in_dim, out_dim, x, 1, false);
-    *rounded = g_q8_rounded;
-    g_q8_round_request = false;
-    g_q8_rounded = false;
-    return ok;
 }
 
 int ds4_gpu_qwen4_matmul_q8_0_tensor(
