@@ -43468,12 +43468,11 @@ static uint32_t ds41_short_prefill_count(const ds41_gpu_graph *g, const ds4_weig
  * elsewhere ds4_gpu_flush_commands synchronizes the device. */
 /* DS4_V41_VERIFY_MERGE_ROWS=0 restores one RoPE/quantize dispatch per row
  * in batched verify attention; results are identical either way. */
-/* DS4_V41_INDEX_ROWS=0 keeps the indexer query and weight projections of
- * small batches inside the per-row attention loop. Metal only. */
+/* Metal hoists the indexer projections of small batches out of the per-row
+ * attention loop; other backends keep them in the loop. */
 static bool ds41_index_rows_enabled(void) {
 #ifdef __APPLE__
-    const char *v = getenv("DS4_V41_INDEX_ROWS");
-    return !v || strcmp(v, "0") != 0;
+    return true;
 #else
     return false;
 #endif
