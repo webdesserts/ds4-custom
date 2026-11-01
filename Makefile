@@ -1041,6 +1041,13 @@ tests/test_deepseek41_gguf: tests/test_deepseek41_gguf.o ds4_engram.c $(filter-o
 test-deepseek41-gguf: tests/test_deepseek41_gguf
 	./tests/test_deepseek41_gguf
 
+tests/test_context_copy: tests/test_context_copy.c ds4_context_copy.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ $<
+
+.PHONY: test-context-copy
+test-context-copy: tests/test_context_copy
+	./tests/test_context_copy
+
 tests/test_qwen4_ngrams.o: tests/test_qwen4_ngrams.c ds4.c ds4.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
 
@@ -1412,6 +1419,7 @@ check-scr-host: $(SCR_HOST_OBJS) $(CACHE_REUSE_LIB)
 clean:
 	rm -f tests/test_mmvq_cuda tests/test_mmvq_rocm
 	rm -f tests/test_qwen4_ngrams
+	rm -f tests/test_context_copy
 	rm -f tests/test_qwen4_ngram_state
 	rm -f tests/test_qwen4_ple_prefetch
 	rm -f tests/test_web_recovery
