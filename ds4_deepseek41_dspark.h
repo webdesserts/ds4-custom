@@ -204,9 +204,8 @@ static bool ds41_dspark_attention_output(ds41_prefill_row *b, const ds4_model *m
     if (!tensor_nbytes(l->attn_output_a->type, width, &weight_row)) return false;
     /* One dispatch per group streams its F16 slab once for all draft rows;
      * each row keeps the single-row reduction, so the result is bitwise
-     * identical to the per-row loop below (DS4_V41_DRAFT_LOW_ROWS=0). */
-    const char *rows_env = getenv("DS4_V41_DRAFT_LOW_ROWS");
-    if (l->attn_output_a->type == DS4_TENSOR_F16 && !(rows_env && !strcmp(rows_env, "0"))) {
+     * identical to the per-row loop below, which other types take. */
+    if (l->attn_output_a->type == DS4_TENSOR_F16) {
         bool ok = true;
         for (uint32_t group = 0; ok && group < groups; group++) {
             ds4_gpu_tensor *x = ds4_gpu_tensor_view(b->heads, (uint64_t)group * width * 4u,
