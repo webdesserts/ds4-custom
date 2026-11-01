@@ -171,7 +171,7 @@ static void server_scr_receipt_log(server_slot *slot, job *j, int rc,
     const ds4_scr_dense_match_receipt *m = &r->match;
     SCR_LOG("ds4-server: scr match request=%p selected=%u", (void *)j, m->selected_ranges);
     const ds4_scr_multi_receipt *u = &r->multi;
-    SCR_LOG("ds4-server: scr multi request=%p outcome=%d reason=%d phase=%d N=%u input=%u normalized=%u attempted_spans=%u materialized_spans=%u installed_spans=%u committed_spans=%u attempted_tokens=%u materialized_tokens=%u installed_tokens=%u committed_tokens=%u prefix_work=%u suffix_work=%u fresh_work=%u discarded=%u unknown=%d head=%d published=%d host=%llu growth=%llu archive=%llu prefix_s=%.6f stage_s=%.6f install_s=%.6f gap_s=%.6f suffix_s=%.6f fresh_s=%.6f head_s=%.6f publication_s=%.6f total_s=%.6f",
+    SCR_LOG("ds4-server: scr multi request=%p outcome=%d reason=%d phase=%d N=%u input=%u normalized=%u attempted_spans=%u materialized_spans=%u installed_spans=%u committed_spans=%u attempted_tokens=%u materialized_tokens=%u installed_tokens=%u committed_tokens=%u prefix_work=%u suffix_work=%u fresh_work=%u discarded=%u unknown=%d head=%d published=%d host=%llu growth=%llu archive=%llu prefix_s=%.6f stage_s=%.6f install_s=%.6f gap_s=%.6f suffix_s=%.6f fresh_s=%.6f head_s=%.6f publication_s=%.6f rebase_prepare_s=%.6f import_s=%.6f total_s=%.6f",
         (void *)j, u->outcome, u->reason, u->phase, u->requested_tokens,
         u->input_spans, u->normalized_spans, u->attempted_spans, u->materialized_spans,
         u->installed_spans, u->committed_spans, u->attempted_tokens, u->materialized_tokens,
@@ -180,7 +180,7 @@ static void server_scr_receipt_log(server_slot *slot, job *j, int rc,
         u->published, SCR_U(u->temporary_host_bytes), SCR_U(u->publication_growth_bytes),
         SCR_U(u->archive_bytes), u->prefix_seconds, u->stage_seconds, u->install_seconds,
         u->gap_seconds, u->suffix_seconds, u->fresh_seconds, u->head_seconds,
-        u->publication_seconds, u->total_seconds);
+        u->publication_seconds, u->rebase_prepare_seconds, u->import_seconds, u->total_seconds);
     for (uint32_t i = 0; i < r->configured_k && i < DS4_SCR_MULTI_MAX_RANGES; ++i)
         SCR_LOG("ds4-server: scr range request=%p i=%u plan_source=%u plan_destination=%u plan_count=%u multi_source=%u multi_destination=%u multi_count=%u gap_work=%u",
             (void *)j, i, m->plan[i].source_start, m->plan[i].destination_start,
@@ -548,9 +548,13 @@ static void server_reuse_json(buf *b, const server *s, const server_slot *slot,
     bool first = true;
     buf_puts(b, ",\"ms\":{");
     if (t->enqueued > 0.0) server_reuse_ms(b, &first, "queue", t->started - t->enqueued);
+    /* Checkpoint pool selection (a restore reads a whole archive from disk). */
+    if (t->pool_known && t->pool.selected) server_reuse_ms(b, &first, "pool", t->pool.seconds);
     if (t->prefill_known && l->planner_timing_known)
         server_reuse_ms(b, &first, "plan", (double)l->planner_elapsed_ns / 1e9);
     if (planned && (e->route == DS4_SCR_DENSE_REUSE)) {
+        if (e->multi.rebase_prepared)
+            server_reuse_ms(b, &first, "rebase", e->multi.rebase_prepare_seconds + e->multi.import_seconds);
         server_reuse_ms(b, &first, "stage", e->multi.stage_seconds);
         server_reuse_ms(b, &first, "install", e->multi.install_seconds);
     }

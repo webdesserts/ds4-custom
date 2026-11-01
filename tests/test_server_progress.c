@@ -77,6 +77,7 @@ static void test_record_schema(void) {
     assert(strstr(b.ptr, "\"archive\":{\"capacity\":4096,\"occupancy\":2048,\"action\":\"retained\",\"device_mib\":3.0}"));
     assert(strstr(b.ptr, "\"decode\":{\"steps\":4,\"tps\":2.00}") && strstr(b.ptr, "\"error\":null}"));
     assert(!strstr(b.ptr, "\"io\":"));
+    assert(!strstr(b.ptr, "\"pool\":") && !strstr(b.ptr, "\"rebase\":"));
     buf_free(&b);
     /* Planner without a discovery stage: the overlap is unknown, so omitted. */
     l->planner_discovery_known = false;
@@ -86,10 +87,17 @@ static void test_record_schema(void) {
     buf_free(&b);
     /* With the checkpoint pool, the archive reports a restore and the catalog size. */
     j.reuse.pool_known = true;
-    j.reuse.pool = (ds4_scr_pool_receipt){.selected = true, .restored = true, .entries = 3};
+    j.reuse.pool = (ds4_scr_pool_receipt){.selected = true, .restored = true, .entries = 3,
+        .seconds = 2.0};
+    /* A rebased archive also reports its prepare and per-range import time. */
+    l->execution.multi.rebase_prepared = true;
+    l->execution.multi.rebase_prepare_seconds = 1.0;
+    l->execution.multi.import_seconds = 0.5;
     server_reuse_json(&b, &s, &slot, &j, &view);
     assert_record(b.ptr, b.len);
     assert(strstr(b.ptr, "\"device_mib\":3.0,\"pool_restored\":true,\"pool_entries\":3}"));
+    assert(strstr(b.ptr, "\"ms\":{\"queue\":500.000,\"pool\":2000.000,\"plan\":1.500,"
+                         "\"rebase\":1500.000,\"stage\":250.000,"));
     buf_free(&b);
 
     /* Before prefill: unknown values are omitted and ranges stay variable-length. */
