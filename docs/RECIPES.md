@@ -134,11 +134,11 @@ The plausible theory, "dense weights re-streamed per row cost ~78 ms", turned ou
 - **Why first:** with uniform routing, grouping saves ~1%; with correlated routing, ~20% (and ~39% across 4 slots). Only real traces can tell which case applies, and the kernel is worth writing only in the second.
 - **Caveats:** at peak bandwidth an expert read already takes ~65% of the measured per-pair cost, so compute fractions above ~0.35 are non-physical. The down kernel's falling per-row cost suggests the cache already serves some repeats, so the predictions lean high.
 
-## 10. Short follow-ups from the SCR archive (`c934bec`, deployed off pending decision)
+## 10. Short follow-ups from the SCR archive (`c934bec`, live since Oct 31)
 
 - **Unused resource:** sealed SCR archives. A request diverging within 128 tokens of the live transcript (regenerate, edit last turn) re-prefilled the whole conversation (~10.5 s at 7–11k tokens) even though an archive covered almost all of it.
 - **Change:** such requests go through the archive planner, taking 0.7–1.1 s and reusing 7.0k–10.9k tokens.
-- **Accuracy:** archive reuse is not fresh-prefill equivalent, so greedy output differs. It is the same class as the existing longer-tail reuse. Live runs with `DS4_SCR_SHORT_FOLLOWUP_FULL=1` until Michael decides.
+- **Accuracy:** archive reuse is not fresh-prefill equivalent, so greedy output differs. It is the same class as the existing longer-tail reuse. Enabled live on Oct 31: reusing the cache for a near-identical turn is the purpose of the cache. `DS4_SCR_SHORT_FOLLOWUP_FULL=1` restores the full re-prefill.
 - **Costs** (measured): **accuracy class** (no longer fresh-equivalent); decode right after the reuse slows to ~40 tok/s, probably because the drafter has little fresh context; a pool archive read (~2.4 s select on a 41k-token conversation).
 
 ## 11. Routing trace (`1e1e05b`)
@@ -288,4 +288,4 @@ What to track per change: joules per generated token, joules per prefilled token
 Where it stands against the hardware: single-token decode reads ~11.1 GB per token, so its floor is ~9.8 ms against 25.3 ms measured (39% of peak). Routed-MoE kernels run at 39–46% of peak. An earlier estimate that inter-encoder gaps took ~37% of GPU time overcounted overlapping encoders: real GPU idle is only 1–3% per window. Remaining exact gains must come from doing less work per kernel or fewer dispatches, not from filling gaps.
 
 ## Pending sections
-Prefill fairness (yield between layers in a wide prefill; design A: a yielded guard state that admits only decode steps, ~3–4 h) · SCR-aware fused multi-slot decode (M3) · short-follow-up planner minimum-suffix recompute (needs an accuracy decision) · sampling semantics (`--mtp-exact-sampling` and Ren's default temperature) · route-trace rotation.
+Prefill fairness (yield between layers in a wide prefill; design A: a yielded guard state that admits only decode steps, ~3–4 h) · SCR-aware fused multi-slot decode (M3) · sampling semantics (`--mtp-exact-sampling` and Ren's default temperature) · route-trace rotation.
