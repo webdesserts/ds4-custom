@@ -200,6 +200,73 @@ static int check_quantization(void) {
     return 1;
 }
 
+/* FP4 activation rounding at its decision points: every block holds bf16
+ * values on, and one bf16 step either side of, each E2M1 midpoint times the
+ * block's scale, for many scales, so a kernel that rounds a midpoint the
+ * wrong way or misses a tie fails. Reference as in check_quantization. */
+static float bf16_step(float x, int up) {
+    uint32_t bits;
+    memcpy(&bits, &x, 4);
+    bits = (bits & 0xffff0000u) + (up ? 0x10000u : (uint32_t)-0x10000);
+    memcpy(&x, &bits, 4);
+    return x;
+}
+
+static int check_fp4_rounding(void) {
+    static const float mids[7] = {0.25f, 0.75f, 1.25f, 1.75f, 2.5f, 3.5f, 5.0f};
+    enum { WIDTH = 4096, ROWS = 64, N = WIDTH * ROWS };
+    float *source = malloc(N * sizeof(float)), *actual = malloc(N * sizeof(float));
+    CHECK(source && actual);
+    ds4_gpu_tensor *t = upload(NULL, N * sizeof(float));
+    CHECK(t);
+    long checked = 0;
+    for (int mode = DS4_V41_FP4_E8M0; mode <= DS4_V41_FP4_E4M3; mode++) {
+        const int block = mode == DS4_V41_FP4_E4M3 ? 16 : 32;
+        for (int i = 0; i < N; i += block) {
+            /* A block amax spread over ~2^-12..2^12, then values that probe
+             * the midpoints of the scale the reference derives from it. */
+            const float amax = bf16(ldexpf(1.0f + (float)((i / block) % 61) / 64.0f, (i / block) % 25 - 12));
+            float scale;
+            if (mode == DS4_V41_FP4_E8M0)
+                scale = exp2f(ceilf(log2f(fmaxf(amax, 0x1.8p-124f) * (1.0f / 6.0f))));
+            else
+                scale = nearest(fmaxf(amax, 6.0f / 512.0f) / 6.0f, 0);
+            source[i] = (i / block) & 1 ? -amax : amax;
+            for (int j = 1; j < block; j++) {
+                const float m = bf16(mids[(j - 1) % 7] * scale);
+                const int k = (j - 1) / 7 % 3;
+                float v = k == 0 ? m : bf16_step(m, k == 1);
+                if (fabsf(v) > amax) v = amax;
+                source[i + j] = (j & 2) ? -v : v;
+            }
+        }
+        CHECK(ds4_gpu_tensor_write(t, 0, source, N * sizeof(float)));
+        CHECK(ds4_gpu_dsv41_quantize(t, WIDTH, ROWS, (ds4_v41_activation_format)mode));
+        CHECK(ds4_gpu_tensor_read(t, 0, actual, N * sizeof(float)));
+        for (int start = 0; start < N; start += block) {
+            float amax = 0, scale;
+            for (int i = 0; i < block; i++) amax = fmaxf(amax, fabsf(bf16(source[start + i])));
+            if (mode == DS4_V41_FP4_E8M0)
+                scale = exp2f(ceilf(log2f(fmaxf(amax, 0x1.8p-124f) * (1.0f / 6.0f))));
+            else
+                scale = nearest(fmaxf(amax, 6.0f / 512.0f) / 6.0f, 0);
+            for (int i = 0; i < block; i++) {
+                const float expected = bf16(nearest(bf16(source[start + i]) / scale, 1) * scale);
+                checked++;
+                if (memcmp(&expected, actual + start + i, 4)) {
+                    fprintf(stderr, "fp4 rounding mode=%d index=%d value=%.9g scale=%.9g: %.9g != %.9g\n",
+                            mode, start + i, source[start + i], scale, actual[start + i], expected);
+                    return 0;
+                }
+            }
+        }
+    }
+    ds4_gpu_tensor_free(t);
+    free(source); free(actual);
+    fprintf(stderr, "V4.1 FP4 rounding at E2M1 midpoints: %ld values exact: PASS\n", checked);
+    return 1;
+}
+
 static double monotonic_seconds(void);
 
 static uint32_t bf16_bits(uint32_t bits) {
@@ -2386,13 +2453,18 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--fp4-rounding")) {
+        const int ok = ds4_gpu_init() && check_fp4_rounding();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--index-projection")) {
         const int ok = ds4_gpu_init() && check_index_projection();
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
     if (argc != 1) return 2;
-    int ok = ds4_gpu_init() && check_router() && check_quantization() && check_engram() && check_rope_stride() && check_pool() &&
+    int ok = ds4_gpu_init() && check_router() && check_quantization() && check_fp4_rounding() && check_engram() && check_rope_stride() && check_pool() &&
              check_candidates() && check_sparse_gather() && check_indexer_batch() &&
              check_embedding() && check_index_projection() && check_decode_rows(0) && check_general_topk() && check_causal_topk() && check_compact_carry() && check_attention_output(false) &&
              check_tp_attention() && check_merge_rows() && check_low_rows();

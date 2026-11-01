@@ -4,6 +4,7 @@ struct ds4_metal_args_dsv41_quantize {
     uint width;
     uint rows;
     uint mode;
+    uint divide; /* 1: E2M1 value by precise division (DS4_METAL_V41_FP4_DIVIDE=1) */
 };
 
 static inline float dsv41_bf16(float x) {
@@ -59,6 +60,24 @@ kernel void kernel_dsv41_rope(
     x[i + 1u] = dsv41_bf16(re * s + im * c);
 }
 
+/* E2M1 rounding of |value| / scale without dividing: count the midpoints
+ * between E2M1 steps that |value| passes, comparing against midpoint * scale.
+ * The products are exact (midpoints have at most 3 significant bits, the
+ * scale is E4M3 or a power of two), and a bf16 |value| that is not exactly on
+ * a midpoint is far more than half a float ulp from it, so this picks what
+ * rounding the correctly rounded quotient picks, ties to even included; values
+ * past the last midpoint saturate to 6 like the clamp in dsv4_e2m1fn_dequant. */
+static inline float dsv41_e2m1_scaled(float ax, float scale) {
+    const float mids[7] = {0.25f, 0.75f, 1.25f, 1.75f, 2.5f, 3.5f, 5.0f};
+    int k = 0;
+    for (int i = 0; i < 7; i++) {
+        const float m = mids[i] * scale;
+        /* A tie goes to the even index of the two neighbours (i, i + 1). */
+        k += ax > m || (ax == m && ((i + 1) & 1) == 0);
+    }
+    return dsv4_e2m1fn_values[k];
+}
+
 kernel void kernel_dsv41_quantize(
         constant ds4_metal_args_dsv41_quantize &args,
         device float *x,
@@ -80,7 +99,8 @@ kernel void kernel_dsv41_quantize(
         const float scale = args.mode == 3u
             ? dsv4_e4m3fn_dequant(precise::divide(max(amax, 0.01171875f), 6.0f))
             : dsv41_pow2_ceil(max(amax, 7.052966104933725e-38f) * (1.0f / 6.0f));
-        result = copysign(dsv4_e2m1fn_dequant(precise::divide(abs(value), scale)), value) * scale;
+        result = copysign(args.divide ? dsv4_e2m1fn_dequant(precise::divide(abs(value), scale))
+                                      : dsv41_e2m1_scaled(abs(value), scale), value) * scale;
     }
     if (valid) x[index] = dsv41_bf16(result);
 }
