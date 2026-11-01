@@ -41485,35 +41485,18 @@ static bool ds41_f32_rows_enabled(void) {
 }
 
 /* V4.1 BF16 rounding happens in the producing kernel's writer: row-tiled
- * Q8_0 batches, HC weighted sums and HC=4 expands (bitwise equal to the
- * kernel plus a separate BF16 pass; tests/test_deepseek41_metal --fused-*). */
-
-/* Shared-expert swiglu and the routed+shared add likewise round in their
- * kernels; DS4_METAL_V41_FUSED_EW=0 keeps the separate pass. */
-static bool ds41_fused_ew_enabled(void) {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char *v = getenv("DS4_METAL_V41_FUSED_EW");
-        enabled = !(v && !strcmp(v, "0"));
-    }
-    return enabled;
-}
-
+ * Q8_0 batches, shared-expert swiglu, the routed+shared add, HC weighted sums
+ * and HC=4 expands (bitwise equal to the kernel plus a separate BF16 pass;
+ * tests/test_deepseek41_metal --fused-*). */
 static bool ds41_swiglu_rounded(ds4_gpu_tensor *mid, const ds4_gpu_tensor *gate,
                                 const ds4_gpu_tensor *up, uint32_t rows) {
-    if (ds41_fused_ew_enabled())
-        return ds4_gpu_swiglu_bf16_tensor(mid, gate, up, rows * DS4_N_FF_EXP,
-            DS4_SWIGLU_CLAMP_EXP, 1.0f);
-    return ds4_gpu_swiglu_tensor(mid, gate, up, rows * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
-        ds4_gpu_dsv41_quantize(mid, DS4_N_FF_EXP, rows, DS4_V41_BF16);
+    return ds4_gpu_swiglu_bf16_tensor(mid, gate, up, rows * DS4_N_FF_EXP,
+        DS4_SWIGLU_CLAMP_EXP, 1.0f);
 }
 
 static bool ds41_add_rounded(ds4_gpu_tensor *out, const ds4_gpu_tensor *a,
                              const ds4_gpu_tensor *b, uint32_t rows) {
-    if (ds41_fused_ew_enabled())
-        return ds4_gpu_add_bf16_tensor(out, a, b, rows * DS4_N_EMBD);
-    return ds4_gpu_add_tensor(out, a, b, rows * DS4_N_EMBD) &&
-        ds4_gpu_dsv41_quantize(out, DS4_N_EMBD, rows, DS4_V41_BF16);
+    return ds4_gpu_add_bf16_tensor(out, a, b, rows * DS4_N_EMBD);
 }
 
 static bool ds41_hc_sum_rounded(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
