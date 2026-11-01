@@ -134,7 +134,7 @@ tests/test_metal_session_batch: tests/test_metal_session_batch.o $(METAL_CORE_OB
 tests/test_v41_indexer_score.o: tests/test_v41_indexer_score.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
-tests/test_v41_indexer_score: tests/test_v41_indexer_score.o $(CORE_OBJS)
+tests/test_v41_indexer_score: tests/test_v41_indexer_score.o $(METAL_CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 test-v41-indexer-score: tests/test_v41_indexer_score
