@@ -15190,8 +15190,7 @@ static void dispatch_jobs_locked(server *s) {
             server_slot *best = NULL;
             int best_score = INT_MIN;
 #ifdef SERVER_SLOT_ROUTER
-            if (required < 0 && server_scr_enabled(s) && s->slot_count <= SERVER_ROUTE_MAX_SLOTS &&
-                !getenv("DS4_SERVER_LEGACY_ROUTE")) {
+            if (required < 0 && server_scr_enabled(s) && s->slot_count <= SERVER_ROUTE_MAX_SLOTS) {
                 ds4_slot_route_decision d;
                 best = job_route_scr_locked(s, j, now, &d);
                 /* Owner and empty slots evict nothing; others log an eviction. */
