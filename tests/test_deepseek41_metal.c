@@ -1158,6 +1158,59 @@ static int check_fused_f16(void) {
 #endif
 
 #ifdef __APPLE__
+/* Fused BF16 rounding in the single-row Q8_0 matvec writer against the
+ * plain matvec plus the separate pass, including the nsg=8 wide grid and
+ * NaN / overflowing inputs. */
+static int check_fused_q8_single(void) {
+    typedef struct { uint16_t d; int8_t qs[32]; } q8_block;
+    const struct { uint32_t in, out; } shapes[] = {{5120, 1280}, {1280, 32768}, {2304, 5120}, {4096, 64}, {128, 70000}};
+    for (size_t sh = 0; sh < sizeof(shapes) / sizeof(*shapes); sh++) {
+        const uint32_t in = shapes[sh].in, out_dim = shapes[sh].out;
+        const uint64_t wbytes = (uint64_t)out_dim * in / 32 * sizeof(q8_block);
+        const uint64_t wb = (wbytes + 16383u) & ~(uint64_t)16383u, ob = (uint64_t)out_dim * 4;
+        void *model = NULL;
+        CHECK(posix_memalign(&model, getpagesize(), wb) == 0);
+        q8_block *w = model;
+        for (uint64_t i = 0; i < wbytes / sizeof(*w); i++) {
+            const int value = (int)(random_value() * 8192);
+            w[i].d = (uint16_t)(0x3000u | ((unsigned)abs(value) % 1024u));
+            for (int j = 0; j < 32; j++) w[i].qs[j] = (int8_t)((int)(random_value() * 8192) % 128);
+        }
+        for (int special = 0; special < 3; special++) {
+            float *x = malloc((uint64_t)in * 4), *plain = malloc(ob), *fused = malloc(ob);
+            CHECK(x && plain && fused);
+            for (uint32_t i = 0; i < in; i++) x[i] = special == 2 ? 3.0e38f : random_value();
+            if (special == 1) x[7] = NAN;
+            ds4_gpu_tensor *xt = upload(x, (uint64_t)in * 4), *ot = upload(NULL, ob);
+            CHECK(xt && ot && ds4_gpu_set_model_map(model, wb));
+            CHECK(ds4_gpu_begin_commands());
+            CHECK(ds4_gpu_matmul_q8_0_tensor(ot, model, wb, 0, in, out_dim, xt, 1));
+            CHECK(ds4_gpu_dsv41_quantize(ot, out_dim, 1, DS4_V41_BF16));
+            CHECK(ds4_gpu_end_commands());
+            CHECK(ds4_gpu_tensor_read(ot, 0, plain, ob));
+            CHECK(ds4_gpu_tensor_fill_f32(ot, 0, ob / 4));
+            int rounded = -1;
+            CHECK(ds4_gpu_begin_commands());
+            CHECK(ds4_gpu_matmul_q8_0_bf16_tensor(ot, model, wb, 0, in, out_dim, xt, &rounded));
+            CHECK(ds4_gpu_end_commands());
+            CHECK(ds4_gpu_tensor_read(ot, 0, fused, ob));
+            if (memcmp(fused, plain, ob) || rounded != 1)
+                fprintf(stderr, "fused q8 single mismatch %ux%u special=%d rounded=%d\n", in, out_dim, special, rounded);
+            CHECK(rounded == 1 && !memcmp(fused, plain, ob));
+            bool nonfinite = false;
+            for (uint32_t i = 0; i < out_dim; i++) nonfinite |= !isfinite(fused[i]);
+            CHECK(nonfinite == (special != 0));
+            ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(ot);
+            free(x); free(plain); free(fused);
+        }
+        fprintf(stderr, "V4.1 fused BF16 single-row Q8_0 %ux%u: PASS\n", in, out_dim);
+        free(model);
+    }
+    return 1;
+}
+#endif
+
+#ifdef __APPLE__
 /* Fused BF16 rounding in swiglu (with and without the clamp) and in the
  * two-input add, against the plain kernels plus the separate pass; inputs
  * span the clamp, NaN and overflow. */
@@ -2350,6 +2403,11 @@ int main(int argc, char **argv) {
     }
     if (argc == 2 && !strcmp(argv[1], "--fused-ew")) {
         const int ok = ds4_gpu_init() && check_fused_ew();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--fused-q8")) {
+        const int ok = ds4_gpu_init() && check_fused_q8_single();
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }

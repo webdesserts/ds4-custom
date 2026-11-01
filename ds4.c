@@ -41487,6 +41487,13 @@ static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
         bool done;
         const bool ok = ds41_matmul_float_rounded(out, m, weight, in, 1, &done);
         if (done || !ok) return ok;
+        /* Single-row Q8_0 matvecs likewise round in the writer when they can. */
+        if (weight->type == DS4_TENSOR_Q8_0) {
+            int rounded = 0;
+            return ds4_gpu_matmul_q8_0_bf16_tensor(out, m->map, m->size, weight->abs_offset,
+                    weight->dim[0], weight->dim[1], in, &rounded) &&
+                (rounded || ds41_bf16(out, (uint32_t)weight->dim[1]));
+        }
     }
     return metal_graph_matmul_plain_tensor(out, m, weight, weight->dim[0], weight->dim[1], in, 1) &&
            (!round || ds41_bf16(out, (uint32_t)weight->dim[1]));
