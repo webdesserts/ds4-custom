@@ -2829,11 +2829,9 @@ int ds4_gpu_device_is_m5_apple_silicon(void) {
  * the results are bitwise those of the generic kernels; only the work per
  * simdgroup changes. The down sum uses one row per simdgroup for a single
  * token (more threadgroups in flight) and two from two tokens.
- * DS4_METAL_V41_MOE_GEOMETRY=0 keeps the generic kernels; it is read per
- * call so tests can compare both in one process. */
+ * Tests reach the generic kernels with DS4_GPU_TEST_V41_GENERIC_MOE. */
 static bool ds4_gpu_v41_moe_geometry_enabled(void) {
-    const char *v = getenv("DS4_METAL_V41_MOE_GEOMETRY");
-    return !v || strcmp(v, "0") != 0;
+    return (g_test_flags & DS4_GPU_TEST_V41_GENERIC_MOE) == 0u;
 }
 
 static bool ds4_gpu_ported_m5_decode_feature_enabled(

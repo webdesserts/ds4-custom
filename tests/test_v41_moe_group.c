@@ -1,7 +1,7 @@
 /* Timing and exactness for the V4.1 routed-MoE verify path (IQ2_XXS gate/up,
  * Q2_K down, 6 of 384 experts) at 1-8 rows, on synthetic weights:
  *
- *   --check            the geometry kernels (DS4_METAL_V41_MOE_GEOMETRY) are
+ *   --check            the compile-time geometry kernels are
  *                      bitwise equal to the generic kernels for mid and the
  *                      summed output, batched (1-8 rows) and single. The
  *                      fused kernels' gate/up stores are diagnostic only: all
@@ -218,7 +218,7 @@ static int read_all(ds4_gpu_tensor *t, void *dst, size_t bytes) {
 static int run_geometry(const moe_model *m, const moe_io *io, ds4_gpu_tensor *sel,
                         uint32_t rows, uint32_t layer, bool single, bool geometry,
                         float *out, float *gate, float *up, float *mid) {
-    setenv("DS4_METAL_V41_MOE_GEOMETRY", geometry ? "1" : "0", 1);
+    ds4_gpu_test_set_flags(geometry ? 0u : DS4_GPU_TEST_V41_GENERIC_MOE);
     const size_t pair = (size_t)rows * N_USED * MID * 4;
     /* Distinct fills per run, so an unwritten element cannot match. */
     const float fill = geometry ? -2.0f : -1.0f;
@@ -279,7 +279,7 @@ static int check(void) {
             }
         }
     }
-    unsetenv("DS4_METAL_V41_MOE_GEOMETRY");
+    ds4_gpu_test_set_flags(0);
     fprintf(stderr, "geometry check: %d passed, %d failed\n", passed, failed);
     ds4_gpu_tensor_free(sel);
     for (int i = 0; i < 8; i++) free(buf[i]);
