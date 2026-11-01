@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <stdatomic.h>
 #include <execinfo.h>
 
 #include <stdint.h>
@@ -1399,7 +1400,13 @@ static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *labe
     return 1;
 }
 
+/* Uptime (ns) when the engine last created a command buffer; the queue
+ * keepalive stops renewing after DS4_METAL_QUEUE_KEEPALIVE_HOLD_S of idle. */
+static _Atomic uint64_t g_queue_last_work_ns;
+
 static id<MTLCommandBuffer> ds4_gpu_new_command_buffer(void) {
+    atomic_store_explicit(&g_queue_last_work_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW),
+                          memory_order_relaxed);
     static int initialized;
     static int use_unretained;
     if (!initialized) {
@@ -11481,17 +11488,46 @@ int ds4_gpu_warm_command_queue(void) {
  * process's GPU mappings; 76-145 GB of no-copy model views here).  Work on
  * other queues does not prevent it.
  *
- * Renewing the model residency set once per second keeps the mappings
- * alive without GPU work.  The older keepalive committed a 1 KB kernel per
- * second on this queue; each commit spent about 0.24 s of system time in
- * the driver's submit call (24% of a core, ~2.8 W while idle on M5 Ultra
- * with 167 GB wired), and first tokens after 5 s of idle still started
- * ~0.4 s late.  DS4_METAL_QUEUE_KEEPALIVE_MODE=submit keeps the kernel; it
- * is also used while there is no model residency set.
- * DS4_METAL_DISABLE_QUEUE_KEEPALIVE=1 opts out of both. */
+ * The keepalive renews the model residency set every second, on an absolute
+ * deadline.  On M5 Ultra a renewal costs ~0.02 ms while the set is still
+ * resident, but once it has lapsed (between 2 and 3 s) renewing re-establishes
+ * it: 0.2-3.8 s of system time.  Periods of 2 s already lapse sometimes and
+ * 3 s about every other tick, so 1 s is the setting that is both free and
+ * keeps first tokens fast.  Knobs:
+ *   DS4_METAL_QUEUE_KEEPALIVE_MODE=submit  commit a 1 KB kernel instead
+ *       (the original keepalive; ~25% of a core while idle)
+ *   DS4_METAL_QUEUE_KEEPALIVE_MODE=off     no keepalive (as
+ *       DS4_METAL_DISABLE_QUEUE_KEEPALIVE=1): ~0.8 s slower first token
+ *   DS4_METAL_QUEUE_KEEPALIVE_MS=N         period (default 1000)
+ *   DS4_METAL_QUEUE_KEEPALIVE_HOLD_S=N     stop renewing after N s without
+ *       engine work (default 0: never); the first token after that is slow
+ *   DS4_METAL_QUEUE_KEEPALIVE_TRACE=1      log each tick's interval and cost
+ * Submit mode is also used while there is no model residency set. */
 static pthread_t g_queue_keepalive_thread;
 static volatile int g_queue_keepalive_running;
 static volatile int g_queue_keepalive_stop;
+
+static pthread_mutex_t g_queue_keepalive_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_queue_keepalive_cv = PTHREAD_COND_INITIALIZER;
+
+static uint64_t ds4_gpu_uptime_ns(void) {
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+
+/* Sleeps until `deadline_ns` (uptime) or until stopped. One timed wait on an
+ * absolute deadline: a chain of short sleeps overran under launchd (live's
+ * llama-swap children), stretching a 1 s period to 2-3 s. */
+static void ds4_gpu_queue_keepalive_wait(uint64_t deadline_ns) {
+    pthread_mutex_lock(&g_queue_keepalive_mu);
+    while (!g_queue_keepalive_stop) {
+        const uint64_t now = ds4_gpu_uptime_ns();
+        if (now >= deadline_ns) break;
+        const uint64_t left = deadline_ns - now;
+        const struct timespec rel = {(time_t)(left / 1000000000ull), (long)(left % 1000000000ull)};
+        pthread_cond_timedwait_relative_np(&g_queue_keepalive_cv, &g_queue_keepalive_mu, &rel);
+    }
+    pthread_mutex_unlock(&g_queue_keepalive_mu);
+}
 
 static void *ds4_gpu_queue_keepalive_thread(void *arg) {
     (void)arg;
@@ -11501,10 +11537,22 @@ static void *ds4_gpu_queue_keepalive_thread(void *arg) {
     if (!pipeline || !scratch) return NULL;
     memset(scratch.contents, 0, 256u * sizeof(float));
     const uint32_t iters = 1u;
-    uint64_t period_ms = ds4_gpu_env_u64("DS4_METAL_QUEUE_KEEPALIVE_MS", 1000u, 50u, 10000u);
+    const uint64_t period_ns = ds4_gpu_env_u64("DS4_METAL_QUEUE_KEEPALIVE_MS", 1000u, 50u, 60000u) *
+                               1000000ull;
+    const uint64_t hold_ns = ds4_gpu_env_u64("DS4_METAL_QUEUE_KEEPALIVE_HOLD_S", 0u, 0u, 86400u) *
+                             1000000000ull;
+    const int trace = getenv("DS4_METAL_QUEUE_KEEPALIVE_TRACE") != NULL;
     const char *mode = getenv("DS4_METAL_QUEUE_KEEPALIVE_MODE");
     const int submit_only = mode && strcmp(mode, "submit") == 0;
-    while (!g_queue_keepalive_stop) {
+    if (mode && strcmp(mode, "off") == 0) return NULL;
+    atomic_store_explicit(&g_queue_last_work_ns, ds4_gpu_uptime_ns(), memory_order_relaxed);
+    uint64_t tick = ds4_gpu_uptime_ns(), last = tick;
+    for (; !g_queue_keepalive_stop; tick += period_ns, ds4_gpu_queue_keepalive_wait(tick)) {
+        const uint64_t now = ds4_gpu_uptime_ns();
+        if (now > tick + period_ns) tick = now; /* overslept: do not burst */
+        const uint64_t work = atomic_load_explicit(&g_queue_last_work_ns, memory_order_relaxed);
+        const uint64_t idle_ns = now > work ? now - work : 0;
+        if (hold_ns && idle_ns > hold_ns) continue;
         /* The thread starts when the queue is warmed, which can be before
          * the model residency set exists: decide on every tick. */
         id residency_set = nil;
@@ -11525,8 +11573,12 @@ static void *ds4_gpu_queue_keepalive_thread(void *arg) {
             [enc endEncoding];
             [cb commit];
         }
-        for (uint64_t slept = 0; slept < period_ms && !g_queue_keepalive_stop; slept += 50)
-            usleep(50000);
+        if (trace) {
+            const uint64_t done = ds4_gpu_uptime_ns();
+            fprintf(stderr, "ds4: keepalive tick interval %.1f ms renew %.2f ms idle %.1f s\n",
+                    (now - last) / 1e6, (done - now) / 1e6, idle_ns / 1e9);
+        }
+        last = now;
     }
     return NULL;
 }
@@ -11541,7 +11593,10 @@ static void ds4_gpu_queue_keepalive_start(void) {
 
 static void ds4_gpu_queue_keepalive_stop_thread(void) {
     if (!g_queue_keepalive_running) return;
+    pthread_mutex_lock(&g_queue_keepalive_mu);
     g_queue_keepalive_stop = 1;
+    pthread_cond_signal(&g_queue_keepalive_cv);
+    pthread_mutex_unlock(&g_queue_keepalive_mu);
     pthread_join(g_queue_keepalive_thread, NULL);
     g_queue_keepalive_running = 0;
 }
