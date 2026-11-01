@@ -322,6 +322,8 @@ enum {
     DS4_GPU_TEST_V41_GENERIC_MOE = 1u << 8,
 };
 void ds4_gpu_test_set_flags(uint32_t flags);
+/* Times a V4.1 specialized path (geometry MoE, fused router) was chosen. */
+uint64_t ds4_gpu_test_v41_specialized_count(void);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
 #else
 static inline int ds4_gpu_device_is_pre_m5_apple_silicon(void) { return 0; }

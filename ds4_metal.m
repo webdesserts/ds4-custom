@@ -2830,8 +2830,21 @@ int ds4_gpu_device_is_m5_apple_silicon(void) {
  * simdgroup changes. The down sum uses one row per simdgroup for a single
  * token (more threadgroups in flight) and two from two tokens.
  * Tests reach the generic kernels with DS4_GPU_TEST_V41_GENERIC_MOE. */
+static _Atomic uint64_t g_test_v41_specialized;
+
+uint64_t ds4_gpu_test_v41_specialized_count(void) {
+    return atomic_load_explicit(&g_test_v41_specialized, memory_order_relaxed);
+}
+
+/* Counts each time a V4.1 specialized path (geometry MoE, fused router) is
+ * chosen, so tests can prove a reference run really took the generic one. */
+static bool ds4_gpu_v41_specialized(bool on) {
+    if (on) atomic_fetch_add_explicit(&g_test_v41_specialized, 1, memory_order_relaxed);
+    return on;
+}
+
 static bool ds4_gpu_v41_moe_geometry_enabled(void) {
-    return (g_test_flags & DS4_GPU_TEST_V41_GENERIC_MOE) == 0u;
+    return ds4_gpu_v41_specialized((g_test_flags & DS4_GPU_TEST_V41_GENERIC_MOE) == 0u);
 }
 
 static bool ds4_gpu_ported_m5_decode_feature_enabled(
@@ -34456,7 +34469,7 @@ static int ds4_gpu_encode_sum_rows_f32(
 
 /* Tests reach the generic router chain with DS4_GPU_TEST_V41_GENERIC_ROUTER. */
 static bool ds4_gpu_v41_fused_router_enabled(void) {
-    return (g_test_flags & DS4_GPU_TEST_V41_GENERIC_ROUTER) == 0u;
+    return ds4_gpu_v41_specialized((g_test_flags & DS4_GPU_TEST_V41_GENERIC_ROUTER) == 0u);
 }
 
 static int ds4_gpu_encode_router_select(

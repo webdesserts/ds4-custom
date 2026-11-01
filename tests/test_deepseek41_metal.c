@@ -857,6 +857,7 @@ static int check_fused_router(void) {
             const unsigned rows = counts[ci];
             for (int v = 0; v < 2; v++) {
                 if (v) ds4_gpu_test_set_flags(DS4_GPU_TEST_V41_GENERIC_ROUTER);
+                const uint64_t chosen = ds4_gpu_test_v41_specialized_count();
                 memset(ds4_gpu_tensor_contents(p[v]), 0xa5, ROWS * N * sizeof(float));
                 memset(ds4_gpu_tensor_contents(ids[v]), 0xa5, ROWS * USED * sizeof(int32_t));
                 memset(ds4_gpu_tensor_contents(w[v]), 0xa5, ROWS * USED * sizeof(float));
@@ -867,6 +868,8 @@ static int check_fused_router(void) {
                         0, 0, 0, 0, 0, true, false, x, tok, N, USED, 1.5f, rows);
                 ds4_gpu_test_set_flags(0);
                 CHECK(ok && ds4_gpu_synchronize());
+                /* The reference run must really take the generic chain. */
+                CHECK((ds4_gpu_test_v41_specialized_count() != chosen) == (v == 0));
             }
             const size_t pb = (size_t)rows * N * sizeof(float), sb = (size_t)rows * USED * 4u;
             const int same_p = memcmp(ds4_gpu_tensor_contents(p[0]), ds4_gpu_tensor_contents(p[1]), pb) == 0;

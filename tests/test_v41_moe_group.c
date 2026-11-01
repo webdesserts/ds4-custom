@@ -215,10 +215,15 @@ static int read_all(ds4_gpu_tensor *t, void *dst, size_t bytes) {
 }
 
 /* One call with the geometry kernels on or off; outputs copied to host. */
+/* Geometry kernels chosen over the whole check: the reference runs must
+ * choose none, the geometry runs some, or the comparison proves nothing. */
+static uint64_t geometry_chosen;
+
 static int run_geometry(const moe_model *m, const moe_io *io, ds4_gpu_tensor *sel,
                         uint32_t rows, uint32_t layer, bool single, bool geometry,
                         float *out, float *gate, float *up, float *mid) {
     ds4_gpu_test_set_flags(geometry ? 0u : DS4_GPU_TEST_V41_GENERIC_MOE);
+    const uint64_t chosen = ds4_gpu_test_v41_specialized_count();
     const size_t pair = (size_t)rows * N_USED * MID * 4;
     /* Distinct fills per run, so an unwritten element cannot match. */
     const float fill = geometry ? -2.0f : -1.0f;
@@ -236,6 +241,9 @@ static int run_geometry(const moe_model *m, const moe_io *io, ds4_gpu_tensor *se
         CHECK(moe_call(m, io, sel, rows, layer));
     }
     CHECK(ds4_gpu_end_commands() && ds4_gpu_synchronize());
+    const uint64_t delta = ds4_gpu_test_v41_specialized_count() - chosen;
+    CHECK(geometry || delta == 0);
+    geometry_chosen += delta;
     return read_all(io->out, out, (size_t)rows * IN * 4) && read_all(io->gate, gate, pair) &&
         read_all(io->up, up, pair) && read_all(io->mid, mid, pair);
 }
@@ -280,7 +288,9 @@ static int check(void) {
         }
     }
     ds4_gpu_test_set_flags(0);
-    fprintf(stderr, "geometry check: %d passed, %d failed\n", passed, failed);
+    fprintf(stderr, "geometry check: %d passed, %d failed, geometry kernels chosen %llu times\n",
+            passed, failed, (unsigned long long)geometry_chosen);
+    CHECK(geometry_chosen > 0);
     ds4_gpu_tensor_free(sel);
     for (int i = 0; i < 8; i++) free(buf[i]);
     return failed == 0;
