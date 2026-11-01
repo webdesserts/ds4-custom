@@ -1,6 +1,6 @@
 /* Model-backed multi-session equivalence for the V4.1 shared workspace.
  *
- *   DS4_V41_SHARED_WORKSPACE=0|1 ./tests/test_v41_shared_sessions MODEL DRAFTER OUT
+ *   V41_SHARED=0|1 ./tests/test_v41_shared_sessions MODEL DRAFTER OUT
  *
  * Runs N sessions (default 4) twice on one engine: "alone" (each session is
  * created, prefilled in its own quanta, decoded with DSpark and plain steps,
@@ -12,7 +12,8 @@
  * line must match, and the per-session lines of "inter" must match "alone".
  * Session 0 has a >40k-token prompt so its single sync defers the decoder
  * across an encoder-only sweep (the carry outlives one sweep).
- * Env: V41_SESSIONS (1..4), V41_CTX (default 262144), V41_ROUNDS (12). */
+ * Env: V41_SHARED (default 1), V41_SESSIONS (1..4), V41_CTX (default 262144),
+ * V41_ROUNDS (12). */
 #include "ds4.h"
 
 #include <stdint.h>
@@ -199,7 +200,7 @@ int main(int argc, char **argv) {
         .model_path = argv[1], .mtp_path = argv[2], .backend = DS4_BACKEND_METAL,
         .context_size = ctx, .dspark = true,
         .placement_session_count_hint = nsessions,
-        .share_session_prefill_workspace = true,
+        .share_session_prefill_workspace = !(getenv("V41_SHARED") && !strcmp(getenv("V41_SHARED"), "0")),
     };
     if (ds4_engine_open(&engine, &opt) != 0) die("engine open", -1, NULL);
     out = fopen(argv[3], "w");

@@ -39,16 +39,12 @@ static void accounting(void) {
     assert(ds41_shared_workspace_enabled(&e));
     assert(ds41_planned_graph_bytes(&e, ctx, 1) == one);
     assert(ds41_planned_graph_bytes(&e, ctx, 4) == 4u * session + shared);
-    setenv("DS4_V41_SHARED_WORKSPACE", "0", 1);
+    e.share_session_prefill_workspace = false;
     assert(!ds41_shared_workspace_enabled(&e));
     assert(ds41_planned_graph_bytes(&e, ctx, 4) == 4u * one);
-    unsetenv("DS4_V41_SHARED_WORKSPACE");
-    e.share_session_prefill_workspace = false;
-    assert(ds41_planned_graph_bytes(&e, ctx, 4) == 4u * one);
-    setenv("DS4_V41_SHARED_WORKSPACE", "1", 1);
-    assert(ds41_planned_graph_bytes(&e, ctx, 4) == 4u * session + shared);
-    unsetenv("DS4_V41_SHARED_WORKSPACE");
-    e.share_session_prefill_workspace = true; e.backend = DS4_BACKEND_CUDA;
+    e.share_session_prefill_workspace = true; e.tp.active = true;
+    assert(!ds41_shared_workspace_enabled(&e));
+    e.tp.active = false; e.backend = DS4_BACKEND_CUDA;
     assert(!ds41_shared_workspace_enabled(&e));
     printf("ctx=%u graph: per session %.3f GiB + transients %.3f GiB = %.3f GiB; "
            "4 sessions %.3f GiB shared vs %.3f GiB private\n",

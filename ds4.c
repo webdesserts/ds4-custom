@@ -44003,14 +44003,9 @@ static uint64_t ds4_engine_streaming_transient_guard_bytes(
 
 #ifdef DS4_HAS_DEEPSEEK41_GPU
 /* Sessions share one ds41_workspace when the engine shares session prefill
- * workspaces (batched server, TP excluded) on Metal.
- * DS4_V41_SHARED_WORKSPACE=0 keeps private transients per session; =1 shares
- * them without the server flag (single-session checks). */
+ * workspaces (batched server, TP excluded) on Metal. */
 static bool ds41_shared_workspace_enabled(const ds4_engine *e) {
-    const char *v = getenv("DS4_V41_SHARED_WORKSPACE");
-    const bool want = v && !strcmp(v, "1") ? true :
-        v && !strcmp(v, "0") ? false : e->share_session_prefill_workspace;
-    return want && e->backend == DS4_BACKEND_METAL && !e->tp.active;
+    return e->share_session_prefill_workspace && e->backend == DS4_BACKEND_METAL && !e->tp.active;
 }
 
 /* Graph bytes planned for `sessions` sessions of `ctx` positions. */
