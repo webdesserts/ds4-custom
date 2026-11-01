@@ -22659,17 +22659,6 @@ int ds4_gpu_rms_norm_weight_tensor(
     return ds4_gpu_rms_norm_weight_rows_tensor(out, x, model_map, model_size, weight_offset, n, 1, eps);
 }
 
-static int ds4_gpu_rms_norm_weight_rows_impl(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *x,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint32_t                n,
-        uint32_t                rows,
-        float                   eps,
-        bool                    round_bf16);
-
 int ds4_gpu_rms_norm_weight_rows_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,
@@ -22679,38 +22668,8 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
         uint32_t                n,
         uint32_t                rows,
         float                   eps) {
-    return ds4_gpu_rms_norm_weight_rows_impl(out, x, model_map, model_size,
-        weight_offset, n, rows, eps, false);
-}
-
-int ds4_gpu_rms_norm_weight_rows_bf16_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *x,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint32_t                n,
-        uint32_t                rows,
-        float                   eps) {
-    return ds4_gpu_rms_norm_weight_rows_impl(out, x, model_map, model_size,
-        weight_offset, n, rows, eps, true);
-}
-
-static int ds4_gpu_rms_norm_weight_rows_impl(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *x,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint32_t                n,
-        uint32_t                rows,
-        float                   eps,
-        bool                    round_bf16) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (n == 0 || rows == 0 || (n & 3u) != 0) return 0;
-    id<MTLComputePipelineState> pipeline = round_bf16 ?
-        ds4_gpu_get_pipeline("kernel_rms_norm_mul_bf16_f32_4") : g_rms_norm_pipeline;
-    if (!pipeline) return 0;
 
     @autoreleasepool {
         id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
@@ -22742,7 +22701,7 @@ static int ds4_gpu_rms_norm_weight_rows_impl(
         if (!cb) return 0;
 
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:pipeline];
+        [enc setComputePipelineState:g_rms_norm_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
         [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:2];
