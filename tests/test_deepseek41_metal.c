@@ -1094,71 +1094,6 @@ static int check_fused_hc(void) {
 #endif
 
 #ifdef __APPLE__
-/* Fused BF16 rounding in F16/F32 matvec writers against the plain matvec
- * plus the separate pass: single row and decode-row plans, shapes covering
- * nr0 1/2/4 grids, a narrow grid, a K tail, F32 routers and a width the
- * float4 kernel cannot take (rounded must then be 0), rows 1..6. */
-static int check_fused_f16(void) {
-    enum { ROWS = 6 };
-    const struct { uint32_t in, out; bool f32; } shapes[] = {
-        {4096, 1024, false}, {5120, 24, false}, {1024, 5120, false}, {4100, 2048, false},
-        {4098, 512, false}, {5120, 384, true}, {5124, 384, true}};
-    for (size_t sh = 0; sh < sizeof(shapes) / sizeof(*shapes); sh++) {
-        const uint32_t in = shapes[sh].in, out_dim = shapes[sh].out;
-        const bool f32 = shapes[sh].f32;
-        const uint64_t wbytes = (uint64_t)in * out_dim * (f32 ? 4 : 2);
-        const uint64_t wb = (wbytes + 16383u) & ~(uint64_t)16383u;
-        const uint64_t xb = (uint64_t)ROWS * in * 4, ob = (uint64_t)ROWS * out_dim * 4;
-        void *model = NULL;
-        CHECK(posix_memalign(&model, getpagesize(), wb) == 0);
-        if (f32) { float *w = model; for (uint64_t i = 0; i < wbytes / 4; i++) w[i] = random_value(); }
-        else {
-            uint16_t *w = model;
-            for (uint64_t i = 0; i < wbytes / 2; i++) {
-                const uint32_t v = (uint32_t)(random_value() * 8192) * 2654435761u + (uint32_t)i;
-                w[i] = (uint16_t)((v & 0x8000u) | ((1u + (v >> 3) % 29u) << 10) | (v & 0x3ffu));
-            }
-        }
-        float *x = malloc(xb), *plain = malloc(ob), *fused = malloc(ob);
-        CHECK(x && plain && fused);
-        for (uint64_t i = 0; i < xb / 4; i++) x[i] = random_value();
-        ds4_gpu_tensor *xt = upload(x, xb), *ot = upload(NULL, ob);
-        CHECK(xt && ot && ds4_gpu_set_model_map(model, wb));
-        for (uint32_t rows = 1; rows <= ROWS; rows++) {
-            ds4_gpu_tensor *o = ds4_gpu_tensor_view(ot, 0, (uint64_t)rows * out_dim * 4);
-            CHECK(o);
-            CHECK(ds4_gpu_tensor_fill_f32(ot, NAN, ob / 4));
-            CHECK(ds4_gpu_begin_commands());
-            if (rows == 1) CHECK(f32 ? ds4_gpu_matmul_f32_tensor(o, model, wb, 0, in, out_dim, xt, 1) :
-                                       ds4_gpu_matmul_f16_tensor(o, model, wb, 0, in, out_dim, xt, 1));
-            else CHECK(f32 ? ds4_gpu_dsv41_projection_rows_f32(o, model, wb, 0, in, out_dim, rows, xt) :
-                             ds4_gpu_dsv41_projection_rows(o, model, wb, 0, in, out_dim, rows, xt));
-            CHECK(ds4_gpu_dsv41_quantize(o, out_dim, rows, DS4_V41_BF16));
-            CHECK(ds4_gpu_end_commands());
-            CHECK(ds4_gpu_tensor_read(ot, 0, plain, ob));
-            CHECK(ds4_gpu_tensor_fill_f32(ot, NAN, ob / 4));
-            int rounded = -1;
-            CHECK(ds4_gpu_begin_commands());
-            CHECK(ds4_gpu_dsv41_projection_bf16(o, model, wb, 0, f32, in, out_dim, rows, xt, &rounded));
-            if (!rounded) CHECK(ds4_gpu_dsv41_quantize(o, out_dim, rows, DS4_V41_BF16));
-            CHECK(ds4_gpu_end_commands());
-            CHECK(ds4_gpu_tensor_read(ot, 0, fused, ob));
-            if (memcmp(fused, plain, (uint64_t)rows * out_dim * 4) || rounded != (in % 4 == 0))
-                fprintf(stderr, "fused f16 mismatch %ux%u f32=%d rows=%u rounded=%d\n", in, out_dim, f32, rows, rounded);
-            CHECK(!memcmp(fused, plain, (uint64_t)rows * out_dim * 4));
-            CHECK(rounded == (in % 4 == 0));
-            for (uint64_t i = (uint64_t)rows * out_dim; i < ob / 4; i++) CHECK(isnan(fused[i]));
-            ds4_gpu_tensor_free(o);
-        }
-        fprintf(stderr, "V4.1 fused BF16 %s matvec %ux%u rows 1..%u: PASS\n", f32 ? "F32" : "F16", in, out_dim, ROWS);
-        ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(ot);
-        free(x); free(plain); free(fused); free(model);
-    }
-    return 1;
-}
-#endif
-
-#ifdef __APPLE__
 /* Fused BF16 rounding in swiglu (with and without the clamp) and in the
  * two-input add, against the plain kernels plus the separate pass; inputs
  * span the clamp, NaN and overflow. */
@@ -2351,11 +2286,6 @@ int main(int argc, char **argv) {
     }
     if (argc == 2 && !strcmp(argv[1], "--fused-ew")) {
         const int ok = ds4_gpu_init() && check_fused_ew();
-        ds4_gpu_cleanup();
-        return ok ? 0 : 1;
-    }
-    if (argc == 2 && !strcmp(argv[1], "--fused-f16")) {
-        const int ok = ds4_gpu_init() && check_fused_f16();
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }

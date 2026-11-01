@@ -119,7 +119,7 @@ static inline void helper_mv_reduce_and_write(
         float tot = simd_sum(shmem_f32[row][tiisg]);
 
         if (tiisg == 0 && sgitg == 0) {
-            dst_f32[r0 + row] = FC_mul_mv_bf16 ? ds4_mv_round_bf16(tot) : tot;
+            dst_f32[r0 + row] = tot;
         }
     }
 }

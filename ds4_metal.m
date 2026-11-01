@@ -21254,9 +21254,7 @@ static int ds4_gpu_matmul_f16_tensor_impl(
         uint64_t                n_tok,
         bool                    exact_rows,
         uint64_t                x_stride,
-        uint64_t                out_stride,
-        int                    *rounded) {
-    if (rounded) *rounded = 0;
+        uint64_t                out_stride) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) return 0;
     /* Row strides in floats; 0 means packed rows. Only exact-row calls
@@ -21328,14 +21326,9 @@ static int ds4_gpu_matmul_f16_tensor_impl(
                 out_groups);
             mv_dispatch.function_name = plan.name;
             mv_dispatch.smem *= plan.nr1;
-            /* Float4 kernels can round to BF16 in their writer. */
-            const bool fuse_bf16 = rounded &&
-                !strncmp(mv_dispatch.function_name, "kernel_mul_mv_f16_f32_4", 23);
-            id<MTLComputePipelineState> pipeline = fuse_bf16 ?
-                ds4_gpu_get_mul_mv_bf16_pipeline(mv_dispatch.function_name, mv_dispatch.nsg) :
+            id<MTLComputePipelineState> pipeline =
                 ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
             if (!pipeline) return 0;
-            if (fuse_bf16) *rounded = 1;
 
             id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
             [enc setComputePipelineState:pipeline];
@@ -21466,13 +21459,13 @@ int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out,
                             uint64_t out_dim, const ds4_gpu_tensor *x,
                             uint64_t n_tok) {
     return ds4_gpu_matmul_f16_tensor_impl(out, model_map, model_size,
-        weight_offset, in_dim, out_dim, x, n_tok, false, 0, 0, NULL);
+        weight_offset, in_dim, out_dim, x, n_tok, false, 0, 0);
 }
 
 static int ds4_gpu_matmul_f32_tensor_impl(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
-        const ds4_gpu_tensor *x, uint64_t n_tok, bool exact_rows, int *rounded);
+        const ds4_gpu_tensor *x, uint64_t n_tok, bool exact_rows);
 
 int ds4_gpu_matmul_f32_tensor(
         ds4_gpu_tensor       *out,
@@ -21484,7 +21477,7 @@ int ds4_gpu_matmul_f32_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok) {
     return ds4_gpu_matmul_f32_tensor_impl(out, model_map, model_size,
-        weight_offset, in_dim, out_dim, x, n_tok, false, NULL);
+        weight_offset, in_dim, out_dim, x, n_tok, false);
 }
 
 int ds4_gpu_dsv41_projection_rows_f32(ds4_gpu_tensor *out,
@@ -21494,20 +21487,7 @@ int ds4_gpu_dsv41_projection_rows_f32(ds4_gpu_tensor *out,
                                  const ds4_gpu_tensor *in) {
     if (!width || !outputs || !rows || rows > 8192u || !model_map) return 0;
     return ds4_gpu_matmul_f32_tensor_impl(out, model_map, model_size,
-        weight_offset, width, outputs, in, rows, true, NULL);
-}
-
-int ds4_gpu_dsv41_projection_bf16(ds4_gpu_tensor *out,
-                                 const void *model_map, uint64_t model_size,
-                                 uint64_t weight_offset, bool f32_weights,
-                                 uint32_t width, uint32_t outputs, uint32_t rows,
-                                 const ds4_gpu_tensor *in, int *rounded) {
-    if (!width || !outputs || !rows || rows > 8192u || !model_map || !rounded) return 0;
-    return f32_weights ?
-        ds4_gpu_matmul_f32_tensor_impl(out, model_map, model_size,
-            weight_offset, width, outputs, in, rows, rows > 1, rounded) :
-        ds4_gpu_matmul_f16_tensor_impl(out, model_map, model_size,
-            weight_offset, width, outputs, in, rows, rows > 1, 0, 0, rounded);
+        weight_offset, width, outputs, in, rows, true);
 }
 
 int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out,
@@ -21517,7 +21497,7 @@ int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out,
                                  const ds4_gpu_tensor *in) {
     if (!width || !outputs || !rows || rows > 8192u || !model_map) return 0;
     return ds4_gpu_matmul_f16_tensor_impl(out, model_map, model_size,
-        weight_offset, width, outputs, in, rows, true, 0, 0, NULL);
+        weight_offset, width, outputs, in, rows, true, 0, 0);
 }
 
 int ds4_gpu_dsv41_projection_rows_strided(ds4_gpu_tensor *out,
@@ -21528,7 +21508,7 @@ int ds4_gpu_dsv41_projection_rows_strided(ds4_gpu_tensor *out,
                                  uint64_t in_stride, uint64_t out_stride) {
     if (!width || !outputs || !rows || rows > 8192u || !model_map) return 0;
     return ds4_gpu_matmul_f16_tensor_impl(out, model_map, model_size,
-        weight_offset, width, outputs, in, rows, true, in_stride, out_stride, NULL);
+        weight_offset, width, outputs, in, rows, true, in_stride, out_stride);
 }
 
 int ds4_gpu_matmul_f16_pair_tensor(
@@ -22219,9 +22199,7 @@ static int ds4_gpu_matmul_f32_tensor_impl(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok,
-        bool                    exact_rows,
-        int                    *rounded) {
-    if (rounded) *rounded = 0;
+        bool                    exact_rows) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok == 0 || n_tok > UINT32_MAX) return 0;
     if (in_dim > UINT64_MAX / n_tok / sizeof(float) ||
@@ -22280,14 +22258,9 @@ static int ds4_gpu_matmul_f32_tensor_impl(
                 out_groups);
             mv_dispatch.function_name = plan.name;
             mv_dispatch.smem *= plan.nr1;
-            /* Float4 kernels can round to BF16 in their writer. */
-            const bool fuse_bf16 = rounded &&
-                !strncmp(mv_dispatch.function_name, "kernel_mul_mv_f32_f32_4", 23);
-            id<MTLComputePipelineState> pipeline = fuse_bf16 ?
-                ds4_gpu_get_mul_mv_bf16_pipeline(mv_dispatch.function_name, mv_dispatch.nsg) :
+            id<MTLComputePipelineState> pipeline =
                 ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
             if (!pipeline) return 0;
-            if (fuse_bf16) *rounded = 1;
 
             id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
             [enc setComputePipelineState:pipeline];

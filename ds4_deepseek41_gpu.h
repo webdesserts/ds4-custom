@@ -141,14 +141,6 @@ int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out,
                                  uint64_t weight_offset, uint32_t width,
                                  uint32_t outputs, uint32_t rows,
                                  const ds4_gpu_tensor *in);
-/* F16 (or F32) projection of one or more rows (exact decode-row plan for
- * several) that rounds outputs to BF16 in the matvec writer when the plan's
- * kernel supports it, reporting that in *rounded (else the caller rounds). */
-int ds4_gpu_dsv41_projection_bf16(ds4_gpu_tensor *out,
-                                 const void *model_map, uint64_t model_size,
-                                 uint64_t weight_offset, bool f32_weights,
-                                 uint32_t width, uint32_t outputs, uint32_t rows,
-                                 const ds4_gpu_tensor *in, int *rounded);
 /* F32 weights (routers), same exactness as individual matvecs. */
 int ds4_gpu_dsv41_projection_rows_f32(ds4_gpu_tensor *out,
                                  const void *model_map, uint64_t model_size,
