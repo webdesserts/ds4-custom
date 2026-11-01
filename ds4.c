@@ -42593,12 +42593,11 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
         ds41_sum_partial_batch(g, b->routed, il, DS4_TP_GATE_FFN, count);
 }
 
-/* DS4_V41_DECODE_OVERLAP=0 restores the per-layer drain of single-token
- * V4.1 decode; results are identical either way. Metal only, as for verify. */
+/* Single-token V4.1 decode overlaps encoding with GPU work on Metal; other
+ * backends drain per layer. Results are identical either way. */
 static bool ds41_decode_overlap_enabled(void) {
 #ifdef __APPLE__
-    const char *v = getenv("DS4_V41_DECODE_OVERLAP");
-    return !v || strcmp(v, "0") != 0;
+    return true;
 #else
     return false;
 #endif
