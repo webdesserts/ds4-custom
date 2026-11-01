@@ -330,6 +330,27 @@ static inline bool ds41_raw_read(ds41_raw_store *s, uint32_t first_record,
     }
     return true;
 }
+/* Asks the kernel to start reading committed records in the background. An
+ * evicted store reads at device speed; advising every range a rebase will
+ * import before the prefix runs overlaps that I/O with the prefix, stages
+ * and import copies. Advisory only: errors are ignored, reads stay checked. */
+static inline void ds41_raw_advise(ds41_raw_store *s, uint32_t first_record, uint32_t records) {
+#ifdef __APPLE__
+    if (!s || s->fd < 0 || !s->readable || first_record > s->committed_tokens / 8u) return;
+    if (records > s->committed_tokens / 8u - first_record)
+        records = s->committed_tokens / 8u - first_record;
+    uint64_t offset = (uint64_t)first_record * DS41_RAW_RECORD_BYTES;
+    uint64_t left = (uint64_t)records * DS41_RAW_RECORD_BYTES;
+    while (left) {
+        const uint64_t n = left < (UINT64_C(1) << 30) ? left : (UINT64_C(1) << 30);
+        struct radvisory advice = {.ra_offset = (off_t)offset, .ra_count = (int)n};
+        if (fcntl(s->fd, F_RDADVISE, &advice) == -1) return;
+        offset += n; left -= n;
+    }
+#else
+    (void)s; (void)first_record; (void)records;
+#endif
+}
 static inline bool ds41_raw_arena_offset(uint32_t origin, uint32_t token,
                                          uint32_t layer, uint64_t *offset) {
     if (!offset || origin % 8u || token < origin || token - origin >= DS41_RAW_ARENA_TOKENS || layer >= 40u)
@@ -3285,6 +3306,12 @@ static int ds41_scr_multi_selected(ds4_session *s, const ds4_tokens *request,
             goto done;
         }
         r->rebase_prepared = true;
+        for (uint32_t i = 0; a && i < selected; ++i) {
+            const uint32_t offset = plan[i].source_start - a->start;
+            ds41_raw_advise(a->raw, offset / DS41_RAW_RECORD_TOKENS,
+                            (offset + plan[i].count + 7u) / DS41_RAW_RECORD_TOKENS -
+                                offset / DS41_RAW_RECORD_TOKENS);
+        }
         r->archive_bytes = ds4_session_scr_archive_bytes(s);
     }
     tokens = malloc((size_t)request->len * sizeof(int));
