@@ -46,6 +46,8 @@ for name in test_scr_append test_scr_rebase_owned test_scr_rebase_failures test_
             test_v41_memory_admission; do
     run "$name" "tests/$name.c" $HOST $ENGINE_AUX "$PLANNER_LIB"
 done
+# The rebase import without its read-only map: pread and gather, same bytes.
+run test_scr_rebase_owned_pread tests/test_scr_rebase_owned.c -DSCR_TEST_NO_MMAP $HOST $ENGINE_AUX "$PLANNER_LIB"
 # Serving: CLI, HTTP worker behaviour and ds4.reuse.v1 telemetry.
 run test_engram_reader_observation tests/test_engram_reader_observation.c
 for name in test_scr_server_cli test_server_contract test_server_progress test_server_upstream_reuse; do

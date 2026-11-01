@@ -18,6 +18,7 @@ static ssize_t fault_pwrite(int, const void *, size_t, off_t);
 typedef enum {
     MISSING_LAYER, WRONG_M_HEAD, WRONG_N_HEAD, CANCEL_TAIL,
     IMPORT_SHORT_READ, IMPORT_CANCEL, IMPORT_BAD_FD, PREFETCH_READ_ERROR, WRITE_CANCEL,
+    IMPORT_TRUNCATED, IMPORT_MAP_CANCEL,
     DESTINATION_CLEANUP_REFUSAL, OLD_RETIREMENT_REFUSAL, WRONG_MAP_POSITION,
     UNSAFE_PAD_CLIP, WRONG_M_CERTIFICATE, MISSING_DESTINATION,
     CANCEL_AFTER_RETIREMENT, WRONG_DESTINATION_TOKENS, WRONG_IMPORTED_RECEIPT,
@@ -26,7 +27,7 @@ typedef enum {
 static const char *const fault_names[] = {
     "missing computed layer", "wrong covered head", "wrong final head", "cancelled tail",
     "imported short read", "cancelled import", "corrupt old fd", "read-ahead I/O error",
-    "postwrite cancellation",
+    "postwrite cancellation", "old file truncated before import", "cancelled mapped import",
     "destination cleanup refusal", "old retirement refusal", "wrong pad position",
     "unsafe clipped pad endpoint", "wrong covered certificate", "missing destination",
     "cancellation after irreversible retirement", "wrong destination tokens", "wrong imported receipt",
@@ -44,6 +45,16 @@ static ssize_t fault_pread(int fd, void *bytes, size_t count, off_t offset) {
     ds41_gpu_graph *g = session ? &session->ds41_graph : NULL;
     bool importing = faults_enabled && g && g->archive && g->archive_pending &&
         g->archive_capture_pending && g->archive->range.valid && fd == g->archive->raw->fd;
+    if (faults_enabled && fault == IMPORT_TRUNCATED && g && g->archive && g->archive_pending &&
+        g->archive_capture_pending && fd == g->archive->raw->fd &&
+        pthread_equal(pthread_self(), owner_thread) && !events) {
+        /* The first stage read succeeds; the import that follows must then
+         * refuse the shrunken store instead of mapping past its end. */
+        ++events;
+        ssize_t result = pread(fd, bytes, count, offset);
+        CHECK(!ftruncate(fd, (off_t)ds41_raw_bytes(8u)));
+        return result;
+    }
     if (importing && (fault == IMPORT_SHORT_READ || fault == IMPORT_CANCEL || fault == IMPORT_BAD_FD)) {
         ++import_reads; ++events;
         if (fault == IMPORT_BAD_FD) {
@@ -66,6 +77,7 @@ static ssize_t fault_pwrite(int fd, const void *bytes, size_t count, off_t offse
         result == (ssize_t)count) { ++events; cancel_now = true; }
     return result;
 }
+static void cancel_on_map(void) { ++events; cancel_now = true; }
 static uint64_t digest_bytes(uint64_t digest, const unsigned char *bytes, size_t count) {
     for (size_t i = 0; i < count; ++i) digest = (digest ^ bytes[i]) * UINT64_C(1099511628211);
     return digest;
@@ -156,6 +168,10 @@ static void run_fault(fault_case mode) {
     s.scr_policy_active = true; s.scr_dense_owner = &owner;
     CHECK(ds41_policy_bind_coordinates(&owner, &map, heap));
     controls(tokens, 315u); faults_enabled = true;
+    /* The pread faults exercise the unmapped import; the mapped one is
+     * cancelled as it maps the source. */
+    refuse_maps = mode == IMPORT_SHORT_READ || mode == IMPORT_CANCEL || mode == IMPORT_BAD_FD;
+    map_event = mode == IMPORT_MAP_CANCEL ? cancel_on_map : NULL;
     if (mode == MISSING_LAYER || mode == DESTINATION_CLEANUP_REFUSAL) omit_pos = 310;
     if (mode == WRONG_M_HEAD) bad_head_pos = 312;
     if (mode == WRONG_N_HEAD) bad_head_pos = 315;
@@ -215,18 +231,21 @@ static void run_fault(fault_case mode) {
                       fcntl(destination_fd, F_GETFD) >= 0);
             } else CHECK(!g->archive_pending && engine.ds41_session_bytes == old_charge);
         }
-        if (mode == IMPORT_SHORT_READ || mode == IMPORT_BAD_FD || mode == PREFETCH_READ_ERROR)
+        if (mode == IMPORT_SHORT_READ || mode == IMPORT_BAD_FD || mode == PREFETCH_READ_ERROR ||
+            mode == IMPORT_TRUNCATED)
             CHECK(events && old->retiring && !old->raw->readable);
         /* The failed read-ahead belongs to range 2: range 1 was installed, range 2 never staged. */
         if (mode == PREFETCH_READ_ERROR)
             CHECK(r.installed_spans == 1u && r.materialized_spans == 1u && !r.prefetched_spans &&
                   r.gap_completed[0] == 10u && r.partial_work_unknown);
-        if (mode == IMPORT_CANCEL || mode == WRITE_CANCEL || mode == CANCEL_TAIL)
+        if (mode == IMPORT_CANCEL || mode == WRITE_CANCEL || mode == CANCEL_TAIL ||
+            mode == IMPORT_MAP_CANCEL)
             CHECK(rc == DS4_SESSION_SYNC_INTERRUPTED && old->raw->readable && !old->retiring);
-        if (mode == IMPORT_CANCEL || mode == WRITE_CANCEL) CHECK(events);
+        if (mode == IMPORT_CANCEL || mode == WRITE_CANCEL || mode == IMPORT_MAP_CANCEL) CHECK(events);
     }
     faults_enabled = false; cancel_now = false; cancel_after_close_fd = -1;
-    if (mode != CANCEL_AFTER_RETIREMENT && mode != IMPORT_BAD_FD)
+    refuse_maps = false; map_event = NULL;
+    if (mode != CANCEL_AFTER_RETIREMENT && mode != IMPORT_BAD_FD && mode != IMPORT_TRUNCATED)
         CHECK(immutable_digest(old) == digest && !memcmp(old->tokens, source, sizeof(source)) &&
               old->end == 512u && old->source_generation == source_generation);
     owner.active = false; s.scr_dense_owner = NULL; s.scr_policy_active = false;

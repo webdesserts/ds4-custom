@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
@@ -329,6 +330,27 @@ static inline bool ds41_raw_read(ds41_raw_store *s, uint32_t first_record,
         ds4_observation_add_u64(&s->read_bytes, (uint64_t)n, &s->counters_overflow);
     }
     return true;
+}
+/* Read-only map of every committed record, or NULL (callers then pread). The
+ * store is unlinked (ds41_raw_identity requires no links), so only this
+ * process can shrink it, and the identity check proves the committed bytes
+ * exist before mapping. The pages are the file's page cache: clean and
+ * file-backed, not process footprint. */
+static inline const unsigned char *ds41_raw_map(ds41_raw_store *s, uint64_t *bytes) {
+    struct stat st;
+    *bytes = 0;
+    if (!s || !s->readable || !s->committed_tokens) return NULL;
+    if (!ds41_raw_identity(s, &st)) { s->readable = s->writable = false; return NULL; }
+    const uint64_t length = ds41_raw_bytes(s->committed_tokens);
+    if (length > SIZE_MAX) return NULL;
+    void *map = mmap(NULL, (size_t)length, PROT_READ, MAP_SHARED, s->fd, 0);
+    if (map == MAP_FAILED) return NULL;
+    (void)madvise(map, (size_t)length, MADV_SEQUENTIAL);
+    *bytes = length;
+    return map;
+}
+static inline void ds41_raw_unmap(const unsigned char *map, uint64_t bytes) {
+    if (map) (void)munmap((void *)map, (size_t)bytes);
 }
 static inline bool ds41_raw_arena_offset(uint32_t origin, uint32_t token,
                                          uint32_t layer, uint64_t *offset) {
@@ -1260,14 +1282,58 @@ static bool ds41_rebase_import_owners(ds41_scr_archive *destination,
 
 /* At most 128 rows (one window read), including partial source records and partial target records.
  * Neighboring fresh/imported rows in the destination arena remain untouched. */
+/* With `mapped` (ds41_raw_map of the source, `mapped_bytes` long), rows go
+ * straight from the mapping into the destination arena: one copy instead of
+ * pread, gather and arena write. The bytes written are the same. */
+static bool ds41_rebase_import_mapped(ds41_scr_archive *destination, ds41_scr_archive *source,
+                                      const unsigned char *mapped, uint64_t mapped_bytes,
+                                      uint32_t offset, uint32_t target_start, uint32_t count) {
+    if ((uint64_t)(offset + count + 7u) / DS41_RAW_RECORD_TOKENS * DS41_RAW_RECORD_BYTES > mapped_bytes)
+        return false;
+    for (uint32_t layer = 0; layer < 40u; ++layer) {
+        for (uint32_t row = 0; row < count; ++row)
+            if (destination->raw_tags[layer][target_start - destination->raw_origin + row] !=
+                    UINT32_MAX) return false;
+        for (uint32_t copied = 0; copied < count;) {
+            const uint32_t position = target_start + copied, from = offset + copied;
+            uint32_t rows = 8u - position % 8u;
+            if (rows > 8u - from % 8u) rows = 8u - from % 8u;
+            if (rows > count - copied) rows = count - copied;
+            uint64_t arena_offset;
+            if (!ds41_raw_arena_offset(destination->raw_origin, position, layer, &arena_offset) ||
+                !ds4_gpu_tensor_write(destination->raw_arena, arena_offset,
+                    mapped + (uint64_t)(from / 8u) * DS41_RAW_RECORD_BYTES +
+                        (uint64_t)(layer * 8u + from % 8u) * DS41_RAW_ROW_BYTES,
+                    (uint64_t)rows * DS41_RAW_ROW_BYTES)) return false;
+            copied += rows;
+        }
+    }
+    ds4_observation_add_u64(&source->raw->read_bytes, (uint64_t)count * 40u * DS41_RAW_ROW_BYTES,
+                            &source->raw->counters_overflow);
+    return true;
+}
 static bool ds41_rebase_import_raw(ds41_scr_archive *destination,
                                    ds41_scr_archive *source,
                                    uint32_t source_start, uint32_t target_start,
-                                   uint32_t count) {
+                                   uint32_t count, const unsigned char *mapped,
+                                   uint64_t mapped_bytes) {
     const uint32_t offset = source_start - source->start;
     const uint32_t first = offset / DS41_RAW_RECORD_TOKENS;
     const uint32_t records = (offset + count + 7u) / DS41_RAW_RECORD_TOKENS - first;
     double began = ds41_archive_observation_time(source);
+    if (mapped) {
+        bool ok = ds41_rebase_import_mapped(destination, source, mapped, mapped_bytes,
+                                            offset, target_start, count);
+        source->raw_gather_seconds += ds41_archive_observation_time(source) - began;
+        if (!ok || !ds4_gpu_synchronize() || ds4_gpu_commands_active() ||
+            (destination->cancelled && destination->cancelled((void *)destination->session)))
+            return false;
+        for (uint32_t layer = 0; layer < 40u; ++layer)
+            for (uint32_t row = 0; row < count; ++row)
+                destination->raw_tags[layer][target_start - destination->raw_origin + row] =
+                    target_start + row;
+        return true;
+    }
     bool ok = ds41_raw_read(source->raw, first, records, source->raw_io,
         DS41_ARCHIVE_READ_BYTES, source->cancelled, (void *)source->session);
     source->raw_read_seconds += ds41_archive_observation_time(source) - began;
@@ -1309,13 +1375,15 @@ static bool ds41_rebase_import_raw(ds41_scr_archive *destination,
 static bool ds41_rebase_import_chunk(ds41_scr_archive *destination,
                                      ds41_scr_archive *source,
                                      uint32_t source_start, uint32_t target_start,
-                                     uint32_t count) {
+                                     uint32_t count, const unsigned char *mapped,
+                                     uint64_t mapped_bytes) {
     if (!ds41_rebase_import_bounds(destination, source, source_start, target_start, count)) {
         errno = EINVAL; return false;
     }
     if ((destination->cancelled && destination->cancelled((void *)destination->session)) ||
         !ds4_gpu_synchronize() ||
-        !ds41_rebase_import_raw(destination, source, source_start, target_start, count)) {
+        !ds41_rebase_import_raw(destination, source, source_start, target_start, count,
+                                mapped, mapped_bytes)) {
         destination->lost = true;
         return false;
     }
@@ -2862,29 +2930,32 @@ static bool ds41_session_rebase_import(ds4_session *s, const ds4_scr_range *rang
         next->captured_end != range->destination_start ||
         !ds41_rebase_import_range_owners(next, old, range->source_start,
                                          range->destination_start, range->count)) return false;
-    for (uint32_t copied = 0; copied < range->count;) {
+    /* Without a mapping the chunks pread and gather as before. */
+    uint64_t mapped_bytes;
+    const unsigned char *mapped = ds41_raw_map(old->raw, &mapped_bytes);
+    bool ok = true;
+    for (uint32_t copied = 0; ok && copied < range->count;) {
         /* One window read per chunk; flush only a full arena or a finished range. */
         uint32_t occupied = next->captured_end - next->raw_origin;
-        if (occupied > next->raw_arena_tokens) return false;
+        if (occupied > next->raw_arena_tokens) { ok = false; break; }
         uint32_t chunk = range->count - copied, room = next->raw_arena_tokens - occupied;
         if (chunk > room) chunk = room;
         if (chunk > 128u) chunk = 128u;
         chunk &= ~1u;
-        if (!chunk || !ds41_session_rebase_pin(s) ||
-            memcmp(next->tokens + range->destination_start + copied,
-                   old->tokens + range->source_start - old->start + copied,
-                   (size_t)chunk * sizeof(int)) ||
-            !ds41_rebase_import_chunk(next, old, range->source_start + copied,
-                                      range->destination_start + copied, chunk))
-            return false;
-        const bool arena_full = next->captured_end - next->raw_origin == next->raw_arena_tokens;
-        if ((arena_full || copied + chunk == range->count) &&
-            !ds41_archive_flush_ready(next, next->captured_end, ds41_archive_raw_cancel, s))
-            return false;
-        next->imported_tokens += chunk;
-        copied += chunk;
+        const bool arena_full = next->captured_end + chunk - next->raw_origin == next->raw_arena_tokens;
+        ok = chunk && ds41_session_rebase_pin(s) &&
+            !memcmp(next->tokens + range->destination_start + copied,
+                    old->tokens + range->source_start - old->start + copied,
+                    (size_t)chunk * sizeof(int)) &&
+            ds41_rebase_import_chunk(next, old, range->source_start + copied,
+                                     range->destination_start + copied, chunk,
+                                     mapped, mapped_bytes) &&
+            (!(arena_full || copied + chunk == range->count) ||
+             ds41_archive_flush_ready(next, next->captured_end, ds41_archive_raw_cancel, s));
+        if (ok) { next->imported_tokens += chunk; copied += chunk; }
     }
-    return true;
+    ds41_raw_unmap(mapped, mapped_bytes);
+    return ok;
 }
 static int ds41_session_rebase_cover(ds4_session *s, const int *tokens, float *logits,
                                      ds4_scr_multi_receipt *receipt) {
