@@ -43856,6 +43856,9 @@ struct ds4_engine {
 #endif
     ds4_model model;
     ds4_model mtp_model;
+    /* Bytes of the --mtp-model file, charged by V4.1 admission before the
+     * support model is mapped (mtp_model.size takes over once it is). */
+    uint64_t mtp_reserve_bytes;
     ds4_model vision_model;
     ds4_vocab vocab;
     ds4_weights weights;
@@ -72561,7 +72564,7 @@ static bool ds41_memory_weights(const ds4_engine *e, uint64_t *out) {
     uint64_t weights = g_tp_shard_model_bytes ? g_tp_shard_model_bytes : e->model.size;
     if (e->ssd_streaming && !weights_streaming_non_routed_bytes(&e->weights, &weights)) return false;
     weights = ds4_add_sat_u64(weights, e->vision_model.size);
-    *out = ds4_add_sat_u64(weights, e->mtp_model.size);
+    *out = ds4_add_sat_u64(weights, e->mtp_model.size ? e->mtp_model.size : e->mtp_reserve_bytes);
     return true;
 }
 
@@ -73301,6 +73304,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
         const uint32_t ctx = opt->context_size > 0 ? (uint32_t)opt->context_size : 4096;
         const uint32_t sessions = e->placement_session_count_hint > 0 ?
             (uint32_t)e->placement_session_count_hint : 1;
+        /* The support model (DSpark/MTP) is mapped later in open; charge it now. */
+        struct stat mtp_stat;
+        if (opt->mtp_path && opt->mtp_path[0] && opt->distributed.role == DS4_DISTRIBUTED_NONE &&
+            stat(opt->mtp_path, &mtp_stat) == 0 && mtp_stat.st_size > 0)
+            e->mtp_reserve_bytes = (uint64_t)mtp_stat.st_size;
         if (!ds41_memory_admit(e, ds41_planned_graph_bytes(e, ctx, sessions), true)) {
             ds4_engine_close(e);
             *out = NULL;
