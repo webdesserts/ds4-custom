@@ -632,18 +632,14 @@ static void engram_async_row_run(void *context, size_t col) {
     if (!engram_read(&item->table, &item->ids[col], 1, item->out + col * DS4_ENGRAM_DIM, o))
         rows->error[col] = errno ? errno : EIO;
 }
-
-static bool engram_async_rows_enabled(void) {
-    const char *v = getenv("DS4_ENGRAM_ASYNC_ROWS");
-    return !v || strcmp(v, "0") != 0;
-}
 #endif
 
 static void engram_async_item_run(void *context) {
     engram_async_item *item = context;
     errno = 0;
 #ifdef __APPLE__
-    if (engram_async_rows_enabled()) {
+    {
+        /* A token's 24 rows are read concurrently. */
         engram_async_rows rows = {.item = item};
         ds4_engram_observation *o = item->observe ? &item->observation : NULL;
         if (o) *o = (ds4_engram_observation){.enabled = true, .calls = 1};
