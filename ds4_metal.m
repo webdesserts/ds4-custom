@@ -1400,13 +1400,7 @@ static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *labe
     return 1;
 }
 
-/* Uptime (ns) when the engine last created a command buffer; the queue
- * keepalive stops renewing after DS4_METAL_QUEUE_KEEPALIVE_HOLD_S of idle. */
-static _Atomic uint64_t g_queue_last_work_ns;
-
 static id<MTLCommandBuffer> ds4_gpu_new_command_buffer(void) {
-    atomic_store_explicit(&g_queue_last_work_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW),
-                          memory_order_relaxed);
     static int initialized;
     static int use_unretained;
     if (!initialized) {
@@ -11499,16 +11493,11 @@ int ds4_gpu_warm_command_queue(void) {
  * resident, but once it has lapsed (between 2 and 3 s) renewing re-establishes
  * it: 0.2-3.8 s of system time.  Periods of 2 s already lapse sometimes and
  * 3 s about every other tick, so 1 s is the setting that is both free and
- * keeps first tokens fast.  Knobs:
- *   DS4_METAL_QUEUE_KEEPALIVE_MODE=submit  commit a 1 KB kernel instead
- *       (the original keepalive; ~25% of a core while idle)
- *   DS4_METAL_QUEUE_KEEPALIVE_MODE=off     no keepalive (as
- *       DS4_METAL_DISABLE_QUEUE_KEEPALIVE=1): ~0.8 s slower first token
- *   DS4_METAL_QUEUE_KEEPALIVE_MS=N         period (default 1000)
- *   DS4_METAL_QUEUE_KEEPALIVE_HOLD_S=N     stop renewing after N s without
- *       engine work (default 0: never); the first token after that is slow
- *   DS4_METAL_QUEUE_KEEPALIVE_TRACE=1      log each tick's interval and cost
- * Submit mode is also used while there is no model residency set. */
+ * keeps first tokens fast (the original 1 KB kernel submit cost ~25% of a
+ * core while idle).  DS4_METAL_DISABLE_QUEUE_KEEPALIVE=1 turns it off (~0.8 s
+ * slower first token); DS4_METAL_QUEUE_KEEPALIVE_TRACE=1 logs each tick's
+ * interval and cost.  While there is no model residency set yet, the tick
+ * submits the kernel instead. */
 static pthread_t g_queue_keepalive_thread;
 static volatile int g_queue_keepalive_running;
 static volatile int g_queue_keepalive_stop;
@@ -11543,30 +11532,17 @@ static void *ds4_gpu_queue_keepalive_thread(void *arg) {
     if (!pipeline || !scratch) return NULL;
     memset(scratch.contents, 0, 256u * sizeof(float));
     const uint32_t iters = 1u;
-    const uint64_t period_ns = ds4_gpu_env_u64("DS4_METAL_QUEUE_KEEPALIVE_MS", 1000u, 50u, 60000u) *
-                               1000000ull;
-    const uint64_t hold_ns = ds4_gpu_env_u64("DS4_METAL_QUEUE_KEEPALIVE_HOLD_S", 0u, 0u, 86400u) *
-                             1000000000ull;
+    const uint64_t period_ns = 1000000000ull;
     const int trace = getenv("DS4_METAL_QUEUE_KEEPALIVE_TRACE") != NULL;
-    const char *mode = getenv("DS4_METAL_QUEUE_KEEPALIVE_MODE");
-    const int submit_only = mode && strcmp(mode, "submit") == 0;
-    if (mode && strcmp(mode, "off") == 0) return NULL;
-    atomic_store_explicit(&g_queue_last_work_ns, ds4_gpu_uptime_ns(), memory_order_relaxed);
     uint64_t tick = ds4_gpu_uptime_ns(), last = tick;
     for (; !g_queue_keepalive_stop; tick += period_ns, ds4_gpu_queue_keepalive_wait(tick)) {
         const uint64_t now = ds4_gpu_uptime_ns();
         if (now > tick + period_ns) tick = now; /* overslept: do not burst */
-        const uint64_t work = atomic_load_explicit(&g_queue_last_work_ns, memory_order_relaxed);
-        const uint64_t idle_ns = now > work ? now - work : 0;
-        if (hold_ns && idle_ns > hold_ns) continue;
         /* The thread starts when the queue is warmed, which can be before
          * the model residency set exists: decide on every tick. */
-        id residency_set = nil;
-        if (!submit_only) {
-            pthread_mutex_lock(&g_model_residency_mu);
-            residency_set = g_model_residency_set;
-            pthread_mutex_unlock(&g_model_residency_mu);
-        }
+        pthread_mutex_lock(&g_model_residency_mu);
+        id residency_set = g_model_residency_set;
+        pthread_mutex_unlock(&g_model_residency_mu);
         if (residency_set) {
             if (@available(macOS 15.0, *)) [residency_set requestResidency];
         } else @autoreleasepool {
@@ -11581,8 +11557,8 @@ static void *ds4_gpu_queue_keepalive_thread(void *arg) {
         }
         if (trace) {
             const uint64_t done = ds4_gpu_uptime_ns();
-            fprintf(stderr, "ds4: keepalive tick interval %.1f ms renew %.2f ms idle %.1f s\n",
-                    (now - last) / 1e6, (done - now) / 1e6, idle_ns / 1e9);
+            fprintf(stderr, "ds4: keepalive tick interval %.1f ms renew %.2f ms\n",
+                    (now - last) / 1e6, (done - now) / 1e6);
         }
         last = now;
     }
