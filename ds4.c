@@ -48,6 +48,7 @@
 #include "ds4_engram.h"
 #include "ds4_tp.h"
 #include "adapter/include/dspark_policy.h"
+#include "ds4_context_copy.h"
 #if !defined(DS4_NO_GPU)
 #define DS4_HAS_DEEPSEEK41_GPU 1
 #endif
@@ -61919,6 +61920,8 @@ typedef struct ds4_dspark_spec_stats {
     uint64_t tail_skips;
     uint64_t verifier_unavailable;
     uint64_t verifier_errors;
+    uint64_t copy_cycles;
+    uint64_t copy_accepted;
     double target_ms;
     double saved_ms;
     double propose_ms;
@@ -75404,7 +75407,7 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
             "verify_layer=%.3f verify_head=%.3f verify_read=%.3f "
             "verify_fused_head=%llu replay=%.3f spec_total=%.3f "
             "target=%.3f saved=%.3f net_saved=%s "
-            "draft_len_hist=%s accepted_len_hist=%s\n",
+            "draft_len_hist=%s accepted_len_hist=%s copy_cycles=%llu copy_accepted=%llu\n",
             (unsigned long long)st->cycles,
             (unsigned long long)st->first_tokens,
             (unsigned long long)st->proposed_tokens,
@@ -75448,7 +75451,9 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
             st->saved_ms,
             net_saved,
             draft_hist,
-            accept_hist);
+            accept_hist,
+            (unsigned long long)st->copy_cycles,
+            (unsigned long long)st->copy_accepted);
 }
 #endif
 
@@ -87526,6 +87531,23 @@ static ds41_spec_gain ds41_spec_gain_get(const ds4_engine *e, bool exact) {
     return g;
 }
 
+/* Context-copy drafts (ds4_context_copy.h) replace the DSpark forward for a
+ * cycle when the copy fills the whole draft depth. Verification is unchanged,
+ * so greedy output is too. DS4_DSPARK_CONTEXT_COPY=0 disables them;
+ * DS4_DSPARK_CONTEXT_COPY_MIN sets the matched key length. Returns the key
+ * length, 0 when disabled. */
+static uint32_t ds41_context_copy_min(void) {
+    static int value = -1;
+    if (value < 0) {
+        const char *on = getenv("DS4_DSPARK_CONTEXT_COPY");
+        /* Shorter keys also match ordinary prose and code idioms; a copy that
+         * is not fully accepted costs a full-width verify (W32/W33). */
+        const uint32_t min = ds4_dspark_env_u32("DS4_DSPARK_CONTEXT_COPY_MIN", 12);
+        value = on && !strcmp(on, "0") ? 0 : (int)(min ? min : 12);
+    }
+    return (uint32_t)value;
+}
+
 static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int eos,
         bool ignore_eos, ds4_think_mode think_mode, float temperature, int top_k,
         float top_p, float min_p, uint64_t *rng, int *accepted, char *err, size_t errlen) {
@@ -87562,13 +87584,21 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
     const ds41_spec_gain gain = ds41_spec_gain_get(e, exact);
     float gain_rows[DS41_VERIFY_ROWS];
     const double started = now_sec();
-    if (!ds41_session_draft(s, first_token))
-        goto fail;
-    const double drafted = now_sec();
     int tokens[DS41_VERIFY_ROWS] = {first_token};
     uint32_t count = 1;
-    ds41_stage("draft.markov");
-    for (; count < (uint32_t)cap; count++) {
+    /* The drafter needs no forward to stay current: verification captures the
+     * accepted rows' target features and the next forward seeds them. */
+    const uint32_t copy_min = exact || e->tp.active ? 0 : ds41_context_copy_min();
+    bool copied = copy_min && ds4_context_copy_find(s->checkpoint.v,
+        (uint32_t)s->checkpoint.len, first_token, copy_min, (uint32_t)cap - 1u, tokens + 1);
+    for (uint32_t i = 1; copied && i < (uint32_t)cap; i++)
+        copied = tokens[i] != eos && !ds4_token_is_stop_for_think_mode(e, tokens[i], think_mode);
+    if (copied) count = (uint32_t)cap;
+    else if (!ds41_session_draft(s, first_token))
+        goto fail;
+    const double drafted = now_sec();
+    if (!copied) ds41_stage("draft.markov");
+    for (; !copied && count < (uint32_t)cap; count++) {
         const uint32_t row = count - 1u;
         float confidence;
         const double markov0 = trace ? now_sec() : 0;
@@ -87616,7 +87646,7 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         return -1;
     }
     const double proposed = now_sec();
-    if (stats) {
+    if (stats && !copied) {
         s->dspark_stats.propose_ms += (proposed - started) * 1000;
         s->dspark_stats.proposed_tokens += count - 1u;
         ds4_dspark_stats_note_len(s->dspark_stats.draft_len_hist, count - 1u);
@@ -87649,7 +87679,12 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         accepted[i] = tokens[i];
     }
     const uint32_t accepted_drafts = keep - 1u;
-    if (stats) {
+    /* Copy cycles stay out of the DSpark acceptance statistics and traces,
+     * which describe (and fit) the drafter's proposals. */
+    if (stats && copied) {
+        s->dspark_stats.copy_cycles++;
+        s->dspark_stats.copy_accepted += accepted_drafts;
+    } else if (stats) {
         s->dspark_stats.verify_ms += (now_sec() - proposed) * 1000;
         s->dspark_stats.accepted_draft_tokens += accepted_drafts;
         ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, accepted_drafts);
@@ -87668,12 +87703,13 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
          * are already saved. Earlier verified prefixes remain rewindable. */
         d->rewind_end = g->pos;
     }
-    if (trace) ds41_spec_trace_write(trace, pos0, first_token, tokens, count, &tr,
+    if (trace && !copied) ds41_spec_trace_write(trace, pos0, first_token, tokens, count, &tr,
         (drafted - started) * 1000, (now_sec() - proposed) * 1000,
         (verified_at - proposed) * 1000, 0, d->host_verified, accepted_drafts + 1u, correction);
     if (getenv("DS4_DSPARK_SPEC_LOG")) fprintf(stderr,
-        "ds4: V4.1 DSpark proposed=%u accepted=%u draft=%.3f ms verify=%.3f ms\n",
-        count - 1u, accepted_drafts, (proposed - started) * 1000, (now_sec() - proposed) * 1000);
+        "ds4: V4.1 DSpark %s=%u accepted=%u draft=%.3f ms verify=%.3f ms\n",
+        copied ? "copied" : "proposed", count - 1u, accepted_drafts,
+        (proposed - started) * 1000, (now_sec() - proposed) * 1000);
     if (stats) s->dspark_stats.total_ms += (now_sec() - started) * 1000;
     return (int)keep;
 fail:
