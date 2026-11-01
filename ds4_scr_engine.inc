@@ -5287,12 +5287,20 @@ static int ds41_pool_select_locked(ds4_session *s, ds4_scr_pool *p, const ds4_to
         hot_candidate = (cache_reuse_candidate){(const int32_t *)a->tokens,
             ds41_archive_count(a), NULL, 0, r->hot_covered};
     }
-    for (uint32_t i = 0; i < p->count && i < DS4_SCR_POOL_MAX_ENTRIES; ++i) {
+    /* Scoring every entry costs seconds at 40k tokens. When the hot archive
+     * already covers three quarters of the request, keep it unscored: a warm
+     * owner round would otherwise rescore the whole pool each time. */
+    const bool hot_enough = hot && r->hot_covered >= 128u &&
+        (uint64_t)r->hot_covered * 4u >= (uint64_t)n * 3u;
+    for (uint32_t i = 0; !hot_enough && i < p->count && i < DS4_SCR_POOL_MAX_ENTRIES; ++i) {
         const ds41_pool_entry *e = &p->entry[i];
         const char *held = hot ? ds41_pool_hot(p, a) : NULL;
         if (held && !strcmp(e->name, held)) continue;
         if (ds4_session_cancelled(s)) break;
         const uint32_t count = e->h.end - e->h.start;
+        /* An entry covers at most its own tokens: one no longer than the hot
+         * coverage plus the match minimum cannot win. */
+        if (hot && count <= r->hot_covered + 128u) continue;
         pool_entry[r->candidates] = i;
         pool[r->candidates++] = (cache_reuse_candidate){(const int32_t *)e->tokens, count,
             NULL, 0, ds41_pool_score(s, request, e->tokens, count, e->h.generation, &config)};
@@ -5301,7 +5309,8 @@ static int ds41_pool_select_locked(ds4_session *s, ds4_scr_pool *p, const ds4_to
         .alignment = 2u, .restore_penalty_tokens = 0u};
     cache_reuse_candidate_selection selection = {0};
     char winner[17] = "";
-    if (!ds4_session_cancelled(s) &&
+    if (hot_enough) r->best_covered = r->hot_covered;
+    else if (!ds4_session_cancelled(s) &&
         cache_reuse_select_candidate((const int32_t *)request->v, n, hot ? &hot_candidate : NULL,
             pool, r->candidates, &policy, &selection, NULL, 0) == CACHE_REUSE_COMPLETE) {
         r->best_covered = selection.reusable_tokens;

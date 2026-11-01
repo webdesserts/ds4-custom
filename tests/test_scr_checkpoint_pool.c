@@ -156,7 +156,10 @@ static void two_sessions(const int *a1, int *a2, int *b1) {
     ds4_tokens edited = {.v = a2, .len = (int)(BASE + EDIT), .cap = (int)(BASE + EDIT)};
     controls(a2);
     CHECK(!ds4_session_scr_pool_select(&sa, pool, &edited, 32u, 201, &pr));
-    CHECK(pr.selected && !pr.restored && pr.candidates == 1u && pr.hot_covered >= 1200u);
+    /* A's archive covers over three quarters of its edit, so B's entry is
+     * not even scored (see pool_short_circuit). */
+    CHECK(pr.selected && !pr.restored && !pr.candidates && pr.hot_covered >= 1200u &&
+          pr.best_covered == pr.hot_covered);
     /* The router's coverage estimate is the pool select's hot score: A's
      * archive covers its edited conversation, B's archive covers none of it,
      * and a request continuing A's transcript needs no archive. */
@@ -178,6 +181,53 @@ static void two_sessions(const int *a1, int *a2, int *b1) {
     harness_session_close(&sa);
     printf("two sessions: each live archive keeps its saved state on a shared pool; "
            "router coverage equals the hot score\n");
+}
+
+/* A warm owner round must not rescore the pool: a hot archive covering at
+ * least three quarters of the request skips every entry. Below that, entries
+ * no longer than the hot coverage plus the match minimum are not scored. */
+static void pool_short_circuit(const int *a1, int *a2, const int *b1) {
+    char dir[PATH_MAX + 16], err[256];
+    snprintf(dir, sizeof(dir), "%s-short", pool_dir);
+    CHECK(!mkdir(dir, 0700) || errno == EEXIST);
+    static ds4_engine ea, eb, ec; static ds4_session sa, sb, sc;
+    harness_session_open(&ea, &sa, CTX, 512u);
+    harness_session_open(&eb, &sb, CTX, 512u);
+    harness_session_open(&ec, &sc, CTX, 512u);
+    ds4_scr_pool *pool = NULL;
+    CHECK(!ds4_scr_pool_open(&pool, dir, CTX, CAP, 0, err, sizeof(err)));
+    ds4_scr_pool_receipt pr; ds4_scr_logical_receipt r;
+    /* B is long enough to be scored against any request here; C is short. */
+    static int b2[2000], c1[500];
+    memcpy(b2, b1, BASE * sizeof(int));
+    for (uint32_t i = BASE; i < 2000u; ++i) b2[i] = 40000 + (int)i;
+    for (uint32_t i = 0; i < 500u; ++i) c1[i] = 60000 + (int)i;
+    policy(&sa, pool, (int *)a1, BASE, &pr, &r, 0);
+    policy(&sb, pool, b2, 2000u, &pr, &r, 0);
+    policy(&sc, pool, c1, 500u, &pr, &r, 0);
+    CHECK(pr.entries == 3u);
+    session = &sa;
+    ds4_tokens edited = {.v = a2, .len = (int)(BASE + EDIT), .cap = (int)(BASE + EDIT)};
+    controls(a2);
+    CHECK(!ds4_session_scr_pool_select(&sa, pool, &edited, 32u, 201, &pr));
+    CHECK(pr.selected && !pr.restored && !pr.candidates &&
+          (uint64_t)pr.hot_covered * 4u >= (uint64_t)(BASE + EDIT) * 3u && pr.best_covered == pr.hot_covered);
+    /* Half of A's transcript, then 700 fresh tokens: the hot archive covers
+     * about half, so B's long entry is scored and C's 500 tokens are not. */
+    static int half[1500];
+    memcpy(half, a1, 800u * sizeof(int));
+    for (uint32_t i = 0; i < 700u; ++i) half[800u + i] = 80000 + (int)i;
+    ds4_tokens partial = {.v = half, .len = 1500, .cap = 1500};
+    controls(half);
+    CHECK(!ds4_session_scr_pool_select(&sa, pool, &partial, 32u, 201, &pr));
+    CHECK(pr.selected && !pr.restored && pr.hot_covered >= 500u &&
+          (uint64_t)pr.hot_covered * 4u < 1500u * 3u && pr.candidates == 1u);
+    printf("pool short circuit: a 3/4 hot archive skips the pool; hot %u of 1500 scores %u of 2 entries\n",
+           pr.hot_covered, pr.candidates);
+    ds4_scr_pool_close(pool);
+    harness_session_close(&sc);
+    harness_session_close(&sb);
+    harness_session_close(&sa);
 }
 
 int main(void) {
@@ -275,6 +325,7 @@ int main(void) {
     harness_session_close(&sb);
     same_session_edit(a1, a2);
     two_sessions(a1, a2, b1);
+    pool_short_circuit(a1, a2, b1);
     short_followup(a1);
     ds4_gpu_tensor_free(rows); ds4_gpu_tensor_free(indices);
     puts("SCR checkpoint pool: cross-restart reuse, branch fan-out, roundtrip, budget, same-session shared prefix, two sessions, short follow-up (host storage, simulated rows)");
