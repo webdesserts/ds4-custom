@@ -43515,13 +43515,6 @@ static bool ds41_verify_overlap_enabled(void) {
 #endif
 }
 
-/* Layers per committed command buffer while overlapping (tuning knob).
- * One layer measured 2-3 ms faster per verify than four or eight. */
-static uint32_t ds41_verify_flush_layers(void) {
-    const char *v = getenv("DS4_V41_VERIFY_FLUSH_LAYERS");
-    const long n = v ? strtol(v, NULL, 10) : 1;
-    return n < 1 ? 1u : n > 64 ? 64u : (uint32_t)n;
-}
 
 static bool ds41_graph_step_batch_body(ds41_gpu_graph *const *graphs, const int *tokens, int count,
                                        uint32_t prefill_rows,
@@ -43625,7 +43618,9 @@ static bool ds41_graph_step_batch_body(ds41_gpu_graph *const *graphs, const int 
         active1 = active;
         active1.engram_rows = engram_rows1;
     }
-    const uint32_t flush_layers = overlap ? ds41_verify_flush_layers() : 0u;
+    /* While overlapping, commit every layer: one layer per command buffer
+     * measured 2-3 ms faster per verify than four or eight. */
+    const uint32_t flush_layers = overlap ? 1u : 0u;
     bool consecutive = true;
     for (int i = 1; i < count; i++)
         consecutive = consecutive && positions[i] == positions[0] + (uint32_t)i;
