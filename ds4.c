@@ -41484,17 +41484,6 @@ static bool ds41_f32_rows_enabled(void) {
     return enabled;
 }
 
-/* Row-tiled Q8_0 batches round to BF16 in the matvec writer instead of a
- * separate pass (same bits); DS4_METAL_V41_FUSED_BF16=0 keeps the pass. */
-static bool ds41_fused_bf16_enabled(void) {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char *v = getenv("DS4_METAL_V41_FUSED_BF16");
-        enabled = !(v && !strcmp(v, "0"));
-    }
-    return enabled;
-}
-
 /* HC weighted sums and HC=4 expands likewise round in their kernels;
  * DS4_METAL_V41_FUSED_HC=0 keeps the separate pass. `rows` token rows. */
 static bool ds41_fused_hc_enabled(void) {
@@ -41567,7 +41556,7 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
         int rounded = 0;
         ok = ds4_gpu_matmul_q8_0_decode_rows_exact_bf16_tensor(out, m->map, m->size,
             weight->abs_offset, width, outputs, in, count,
-            round && ds41_fused_bf16_enabled() ? &rounded : NULL);
+            round ? &rounded : NULL);
         if (rounded) return ok;
     } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F16) {
         ok = ds4_gpu_dsv41_projection_rows(out, m->map, m->size,
