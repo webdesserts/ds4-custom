@@ -87617,19 +87617,15 @@ static void ds41_spec_trace_write(FILE *f, uint32_t pos, int first_token, const 
  * threshold was set explicitly: keep drafting while P(every draft so far is
  * accepted) exceeds the marginal verify cost of one more row valued at
  * DS4_DSPARK_GAIN tok/s (0 restores the threshold). The rule and its fitted
- * tables live in adapter/dspark-policy, which dspark-policy-sim replays;
- * DS4_DSPARK_POLICY_C=1 uses the original C rule and tables (default 65
- * tok/s) instead. Only the verify width changes, so greedy output is
- * unchanged. */
+ * tables live in adapter/dspark-policy, which dspark-policy-sim replays.
+ * Only the verify width changes, so greedy output is unchanged. */
 typedef struct {
     bool on;
-    bool c_rule;
-    float c_value; /* tokens/ms for the C rule */
     ds4_dspark_gain_model model;
 } ds41_spec_gain;
 
 static ds41_spec_gain ds41_spec_gain_get(const ds4_engine *e, bool exact) {
-    static bool read, c_rule;
+    static bool read;
     static float env = -1; /* < 0: unset */
     if (!read) {
         read = true;
@@ -87638,16 +87634,12 @@ static ds41_spec_gain ds41_spec_gain_get(const ds4_engine *e, bool exact) {
             env = strtof(v, NULL);
             if (!(env > 0)) env = 0;
         }
-        const char *c = getenv("DS4_DSPARK_POLICY_C");
-        c_rule = c && strcmp(c, "0") != 0;
     }
     ds41_spec_gain g = {0};
     /* The acceptance table is for argmax drafts; exact sampling keeps the threshold. */
     g.on = !exact && (env >= 0 ? env > 0 :
         e->backend == DS4_BACKEND_METAL && !e->dspark_confidence_threshold_set);
     if (!g.on) return g;
-    g.c_rule = c_rule;
-    g.c_value = (env > 0 ? env : 65.0f) / 1000.0f;
     g.model = ds4_dspark_gain_model_default(env > 0 ? env : 0.0f);
     return g;
 }
@@ -87686,7 +87678,7 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
     const bool trace_full = trace && ds41_spec_trace_full();
     ds41_spec_trace tr = {0};
     const ds41_spec_gain gain = ds41_spec_gain_get(e, exact);
-    float gain_survive = 1.0f, gain_rows[DS41_VERIFY_ROWS];
+    float gain_rows[DS41_VERIFY_ROWS];
     const double started = now_sec();
     if (!ds41_session_draft(s, first_token))
         goto fail;
@@ -87707,7 +87699,6 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         gain_rows[row] = p;
         const bool stop = !gain.on ?
             e->dspark_confidence_threshold > 0 && p < e->dspark_confidence_threshold :
-            gain.c_rule ? !ds4_dspark_gain_continue_c(gain.c_value, row, p, &gain_survive) :
             !ds4_dspark_gain_continue(&gain.model, gain_rows, row + 1u);
         if (stop && !trace_full) break;
         const float *qlogits = d->host_logits + (uint64_t)row * DS4_N_VOCAB;

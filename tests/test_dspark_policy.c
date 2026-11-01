@@ -9,6 +9,24 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* The original C rule (9f1f59f), frozen here as the reference the Rust rule
+ * must reproduce. Updates `*survive` with this row's acceptance estimate. */
+static inline bool ds4_dspark_gain_continue_c(float value, uint32_t row, float confidence,
+                                              float *survive) {
+    static const float accept[10] = {
+        0.0500f, 0.0605f, 0.3206f, 0.3053f, 0.4847f,
+        0.5770f, 0.6446f, 0.7688f, 0.9096f, 0.9937f,
+    };
+    /* ms added by verifying draft row+1 instead of row drafts (row 0: the
+     * 2-row verify instead of a single-token decode). */
+    static const float marginal_ms[DS4_DSPARK_GAIN_ROWS] = {8.28f, 6.84f, 7.18f, 8.83f, 10.48f};
+    int bucket = (int)(confidence * 10.0f);
+    if (!(bucket >= 0)) bucket = 0;
+    if (bucket > 9) bucket = 9;
+    *survive *= accept[bucket];
+    return *survive > value * marginal_ms[row < DS4_DSPARK_GAIN_ROWS ? row : DS4_DSPARK_GAIN_ROWS - 1];
+}
+
 static const float values_tok_s[] = {1, 10, 30, 50, 60, 65, 70, 80, 90, 100, 120, 150, 400};
 
 /* Compares every prefix of `conf`; returns 0 on a mismatch. */
