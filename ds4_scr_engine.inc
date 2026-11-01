@@ -5165,13 +5165,48 @@ static uint32_t ds41_pool_score(ds4_session *s, const ds4_tokens *request, const
         result.status == CACHE_REUSE_STATE_LIMIT);
     return planned ? result.covered_tokens : 0u;
 }
-static bool ds41_pool_session_idle(const ds4_session *s) {
+/* No policy, capture or encoder of this session is in flight. */
+static bool ds41_pool_session_quiet(const ds4_session *s) {
     const ds41_gpu_graph *g = &s->ds41_graph;
     return s->engine && s->ds41_graph_ready && ds4_session_is_ds41(s) && !s->distributed &&
         s->engine->backend == DS4_BACKEND_METAL && !s->scr_policy_active &&
         !s->scr_multi_active && !s->scr_dense_owner && g->tp_world == 1u && !g->image_count &&
-        !g->archive_pending && !g->archive_capture_pending && !g->encoder_resident &&
-        !ds4_gpu_commands_active();
+        !g->archive_pending && !g->archive_capture_pending && !g->encoder_resident;
+}
+static bool ds41_pool_session_idle(const ds4_session *s) {
+    return ds41_pool_session_quiet(s) && !ds4_gpu_commands_active();
+}
+
+/* The planner configuration the logical policy would use for `request`, or
+ * false when the policy consults no archive: it continues the live
+ * transcript, carries a short tail, or cannot plan. */
+static bool ds41_pool_score_config(ds4_session *s, const ds4_tokens *request,
+                                   uint32_t max_ranges, int pad_token, cache_reuse_config *config) {
+    ds41_gpu_graph *g = &s->ds41_graph;
+    const uint32_t n = (uint32_t)request->len;
+    ds41_pad_budget budget = {.limit = DS41_SCR_PLAN_WORK_MAX, .session = s};
+    ds41_pad_prefix_info prefix;
+    if (ds41_pad_prefix(request->v, n, s->checkpoint.v, (uint32_t)s->checkpoint.len,
+            &s->scr_coordinates, &prefix, &budget) != DS41_PAD_OK) return false;
+    const bool continuation = s->checkpoint.len > 0 && s->checkpoint_valid && g->valid &&
+        g->pos == (uint32_t)s->checkpoint.len && prefix.common == prefix.live_logical;
+    ds41_boundary_permissions permissions;
+    if (continuation || n - prefix.common <= 128u ||
+        ds41_even_prepare_boundaries(s, request, &permissions, &budget)) return false;
+    if (permissions.policy == DS4_SCR_BOUNDARIES_FRESH_GAP_SPACE_V1) pad_token = permissions.pad_token;
+    const uint32_t context = g->ctx < (uint32_t)s->ctx_size ? g->ctx : (uint32_t)s->ctx_size;
+    if (pad_token < 0 || n >= context) return false;
+    /* Scored as the policy plans: no protected live prefix (see
+     * ds41_even_policy_impl). */
+    ds41_scr_planner_config(s, n, context, 0u, (uint32_t)pad_token,
+        permissions.policy == DS4_SCR_BOUNDARIES_FRESH_GAP_SPACE_V1, max_ranges, config);
+    if (config->budget_ms > DS41_POOL_SCORE_BUDGET_MS) config->budget_ms = DS41_POOL_SCORE_BUDGET_MS;
+    return true;
+}
+
+static bool ds41_pool_hot_archive(const ds4_session *s) {
+    const ds41_scr_archive *a = s->ds41_graph.archive;
+    return a && ds41_archive_owned_sealed(a, s) && !a->retiring && ds41_archive_count(a) >= 128u;
 }
 #endif
 
@@ -5188,28 +5223,11 @@ static int ds41_pool_select_locked(ds4_session *s, ds4_scr_pool *p, const ds4_to
     const uint32_t n = (uint32_t)request->len;
     /* The policy continues a live transcript or carries a short tail without
      * consulting any archive; swapping it out would only cost time. */
-    ds41_pad_budget budget = {.limit = DS41_SCR_PLAN_WORK_MAX, .session = s};
-    ds41_pad_prefix_info prefix;
-    if (ds41_pad_prefix(request->v, n, s->checkpoint.v, (uint32_t)s->checkpoint.len,
-            &s->scr_coordinates, &prefix, &budget) != DS41_PAD_OK) return 0;
-    const bool continuation = s->checkpoint.len > 0 && s->checkpoint_valid && g->valid &&
-        g->pos == (uint32_t)s->checkpoint.len && prefix.common == prefix.live_logical;
-    ds41_boundary_permissions permissions;
-    if (continuation || n - prefix.common <= 128u ||
-        ds41_even_prepare_boundaries(s, request, &permissions, &budget)) return 0;
-    if (permissions.policy == DS4_SCR_BOUNDARIES_FRESH_GAP_SPACE_V1) pad_token = permissions.pad_token;
-    const uint32_t context = g->ctx < (uint32_t)s->ctx_size ? g->ctx : (uint32_t)s->ctx_size;
-    if (pad_token < 0 || n >= context) return 0;
     cache_reuse_config config;
-    /* Scored as the policy plans: no protected live prefix (see
-     * ds41_even_policy_impl). */
-    ds41_scr_planner_config(s, n, context, 0u, (uint32_t)pad_token,
-        permissions.policy == DS4_SCR_BOUNDARIES_FRESH_GAP_SPACE_V1, max_ranges, &config);
-    if (config.budget_ms > DS41_POOL_SCORE_BUDGET_MS) config.budget_ms = DS41_POOL_SCORE_BUDGET_MS;
+    if (!ds41_pool_score_config(s, request, max_ranges, pad_token, &config)) return 0;
     r->selected = true;
     ds41_scr_archive *a = g->archive;
-    const bool hot = a && ds41_archive_owned_sealed(a, s) && !a->retiring &&
-        ds41_archive_count(a) >= 128u;
+    const bool hot = ds41_pool_hot_archive(s);
     /* Each candidate is planned here under the scoring budget; the library
      * weighs that plan against its aligned common prefix and picks one. */
     cache_reuse_candidate hot_candidate = {0}, pool[DS4_SCR_POOL_MAX_ENTRIES];
@@ -5278,6 +5296,22 @@ static int ds41_pool_save_locked(ds4_session *s, ds4_scr_pool *p, bool include_a
     return rc;
 #else
     (void)s; (void)include_appends;
+    return 0;
+#endif
+}
+
+uint32_t ds4_session_scr_archive_coverage(ds4_session *s, const ds4_tokens *request,
+                                          uint32_t max_ranges, int pad_token) {
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    if (!s || !request || !request->v || request->len <= 0 || request->len >= s->ctx_size ||
+        !ds41_pool_session_quiet(s) || !ds41_pool_hot_archive(s)) return 0;
+    cache_reuse_config config;
+    if (!ds41_pool_score_config(s, request, max_ranges, pad_token, &config)) return 0;
+    const ds41_scr_archive *a = s->ds41_graph.archive;
+    return ds41_pool_score(s, request, a->tokens, ds41_archive_count(a), a->source_generation,
+                           &config);
+#else
+    (void)s; (void)request; (void)max_ranges; (void)pad_token;
     return 0;
 #endif
 }

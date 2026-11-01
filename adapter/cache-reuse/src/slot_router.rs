@@ -9,7 +9,13 @@
 //!    (tool-call ids, remembered visible transcript) always qualifies;
 //!    otherwise the reusable prefix must reach `min_match` and extend past
 //!    `conversation_floor`, the prefix any other conversation can share (the
-//!    system prompt and first user message). Most reuse wins.
+//!    system prompt and first user message), or the slot's archive must
+//!    cover at least `min_match` tokens more than that floor. Archive
+//!    coverage counts ranges after a break: a conversation whose prompt
+//!    changes early (a timestamp or edited file in the system prompt) still
+//!    owns the slot that holds the rest of it, and rebasing that archive in
+//!    place saves restoring it from the pool onto another slot. Most reuse
+//!    (prefix or archive) wins, then the longer prefix.
 //! 2. **Empty**: a slot holding nothing.
 //! 3. **Stale**: idle at least `stale_after_seconds`; the longest idle first.
 //! 4. **Cheapest**: the slot with the fewest live tokens (the least prefilled
@@ -36,6 +42,9 @@ pub struct SlotRouteInput {
     pub live_tokens: u32,
     /// Tokens of the request this slot can reuse.
     pub reuse_tokens: u32,
+    /// Tokens of the request the slot's archive covers, prefix and later
+    /// ranges together (0 when unknown or when the prefix continues).
+    pub archive_tokens: u32,
     pub idle_seconds: u64,
 }
 
@@ -64,21 +73,29 @@ pub struct SlotRouteDecision {
     /// Chosen slot index, or -1 to queue.
     pub slot: i32,
     pub reason: u32,
+    /// Owner only: the larger of its prefix reuse and archive coverage.
     pub reuse_tokens: u32,
     /// Live tokens of the chosen slot this request does not reuse.
     pub evicted_tokens: u32,
 }
 
 fn owns(req: &SlotRouteRequest, s: &SlotRouteInput) -> bool {
+    let min = req.min_match.max(1);
     s.bound != 0
-        || (s.reuse_tokens >= req.min_match.max(1) && s.reuse_tokens > req.conversation_floor)
+        || (s.reuse_tokens >= min && s.reuse_tokens > req.conversation_floor)
+        || s.archive_tokens >= req.conversation_floor.saturating_add(min)
+}
+
+/// Request tokens an owner saves: its prefix or its archive coverage.
+fn credit(s: &SlotRouteInput) -> u32 {
+    s.reuse_tokens.max(s.archive_tokens)
 }
 
 /// Route one request over `slots`.
 pub fn route(req: &SlotRouteRequest, slots: &[SlotRouteInput]) -> SlotRouteDecision {
     let pick = |i: usize, reason: u32| {
         let s = &slots[i];
-        let reuse = if reason == SLOT_ROUTE_OWNER { s.reuse_tokens } else { 0 };
+        let reuse = if reason == SLOT_ROUTE_OWNER { credit(s) } else { 0 };
         SlotRouteDecision {
             slot: i as i32,
             reason,
@@ -88,7 +105,7 @@ pub fn route(req: &SlotRouteRequest, slots: &[SlotRouteInput]) -> SlotRouteDecis
     };
     let available = || slots.iter().enumerate().filter(|(_, s)| s.available != 0);
 
-    let best_available = available().filter(|(_, s)| owns(req, s)).map(|(_, s)| s.reuse_tokens).max().unwrap_or(0);
+    let best_available = available().filter(|(_, s)| owns(req, s)).map(|(_, s)| credit(s)).max().unwrap_or(0);
     if let Some(s) = slots
         .iter()
         .filter(|s| s.available == 0 && s.finishing != 0 && owns(req, s))
@@ -99,11 +116,17 @@ pub fn route(req: &SlotRouteRequest, slots: &[SlotRouteInput]) -> SlotRouteDecis
         }
     }
 
-    // Most reuse; then the least of the slot's own history lost; then lowest index.
+    // Most reuse; then the longer prefix (no rebase); then the least of the
+    // slot's own history lost; then lowest index.
     if let Some((i, _)) = available()
         .filter(|(_, s)| owns(req, s))
         .min_by_key(|(i, s)| {
-            (std::cmp::Reverse(s.reuse_tokens), s.live_tokens.saturating_sub(s.reuse_tokens), *i)
+            (
+                std::cmp::Reverse(credit(s)),
+                std::cmp::Reverse(s.reuse_tokens),
+                s.live_tokens.saturating_sub(credit(s)),
+                *i,
+            )
         })
     {
         return pick(i, SLOT_ROUTE_OWNER);
@@ -163,7 +186,77 @@ mod tests {
     };
 
     fn slot(available: bool, live: u32, reuse: u32, idle: u64) -> SlotRouteInput {
-        SlotRouteInput { available: available as u8, bound: 0, finishing: 0, live_tokens: live, reuse_tokens: reuse, idle_seconds: idle }
+        SlotRouteInput { available: available as u8, live_tokens: live, reuse_tokens: reuse, idle_seconds: idle, ..Default::default() }
+    }
+
+    fn archived(live: u32, reuse: u32, archive: u32) -> SlotRouteInput {
+        SlotRouteInput { archive_tokens: archive, ..slot(true, live, reuse, 5) }
+    }
+
+    #[test]
+    fn conversation_changed_before_the_floor_stays_on_the_slot_covering_it() {
+        // Ren: the system prompt changes at token 920 (a file digest), below
+        // the 6200-token floor, but the slot's archive covers the rest.
+        let slots = [slot(true, 0, 0, 0), archived(40100, 920, 39000)];
+        let d = route(&REQ, &slots);
+        assert_eq!((d.slot, d.reason, d.reuse_tokens, d.evicted_tokens), (1, SLOT_ROUTE_OWNER, 39000, 1100));
+        // Without the archive input the same request went to the empty slot.
+        let slots = [slot(true, 0, 0, 0), slot(true, 40100, 920, 5)];
+        assert_eq!(route(&REQ, &slots).reason, SLOT_ROUTE_EMPTY);
+    }
+
+    #[test]
+    fn archive_must_cover_a_minimum_match_past_the_floor() {
+        // Another conversation sharing the system prompt plus a few scattered
+        // ranges does not own the slot.
+        let slots = [slot(true, 0, 0, 0), archived(30000, 6200, 6200 + 127)];
+        assert_eq!(route(&REQ, &slots).reason, SLOT_ROUTE_EMPTY);
+        let slots = [slot(true, 0, 0, 0), archived(30000, 6200, 6200 + 128)];
+        assert_eq!(route(&REQ, &slots).reason, SLOT_ROUTE_OWNER);
+        // With no floor the archive still needs min_match.
+        let req = SlotRouteRequest { conversation_floor: 0, ..REQ };
+        let slots = [slot(true, 0, 0, 0), archived(30000, 0, 127)];
+        assert_eq!(route(&req, &slots).reason, SLOT_ROUTE_EMPTY);
+        let slots = [slot(true, 0, 0, 0), archived(30000, 0, 128)];
+        assert_eq!(route(&req, &slots).reason, SLOT_ROUTE_OWNER);
+    }
+
+    #[test]
+    fn most_coverage_wins_then_the_longer_prefix() {
+        // An archive covering more beats a shorter live prefix.
+        let slots = [slot(true, 8100, 8000, 5), archived(40000, 900, 30000)];
+        assert_eq!(route(&REQ, &slots).slot, 1);
+        // Equal coverage: the prefix needs no rebase.
+        let slots = [archived(40000, 900, 30000), archived(40000, 30000, 0)];
+        let d = route(&REQ, &slots);
+        assert_eq!((d.slot, d.reuse_tokens), (1, 30000));
+        let slots = [archived(40000, 900, 30000), archived(40000, 7000, 30000)];
+        assert_eq!(route(&REQ, &slots).slot, 1);
+        // Equal coverage and prefix: the least history lost.
+        let slots = [archived(45000, 900, 30000), archived(40000, 900, 30000)];
+        let d = route(&REQ, &slots);
+        assert_eq!((d.slot, d.evicted_tokens), (1, 10000));
+    }
+
+    #[test]
+    fn archive_coverage_counts_against_waiting() {
+        // An available slot whose archive covers nearly as much as a
+        // finishing owner's prefix is used instead of waiting.
+        let mut owner = slot(false, 11071, 10910, 0);
+        owner.finishing = 1;
+        let slots = [owner, archived(11000, 900, 10000)];
+        assert_eq!(route(&REQ, &slots).reason, SLOT_ROUTE_OWNER);
+        let slots = [owner, archived(11000, 900, 8000)];
+        assert_eq!(route(&REQ, &slots).reason, SLOT_ROUTE_WAIT);
+    }
+
+    #[test]
+    fn c_layout_matches_the_header() {
+        // adapter/include/slot_router.h asserts the same sizes.
+        assert_eq!(std::mem::size_of::<SlotRouteInput>(), 24);
+        assert_eq!(std::mem::offset_of!(SlotRouteInput, archive_tokens), 12);
+        assert_eq!(std::mem::offset_of!(SlotRouteInput, idle_seconds), 16);
+        assert_eq!(std::mem::size_of::<SlotRouteDecision>(), 16);
     }
 
     #[test]

@@ -12,8 +12,10 @@ typedef struct {
     uint8_t finishing;     /* busy, request finished, slot about to free */
     uint32_t live_tokens;
     uint32_t reuse_tokens; /* tokens of the request this slot can reuse */
+    uint32_t archive_tokens; /* request tokens the slot's archive covers, any ranges */
     uint64_t idle_seconds;
 } ds4_slot_route_input;
+_Static_assert(sizeof(ds4_slot_route_input) == 24, "matches slot_router.rs");
 
 typedef struct {
     uint32_t request_tokens;
@@ -35,7 +37,7 @@ enum {
 typedef struct {
     int32_t slot;          /* -1: queue or wait */
     uint32_t reason;
-    uint32_t reuse_tokens;
+    uint32_t reuse_tokens; /* owner: max of prefix reuse and archive coverage */
     uint32_t evicted_tokens;
 } ds4_slot_route_decision;
 

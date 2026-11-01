@@ -157,6 +157,18 @@ static void two_sessions(const int *a1, int *a2, int *b1) {
     controls(a2);
     CHECK(!ds4_session_scr_pool_select(&sa, pool, &edited, 32u, 201, &pr));
     CHECK(pr.selected && !pr.restored && pr.candidates == 1u && pr.hot_covered >= 1200u);
+    /* The router's coverage estimate is the pool select's hot score: A's
+     * archive covers its edited conversation, B's archive covers none of it,
+     * and a request continuing A's transcript needs no archive. */
+    CHECK(ds4_session_scr_archive_coverage(&sa, &edited, 32u, 201) == pr.hot_covered);
+    session = &sb;
+    CHECK(ds4_session_scr_archive_coverage(&sb, &edited, 32u, 201) == 0u);
+    static int a1_more[BASE + EDIT];
+    memcpy(a1_more, a1, BASE * sizeof(int));
+    for (uint32_t i = 0; i < EDIT; ++i) a1_more[BASE + i] = 97000 + (int)i;
+    ds4_tokens more = {.v = a1_more, .len = (int)(BASE + EDIT), .cap = (int)(BASE + EDIT)};
+    session = &sa;
+    CHECK(ds4_session_scr_archive_coverage(&sa, &more, 32u, 201) == 0u);
     /* A's unchanged archive is already held: a shutdown save, which skips
      * nothing by owner, finds it saved and writes nothing. */
     CHECK(!ds4_session_scr_pool_save(&sa, pool, true, &pr) && !pr.saved && pr.entries == 2u);
@@ -164,7 +176,8 @@ static void two_sessions(const int *a1, int *a2, int *b1) {
     ds4_scr_pool_close(pool);
     harness_session_close(&sb);
     harness_session_close(&sa);
-    printf("two sessions: each live archive keeps its saved state on a shared pool\n");
+    printf("two sessions: each live archive keeps its saved state on a shared pool; "
+           "router coverage equals the hot score\n");
 }
 
 int main(void) {

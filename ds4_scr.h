@@ -444,6 +444,14 @@ uint32_t ds4_scr_pool_entries(const ds4_scr_pool *pool);
 int ds4_session_scr_pool_select(ds4_session *s, ds4_scr_pool *pool,
                                 const ds4_tokens *logical_request, uint32_t max_ranges,
                                 int pad_token, ds4_scr_pool_receipt *receipt);
+/* Request tokens the session's sealed hot archive covers, as the pool select
+ * scores it (planner coverage, non-prefix ranges included); 0 when the policy
+ * would consult no archive (the live transcript continues into the request, a
+ * short tail) or there is none. Host-only: no GPU work, safe while other
+ * sessions run, but the caller must own this session exclusively (an idle
+ * batched slot under the dispatch lock). Bounded by the pool scoring budget. */
+uint32_t ds4_session_scr_archive_coverage(ds4_session *s, const ds4_tokens *logical_request,
+                                          uint32_t max_ranges, int pad_token);
 /* Persist the sealed hot archive unless the pool already holds it. After a
  * request, pass include_appends=false: an archive that a refresh or rebase
  * sealed is saved, while one that only appended to a saved archive is not

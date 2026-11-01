@@ -15123,13 +15123,17 @@ static const char *server_route_reason(uint32_t reason) {
     }
 }
 
-/* SCR servers route by the reusable prefix each idle slot holds (live KV and,
- * through it, the slot's archive), keeping warm conversations on their slots;
- * see adapter/cache-reuse/src/slot_router.rs. Requires s->mu and tool_mu. */
+/* SCR servers route by the reusable prefix each idle slot holds (live KV and
+ * protocol tiers) and, when that prefix stays within the conversation floor,
+ * by how much of the request the slot's archive covers, keeping warm
+ * conversations on their slots; see adapter/cache-reuse/src/slot_router.rs.
+ * Requires s->mu and tool_mu. */
 static server_slot *job_route_scr_locked(server *s, const job *j, time_t now,
                                          ds4_slot_route_decision *d) {
     ds4_slot_route_input in[SERVER_ROUTE_MAX_SLOTS];
     memset(in, 0, sizeof(in));
+    const uint32_t floor = server_route_conversation_floor(s, &j->req.prompt);
+    double archive_seconds = 0.0;
     for (int i = 0; i < s->slot_count; i++) {
         server_slot *slot = &s->slots[i];
         ds4_slot_route_input *x = &in[i];
@@ -15153,11 +15157,20 @@ static server_slot *job_route_scr_locked(server *s, const job *j, time_t now,
         const int common = server_route_common_prefix(slot, &j->req.prompt);
         const int reuse = common > pr.reuse_tokens ? common : pr.reuse_tokens;
         x->reuse_tokens = reuse > 0 ? (uint32_t)reuse : 0u;
+        /* Planning is host work bounded by the pool scoring budget; skip it
+         * when the prefix already makes this slot an owner. The slot is idle
+         * and unassigned, so no worker touches its session meanwhile. */
+        if (!x->bound && x->reuse_tokens <= floor) {
+            const double began = now_sec();
+            x->archive_tokens = ds4_session_scr_archive_coverage(slot->session, &j->req.prompt,
+                (uint32_t)s->scr_max_ranges, 201);
+            archive_seconds += now_sec() - began;
+        }
         x->idle_seconds = now > slot->last_used ? (uint64_t)(now - slot->last_used) : 0u;
     }
     const ds4_slot_route_request req = {
         .request_tokens = j->req.prompt.len > 0 ? (uint32_t)j->req.prompt.len : 0u,
-        .conversation_floor = server_route_conversation_floor(s, &j->req.prompt),
+        .conversation_floor = floor,
         .min_match = SERVER_ROUTE_MIN_MATCH,
         .wait_gain = SERVER_ROUTE_WAIT_GAIN,
         .stale_after_seconds = (uint64_t)SLOT_STALE_AFTER_SEC,
@@ -15165,9 +15178,12 @@ static server_slot *job_route_scr_locked(server *s, const job *j, time_t now,
     const int32_t chosen = ds4_slot_route(&req, in, (uint32_t)s->slot_count, d);
     if (chosen >= 0 || d->reason == DS4_SLOT_ROUTE_WAIT)
         server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: slot route slot=%d reason=%s reuse=%u floor=%u live=%u evicted=%u prompt=%u",
-                   chosen, server_route_reason(d->reason), d->reuse_tokens, req.conversation_floor,
-                   chosen >= 0 ? in[chosen].live_tokens : 0u, d->evicted_tokens, req.request_tokens);
+                   "ds4-server: slot route slot=%d reason=%s reuse=%u prefix=%u archive=%u floor=%u live=%u evicted=%u prompt=%u archive_s=%.6f",
+                   chosen, server_route_reason(d->reason), d->reuse_tokens,
+                   chosen >= 0 ? in[chosen].reuse_tokens : 0u,
+                   chosen >= 0 ? in[chosen].archive_tokens : 0u, req.conversation_floor,
+                   chosen >= 0 ? in[chosen].live_tokens : 0u, d->evicted_tokens, req.request_tokens,
+                   archive_seconds);
     return chosen >= 0 && chosen < s->slot_count ? &s->slots[chosen] : NULL;
 }
 #endif
