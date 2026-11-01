@@ -257,7 +257,7 @@ static bool ds41_dspark_stage(ds41_dspark *d, const ds4_model *m, uint32_t stage
     const ds4_layer_weights *l = &d->weights->stage[stage].block;
     const uint32_t n = DS41_DRAFT_ROWS, past = pos < DS41_DRAFT_WINDOW ? pos : DS41_DRAFT_WINDOW;
     if (!ds41_hc_mix_batch(b, m, l, false, n) ||
-        !ds41_hc_sum_rounded(b->x, b->residual, stage ? b->ffn_split : b->pre, stage != 0, n) ||
+        !ds41_hc_sum_rounded(b->x, b->residual, stage ? b->ffn_split : b->pre, stage != 0) ||
         !ds41_norm_batch(b->norm, b->x, m, l->attn_norm, n) ||
         !ds41_dspark_matmul_batch(b->qr, m, l->attn_q_a, b->norm, n, true) ||
         !ds41_norm_batch(b->qr, b->qr, m, l->attn_q_a_norm, n) ||
@@ -305,7 +305,7 @@ static bool ds41_dspark_stage(ds41_dspark *d, const ds4_model *m, uint32_t stage
         fprintf(stderr, "ds4: V4.1 draft routed experts failed\n"); return false;
     }
     return ds41_add_rounded(b->block, b->routed, b->shared, n) &&
-        ds41_hc_expand_rounded(b->residual, b->block, b->after_attn, b->ffn_split, n);
+        ds41_hc_expand_rounded(b->residual, b->block, b->after_attn, b->ffn_split);
 }
 
 /* Leaves the five base-logit rows and unnormalized collapsed features on the
@@ -334,7 +334,7 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_forward(ds41_dspark *d, const ds4_model
         ok = ds41_dspark_stage(d, draft, stage, pos) && ds41_dspark_flush();
         if (!ok) fprintf(stderr, "ds4: V4.1 DSpark stage %u failed\n", stage);
     }
-    if (ok) ok = ds41_hc_sum_rounded(b->x, b->residual, b->ffn_split, true, DS41_DRAFT_ROWS) &&
+    if (ok) ok = ds41_hc_sum_rounded(b->x, b->residual, b->ffn_split, true) &&
         ds41_norm_batch(b->norm, b->x, draft, d->weights->stage[2].norm, DS41_DRAFT_ROWS);
     if (ok) ok = target_graph ?
         ds41_output_projection(target_graph, d->logits, target, tw, b->norm, DS41_DRAFT_ROWS) :
