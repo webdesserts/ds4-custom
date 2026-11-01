@@ -43506,11 +43506,6 @@ static bool ds41_index_rows_prepare(ds41_gpu_graph *g, ds41_prefill_row *active,
     return *ok;
 }
 
-static bool ds41_verify_merge_rows_enabled(void) {
-    const char *v = getenv("DS4_V41_VERIFY_MERGE_ROWS");
-    return !v || strcmp(v, "0") != 0;
-}
-
 static bool ds41_verify_overlap_enabled(void) {
 #ifdef __APPLE__
     const char *v = getenv("DS4_V41_VERIFY_OVERLAP");
@@ -43667,7 +43662,7 @@ static bool ds41_graph_step_batch_body(ds41_gpu_graph *const *graphs, const int 
         /* With consecutive positions, the row-local prologue and epilogue run
          * once over all rows; only the window, selection and attention stay
          * per row and in row order. */
-        const bool merged = batch_output && consecutive && ds41_verify_merge_rows_enabled();
+        const bool merged = batch_output && consecutive;
         ds41_gpu_graph all = *g;
         all.pos = positions[0];
         all.q = active.q;
