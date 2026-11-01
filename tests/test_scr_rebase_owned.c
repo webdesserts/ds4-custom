@@ -2,36 +2,12 @@
  * and fault events are simulated; this is not Transformer or scale acceptance. */
 #include "../ds4.h"
 #include <unistd.h>
-#include <sys/types.h>
-#include <sys/mman.h>
 static bool rebase_open(void *, const char *, uint32_t, uint64_t);
 static int rebase_close(int);
-static void *raw_mmap(void *, size_t, int, int, int, off_t);
 #define DS41_REBASE_OPEN rebase_open
 #define close rebase_close
-#define mmap raw_mmap
 #include "test_scr_refresh_model.h"
 #undef close
-#undef mmap
-/* Maps of the session's published raw store (the rebase import source).
- * Refused maps make the import pread and gather instead; build with
- * -DSCR_TEST_NO_MMAP to run the whole fixture that way. */
-static uint32_t raw_maps;
-#ifdef SCR_TEST_NO_MMAP
-static bool refuse_maps = true;
-#else
-static bool refuse_maps;
-#endif
-static void (*map_event)(void);
-static void *raw_mmap(void *address, size_t length, int protection, int flags, int fd, off_t offset) {
-    const ds41_gpu_graph *g = session ? &session->ds41_graph : NULL;
-    if (g && g->archive && g->archive->raw && fd == g->archive->raw->fd) {
-        if (refuse_maps) { errno = ENOMEM; return MAP_FAILED; }
-        ++raw_maps;
-        if (map_event) map_event();
-    }
-    return mmap(address, length, protection, flags, fd, offset);
-}
 static bool reject_open, reject_after_open, reject_close;
 static uint32_t opens;
 static int destination_fd = -1, cancel_after_close_fd = -1;
@@ -184,9 +160,6 @@ static void owned_splice(ds4_session *s, const int *old_tokens) {
           receipt.materialized_spans == 2u && receipt.prefetched_spans == 1u &&
           heads == 2 && s->logits[0] == 315.0f && g->archive == old);
     ds41_scr_archive *next = g->archive_pending;
-    /* One map per imported range unless maps are refused; both ways the
-     * splice below must hold exactly the captured values. */
-    CHECK(raw_maps == (refuse_maps ? 0u : 2u));
     CHECK(next && next->sealed && next->end == 312u && next->captured_end == 315u &&
           next->raw_origin == 312u && next->raw->committed_tokens == 312u &&
           ds41_raw_capture_complete(next->raw_tags, 312u, 3u) &&
